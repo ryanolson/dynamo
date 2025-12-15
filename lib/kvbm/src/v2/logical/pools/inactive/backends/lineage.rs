@@ -1,10 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use dynamo_tokens::PositionalLineageHash;
-use lru::LruCache;
 
 use super::super::{Block, BlockMetadata, Registered};
 
@@ -26,10 +25,14 @@ struct LineageNode<T: BlockMetadata> {
 
     /// Children fragments (at position + 1).
     children: HashSet<u64>,
+
+    /// The tick when this block was inserted into the pool.
+    /// Used for LRU ordering.
+    last_used: u64,
 }
 
 impl<T: BlockMetadata> LineageNode<T> {
-    fn new(block: Block<T, Registered>, lineage_hash: PositionalLineageHash) -> Self {
+    fn new(block: Block<T, Registered>, lineage_hash: PositionalLineageHash, tick: u64) -> Self {
         let parent_fragment = if lineage_hash.position() > 0 {
             Some(lineage_hash.parent_hash_fragment())
         } else {
@@ -42,6 +45,7 @@ impl<T: BlockMetadata> LineageNode<T> {
             position: lineage_hash.position(),
             parent_fragment,
             children: HashSet::new(),
+            last_used: tick,
         }
     }
 
@@ -53,41 +57,41 @@ impl<T: BlockMetadata> LineageNode<T> {
 /// A backend that manages blocks using a lineage graph and evicts from the leaves.
 pub struct LineageBackend<T: BlockMetadata> {
     /// Map from (position, fragment) to Node.
-    /// We use a nested HashMap approach: Position -> Fragment -> Node.
     nodes: HashMap<u64, HashMap<u64, LineageNode<T>>>,
 
-    /// LRU cache storing ONLY the keys (position, fragment) of leaf nodes.
-    /// This is used to select candidates for eviction/allocation.
-    leaf_lru: LruCache<(u64, u64), ()>,
+    /// Sorted queue of leaf nodes, keyed by (last_used, position, fragment).
+    /// Smallest key (oldest tick) is popped first.
+    leaf_queue: BTreeMap<(u64, u64, u64), ()>,
 
     /// Total number of blocks currently stored (excluding ghost nodes).
     count: usize,
 
     /// Maximum capacity (total blocks).
     capacity: usize,
+
+    /// Monotonic counter for insertion ordering.
+    current_tick: u64,
 }
 
 impl<T: BlockMetadata> LineageBackend<T> {
     /// Creates a new LineageBackend.
     pub fn new(capacity: std::num::NonZeroUsize) -> Self {
-        // leaf_lru uses unbounded capacity because we manually manage eviction
-        // based on total block count, not leaf count.
         Self {
             nodes: HashMap::new(),
-            leaf_lru: LruCache::unbounded(),
+            leaf_queue: BTreeMap::new(),
             count: 0,
             capacity: capacity.get(),
+            current_tick: 0,
         }
     }
 
     /// Inserts a block into the lineage graph.
     /// Panics if capacity is exceeded.
     pub fn insert(&mut self, block: Block<T, Registered>, lineage_hash: PositionalLineageHash) {
-        // Enforce capacity before insertion
-        // Note: We check if count >= capacity.
-        // We only panic if we are ADDING a new block (not filling a ghost or updating)
-        // But verifying that before looking up is hard.
-        // Let's defer check until we know we increment count.
+        // Enforce capacity before insertion check (approximate, refined later)
+        // If we know we are definitely adding a new block (not updating), we check.
+        // But we don't know yet.
+        // If at capacity, and we add a new one, we panic.
 
         let position = lineage_hash.position();
         let fragment = lineage_hash.current_hash_fragment();
@@ -98,6 +102,8 @@ impl<T: BlockMetadata> LineageBackend<T> {
         };
 
         let mut increment_count = false;
+        let tick = self.current_tick;
+        self.current_tick += 1;
 
         // 1. Create or update the node
         let is_new_node = !self
@@ -107,22 +113,27 @@ impl<T: BlockMetadata> LineageBackend<T> {
 
         if is_new_node {
             increment_count = true;
-            let node = LineageNode::new(block, lineage_hash);
+            let node = LineageNode::new(block, lineage_hash, tick);
             self.nodes.entry(position).or_default().insert(fragment, node);
         } else {
-            // Node exists
             let level = self.nodes.get_mut(&position).unwrap();
             let node = level.get_mut(&fragment).unwrap();
 
             if node.block.is_none() {
                 increment_count = true;
+            } else {
+                // If block existed, we are updating it. Remove from leaf_queue if it was there
+                // because we will update its timestamp and potentially re-add it.
+                if node.is_leaf() {
+                    self.leaf_queue.remove(&(node.last_used, position, fragment));
+                }
             }
             node.block = Some(block);
             node.parent_fragment = parent_fragment;
+            node.last_used = tick;
         }
 
         if increment_count {
-            // Check capacity
             if self.count >= self.capacity {
                 panic!(
                     "Lineage backend insert would cause overflow! len={}, cap={}. \
@@ -145,23 +156,26 @@ impl<T: BlockMetadata> LineageBackend<T> {
                     position: p_pos,
                     parent_fragment: None, // We don't know the parent's parent yet
                     children: HashSet::new(),
+                    last_used: 0, // Irrelevant for ghost
                 }
             });
 
             let was_parent_leaf = parent_node.is_leaf();
             parent_node.children.insert(fragment);
 
-            // If parent was a leaf and in LRU, it is no longer a leaf. Remove from LRU.
             if was_parent_leaf {
-                self.leaf_lru.pop(&(p_pos, p_frag));
+                // Parent was a leaf, now has a child. Remove from queue.
+                // Note: Ghost nodes (block=None) are never in queue, but check is cheap.
+                if parent_node.block.is_some() {
+                    self.leaf_queue.remove(&(parent_node.last_used, p_pos, p_frag));
+                }
             }
         }
 
         // 3. Update LRU status for this node
-        let is_leaf = self.nodes.get(&position).unwrap().get(&fragment).unwrap().is_leaf();
-
-        if is_leaf {
-             self.leaf_lru.put((position, fragment), ());
+        let node = self.nodes.get(&position).unwrap().get(&fragment).unwrap();
+        if node.is_leaf() {
+             self.leaf_queue.insert((node.last_used, position, fragment), ());
         }
     }
 
@@ -170,7 +184,11 @@ impl<T: BlockMetadata> LineageBackend<T> {
         let mut allocated = Vec::with_capacity(count);
 
         while allocated.len() < count {
-            if let Some(((pos, frag), _)) = self.leaf_lru.pop_lru() {
+            if let Some((&(_tick, pos, frag), _)) = self.leaf_queue.iter().next() {
+                // Need to remove from map using the key we just found
+                let key = (_tick, pos, frag);
+                self.leaf_queue.remove(&key);
+
                 if let Some(b) = self.remove_block(pos, frag) {
                     allocated.push(b);
                 }
@@ -187,17 +205,20 @@ impl<T: BlockMetadata> LineageBackend<T> {
         let position = lineage_hash.position();
         let fragment = lineage_hash.current_hash_fragment();
 
-        let has_block = self.nodes.get(&position)
+        let node_data = self.nodes.get(&position)
             .and_then(|level| level.get(&fragment))
-            .map(|node| node.block.is_some())
-            .unwrap_or(false);
+            .map(|node| (node.block.is_some(), node.last_used));
 
-        if !has_block {
-            return None;
+        if let Some((has_block, tick)) = node_data {
+            if !has_block {
+                return None;
+            }
+            // Remove from queue if present (might be present if it's a leaf)
+            self.leaf_queue.remove(&(tick, position, fragment));
+            self.remove_block(position, fragment)
+        } else {
+            None
         }
-
-        self.leaf_lru.pop(&(position, fragment));
-        self.remove_block(position, fragment)
     }
 
     /// Internal method to remove a block from the graph.
@@ -243,6 +264,7 @@ impl<T: BlockMetadata> LineageBackend<T> {
                 if let Some((p_pos, p_frag)) = parent_info {
                     let mut parent_became_leaf = false;
                     let mut parent_has_block = false;
+                    let mut parent_tick = 0;
 
                     if let Some(level) = self.nodes.get_mut(&p_pos) {
                         if let Some(parent) = level.get_mut(&p_frag) {
@@ -250,13 +272,15 @@ impl<T: BlockMetadata> LineageBackend<T> {
                             if parent.children.is_empty() {
                                 parent_became_leaf = true;
                                 parent_has_block = parent.block.is_some();
+                                parent_tick = parent.last_used;
                             }
                         }
                     }
 
                     if parent_became_leaf {
                         if parent_has_block {
-                            self.leaf_lru.put((p_pos, p_frag), ());
+                            // Parent is a real block leaf -> add to queue using its OLD tick
+                            self.leaf_queue.insert((parent_tick, p_pos, p_frag), ());
                             break;
                         } else {
                             current_pos = p_pos;
@@ -286,10 +310,9 @@ impl<T: BlockMetadata> LineageBackend<T> {
         self.count == 0
     }
 
-    // For debugging/testing
     #[allow(dead_code)]
-    pub fn get_lru_len(&self) -> usize {
-        self.leaf_lru.len()
+    pub fn get_queue_len(&self) -> usize {
+        self.leaf_queue.len()
     }
 }
 
@@ -333,7 +356,7 @@ mod tests {
         backend.insert(b1, h1);
 
         assert_eq!(backend.len(), 1);
-        assert_eq!(backend.get_lru_len(), 1); // It is a leaf (no children)
+        assert_eq!(backend.get_queue_len(), 1); // It is a leaf (no children)
 
         let allocated = backend.allocate(1);
         assert_eq!(allocated.len(), 1);
@@ -353,7 +376,7 @@ mod tests {
 
         // Insert parent first
         backend.insert(b1, h1);
-        assert_eq!(backend.get_lru_len(), 1); // h1 is leaf
+        assert_eq!(backend.get_queue_len(), 1); // h1 is leaf
 
         // Insert child
         backend.insert(b2, h2);
@@ -361,14 +384,14 @@ mod tests {
 
         // h1 is no longer leaf (has child h2). h2 is leaf.
         // LRU should contain only h2.
-        assert_eq!(backend.get_lru_len(), 1);
+        assert_eq!(backend.get_queue_len(), 1);
 
         let allocated = backend.allocate(1);
         assert_eq!(allocated.len(), 1);
         assert_eq!(allocated[0].block_id(), 2); // Should allocate h2 (leaf)
 
         // Now h1 should be a leaf again and added to LRU
-        assert_eq!(backend.get_lru_len(), 1);
+        assert_eq!(backend.get_queue_len(), 1);
 
         let allocated2 = backend.allocate(1);
         assert_eq!(allocated2.len(), 1);
@@ -390,7 +413,7 @@ mod tests {
         // Created ghost node for parent h1.
         // h2 is leaf.
         assert_eq!(backend.len(), 1); // Only 1 actual block
-        assert_eq!(backend.get_lru_len(), 1);
+        assert_eq!(backend.get_queue_len(), 1);
 
         // Insert parent
         backend.insert(b1, h1);
@@ -398,13 +421,13 @@ mod tests {
         // h2 is still leaf.
 
         assert_eq!(backend.len(), 2);
-        assert_eq!(backend.get_lru_len(), 1); // Only h2
+        assert_eq!(backend.get_queue_len(), 1); // Only h2
 
         let allocated = backend.allocate(1);
         assert_eq!(allocated[0].block_id(), 2);
 
         // Now h1 becomes leaf
-        assert_eq!(backend.get_lru_len(), 1);
+        assert_eq!(backend.get_queue_len(), 1);
 
         let allocated2 = backend.allocate(1);
         assert_eq!(allocated2[0].block_id(), 1);
@@ -429,41 +452,64 @@ mod tests {
 
         // Root has 2 children.
         // LRU should have child1 and child2. Root is not leaf.
-        assert_eq!(backend.get_lru_len(), 2);
+        assert_eq!(backend.get_queue_len(), 2);
 
         // Allocate 2 blocks (both children)
         let allocated = backend.allocate(2);
         assert_eq!(allocated.len(), 2);
 
         // Now root should be leaf
-        assert_eq!(backend.get_lru_len(), 1);
+        assert_eq!(backend.get_queue_len(), 1);
 
         let allocated_root = backend.allocate(1);
         assert_eq!(allocated_root[0].block_id(), 1);
     }
 
     #[test]
-    fn test_chain_eviction() {
-        // Chain: A -> B -> C -> D
+    fn test_interleaved_chains() {
+        // Chain 1: A(0) -> B(1)
+        // Chain 2: X(10) -> Y(11)
+        // We want strict consumption of older chain.
         let mut backend = LineageBackend::<TestData>::new(NonZeroUsize::new(10).unwrap());
 
-        let blocks: Vec<_> = (0..4).map(|i| create_block(i)).collect();
-        let hashes: Vec<_> = (0..4).map(|i| make_hash(i as u64, 100 + i as u64, 100 + i as u64 - 1)).collect();
+        let a = create_block(1);
+        let b = create_block(2);
+        let x = create_block(3);
+        let y = create_block(4);
 
-        for (b, h) in blocks.into_iter().zip(hashes.into_iter()) {
-            backend.insert(b, h);
-        }
+        // Manually manipulate ticks? No, just insert in order.
+        // insert(A) tick 0
+        // insert(B) tick 1
+        // insert(X) tick 2
+        // insert(Y) tick 3
+        // So Chain 1 is older.
+
+        backend.insert(a, make_hash(0, 100, 0));
+        backend.insert(b, make_hash(1, 101, 100));
+
+        backend.insert(x, make_hash(0, 200, 0));
+        backend.insert(y, make_hash(1, 201, 200));
 
         assert_eq!(backend.len(), 4);
-        assert_eq!(backend.get_lru_len(), 1); // Only D is leaf
+        assert_eq!(backend.get_queue_len(), 2); // Leaves: B, Y
 
-        let allocated = backend.allocate(4);
-        // Expect order: D, C, B, A (IDs: 3, 2, 1, 0)
-        assert_eq!(allocated.len(), 4);
-        assert_eq!(allocated[0].block_id(), 3);
-        assert_eq!(allocated[1].block_id(), 2);
-        assert_eq!(allocated[2].block_id(), 1);
-        assert_eq!(allocated[3].block_id(), 0);
+        // B (tick 1) is older than Y (tick 3). Expect B.
+        let alloc1 = backend.allocate(1);
+        assert_eq!(alloc1[0].block_id(), 2); // B
+
+        // Now A becomes leaf. A has tick 0.
+        // Queue: A(0), Y(3).
+        // Expect A.
+        let alloc2 = backend.allocate(1);
+        assert_eq!(alloc2[0].block_id(), 1); // A
+
+        // Now Y(3).
+        let alloc3 = backend.allocate(1);
+        assert_eq!(alloc3[0].block_id(), 4); // Y
+
+        // Now X becomes leaf. X has tick 2.
+        let alloc4 = backend.allocate(1);
+        assert_eq!(alloc4[0].block_id(), 3); // X
     }
 
     #[test]
@@ -520,14 +566,14 @@ mod tests {
 
         assert_eq!(backend.len(), depth);
         // Only last one is leaf
-        assert_eq!(backend.get_lru_len(), 1);
+        assert_eq!(backend.get_queue_len(), 1);
 
         let last_h = make_hash((depth-1) as u64, 100 + (depth-1) as u64, 100 + (depth-2) as u64);
         backend.remove(&last_h);
 
         assert_eq!(backend.len(), depth - 1);
         // Now 998 is leaf
-        assert_eq!(backend.get_lru_len(), 1);
+        assert_eq!(backend.get_queue_len(), 1);
 
         // Now insert a chain out of order to create ghosts, then delete leaf to trigger cleanup
         backend = LineageBackend::<TestData>::new(NonZeroUsize::new(2000).unwrap());
