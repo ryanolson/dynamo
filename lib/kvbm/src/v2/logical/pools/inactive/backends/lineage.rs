@@ -81,12 +81,13 @@ impl<T: BlockMetadata> LineageBackend<T> {
     }
 
     /// Inserts a block into the lineage graph.
-    /// If capacity is exceeded, evicts the least recently used leaf.
+    /// Panics if capacity is exceeded.
     pub fn insert(&mut self, block: Block<T, Registered>, lineage_hash: PositionalLineageHash) {
         // Enforce capacity before insertion
-        if self.count >= self.capacity {
-            self.evict_leaf();
-        }
+        // Note: We check if count >= capacity.
+        // We only panic if we are ADDING a new block (not filling a ghost or updating)
+        // But verifying that before looking up is hard.
+        // Let's defer check until we know we increment count.
 
         let position = lineage_hash.position();
         let fragment = lineage_hash.current_hash_fragment();
@@ -96,6 +97,8 @@ impl<T: BlockMetadata> LineageBackend<T> {
             None
         };
 
+        let mut increment_count = false;
+
         // 1. Create or update the node
         let is_new_node = !self
             .nodes
@@ -103,19 +106,31 @@ impl<T: BlockMetadata> LineageBackend<T> {
             .map_or(false, |level| level.contains_key(&fragment));
 
         if is_new_node {
+            increment_count = true;
             let node = LineageNode::new(block, lineage_hash);
             self.nodes.entry(position).or_default().insert(fragment, node);
-            self.count += 1;
         } else {
             // Node exists
             let level = self.nodes.get_mut(&position).unwrap();
             let node = level.get_mut(&fragment).unwrap();
 
             if node.block.is_none() {
-                self.count += 1;
+                increment_count = true;
             }
             node.block = Some(block);
             node.parent_fragment = parent_fragment;
+        }
+
+        if increment_count {
+            // Check capacity
+            if self.count >= self.capacity {
+                panic!(
+                    "Lineage backend insert would cause overflow! len={}, cap={}. \
+                     This indicates insufficient capacity for all blocks.",
+                    self.count, self.capacity
+                );
+            }
+            self.count += 1;
         }
 
         // 2. Link to parent
@@ -147,13 +162,6 @@ impl<T: BlockMetadata> LineageBackend<T> {
 
         if is_leaf {
              self.leaf_lru.put((position, fragment), ());
-        }
-    }
-
-    /// Evicts the least recently used leaf to free up space.
-    fn evict_leaf(&mut self) {
-        if let Some(((pos, frag), _)) = self.leaf_lru.pop_lru() {
-            self.remove_block(pos, frag);
         }
     }
 
@@ -459,7 +467,8 @@ mod tests {
     }
 
     #[test]
-    fn test_capacity_eviction() {
+    #[should_panic(expected = "Lineage backend insert would cause overflow")]
+    fn test_capacity_enforcement() {
         // Capacity 2
         let mut backend = LineageBackend::<TestData>::new(NonZeroUsize::new(2).unwrap());
 
@@ -467,32 +476,18 @@ mod tests {
         let h1 = make_hash(0, 100, 0);
 
         let b2 = create_block(2);
-        let h2 = make_hash(1, 200, 100); // Child of h1
+        let h2 = make_hash(1, 200, 100);
 
         backend.insert(b1, h1);
         backend.insert(b2, h2);
 
         assert_eq!(backend.len(), 2);
-        assert_eq!(backend.get_lru_len(), 1); // Only h2 is leaf
 
-        // Insert 3rd block (unrelated)
+        // Insert 3rd block - should panic
         let b3 = create_block(3);
         let h3 = make_hash(0, 300, 0);
 
         backend.insert(b3, h3);
-
-        // Should have evicted h2 (leaf).
-        // Then h1 became leaf and added to LRU.
-        // Then h3 added as leaf.
-
-        assert_eq!(backend.len(), 2); // Capacity maintained
-
-        let allocated = backend.allocate(2);
-        // Should get h1 and h3.
-        let ids: Vec<_> = allocated.iter().map(|b| b.block_id()).collect();
-        assert!(ids.contains(&1));
-        assert!(ids.contains(&3));
-        assert!(!ids.contains(&2));
     }
 
     #[test]
