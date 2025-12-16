@@ -88,8 +88,6 @@ impl<T: BlockMetadata> LineageBackend<T> {
     /// Inserts a block into the lineage graph.
     /// Panics if capacity is exceeded.
     pub fn insert(&mut self, block: Block<T, Registered>, lineage_hash: PositionalLineageHash) {
-        // Enforce capacity before insertion check (approximate, refined later)
-
         let position = lineage_hash.position();
         let fragment = lineage_hash.current_hash_fragment();
         let parent_fragment = if position > 0 {
@@ -103,31 +101,28 @@ impl<T: BlockMetadata> LineageBackend<T> {
         self.current_tick += 1;
 
         // 1. Create or update the node
-        let is_new_node = !self
-            .nodes
-            .get(&position)
-            .map_or(false, |level| level.contains_key(&fragment));
-
-        if is_new_node {
-            increment_count = true;
-            let node = LineageNode::new(block, lineage_hash, tick);
-            self.nodes.entry(position).or_default().insert(fragment, node);
-        } else {
-            let level = self.nodes.get_mut(&position).unwrap();
-            let node = level.get_mut(&fragment).unwrap();
-
-            if node.block.is_none() {
+        let level = self.nodes.entry(position).or_default();
+        match level.entry(fragment) {
+            std::collections::hash_map::Entry::Vacant(e) => {
                 increment_count = true;
-            } else {
-                // If block existed, we are updating it. Remove from leaf_queue if it was there
-                // because we will update its timestamp and potentially re-add it.
-                if node.is_leaf() {
-                    self.leaf_queue.remove(&(node.last_used, position, fragment));
-                }
+                let node = LineageNode::new(block, lineage_hash, tick);
+                e.insert(node);
             }
-            node.block = Some(block);
-            node.parent_fragment = parent_fragment;
-            node.last_used = tick;
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let node = e.get_mut();
+                if node.block.is_none() {
+                    increment_count = true;
+                } else {
+                    // If block existed, we are updating it. Remove from leaf_queue if it was there
+                    // because we will update its timestamp and potentially re-add it.
+                    if node.is_leaf() {
+                        self.leaf_queue.remove(&(node.last_used, position, fragment));
+                    }
+                }
+                node.block = Some(block);
+                node.parent_fragment = parent_fragment;
+                node.last_used = tick;
+            }
         }
 
         if increment_count {
