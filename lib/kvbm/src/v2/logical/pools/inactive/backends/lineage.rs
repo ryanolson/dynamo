@@ -89,9 +89,6 @@ impl<T: BlockMetadata> LineageBackend<T> {
     /// Panics if capacity is exceeded.
     pub fn insert(&mut self, block: Block<T, Registered>, lineage_hash: PositionalLineageHash) {
         // Enforce capacity before insertion check (approximate, refined later)
-        // If we know we are definitely adding a new block (not updating), we check.
-        // But we don't know yet.
-        // If at capacity, and we add a new one, we panic.
 
         let position = lineage_hash.position();
         let fragment = lineage_hash.current_hash_fragment();
@@ -593,5 +590,78 @@ mod tests {
 
         assert_eq!(backend.len(), 0);
         assert!(backend.nodes.is_empty());
+    }
+
+    #[test]
+    fn test_split_sequence_eviction() {
+        // Scenario: A(0)->B(1)->C(2)-> {D(3)->E(4), F(3)->G(4)}
+        // Leaves: E and G.
+        // We want to ensure C is not exposed until both branches are gone.
+        let mut backend = LineageBackend::<TestData>::new(NonZeroUsize::new(20).unwrap());
+
+        // Create blocks
+        let a = create_block(0); let ha = make_hash(0, 100, 0);
+        let b = create_block(1); let hb = make_hash(1, 101, 100);
+        let c = create_block(2); let hc = make_hash(2, 102, 101);
+
+        let d = create_block(3); let hd = make_hash(3, 103, 102);
+        let e = create_block(4); let he = make_hash(4, 104, 103);
+
+        let f = create_block(5); let hf = make_hash(3, 105, 102);
+        let g = create_block(6); let hg = make_hash(4, 106, 105);
+
+        // Insert
+        backend.insert(a, ha);
+        backend.insert(b, hb);
+        backend.insert(c, hc);
+        backend.insert(d, hd);
+        backend.insert(e, he);
+        backend.insert(f, hf);
+        backend.insert(g, hg);
+
+        assert_eq!(backend.len(), 7);
+        // Leaves are E and G.
+        assert_eq!(backend.get_queue_len(), 2);
+
+        // Allocate E (D->E branch tip)
+        let alloc1 = backend.allocate(1);
+        assert!(alloc1[0].block_id() == 4 || alloc1[0].block_id() == 6); // E or G
+
+        // Assume E was allocated (based on insertion order E before G?
+        // E tick=4, G tick=6. E is older. So E should be allocated first.
+        assert_eq!(alloc1[0].block_id(), 4); // E
+
+        // Now D is a leaf. D tick=3. G tick=6.
+        // Queue: D(3), G(6).
+        assert_eq!(backend.get_queue_len(), 2);
+
+        // Allocate D.
+        let alloc2 = backend.allocate(1);
+        assert_eq!(alloc2[0].block_id(), 3); // D
+
+        // Now D is gone. D's parent is C.
+        // C has another child F. So C is NOT a leaf.
+        // Queue should only have G(6).
+        assert_eq!(backend.get_queue_len(), 1);
+
+        // Allocate G.
+        let alloc3 = backend.allocate(1);
+        assert_eq!(alloc3[0].block_id(), 6); // G
+
+        // Now F is a leaf. F tick=5.
+        // Queue: F(5).
+        assert_eq!(backend.get_queue_len(), 1);
+
+        // Allocate F.
+        let alloc4 = backend.allocate(1);
+        assert_eq!(alloc4[0].block_id(), 5); // F
+
+        // Now F is gone. F's parent is C.
+        // C has no more children. C is now a leaf.
+        // C should be in Queue.
+        assert_eq!(backend.get_queue_len(), 1);
+
+        let alloc5 = backend.allocate(1);
+        assert_eq!(alloc5[0].block_id(), 2); // C
     }
 }
