@@ -159,6 +159,40 @@ impl PositionalSequenceHash {
     }
 }
 
+impl PositionalSequenceHash {
+    /// Returns the hash fragment that identifies the current block within its
+    /// position level.
+    ///
+    /// This is an alias for [`local_block_hash`](Self::local_block_hash),
+    /// provided for compatibility with lineage-tree based algorithms.
+    #[inline]
+    pub fn current_hash_fragment(&self) -> u64 {
+        self.local_block_hash()
+    }
+
+    /// Returns the hash fragment that identifies the parent block at
+    /// `position - 1` in the lineage chain.
+    ///
+    /// Derives the parent's fragment by removing the current block's
+    /// contribution from the rolling sequence hash.
+    #[inline]
+    pub fn parent_hash_fragment(&self) -> u64 {
+        self.sequence_hash() ^ self.local_block_hash()
+    }
+}
+
+impl std::fmt::Display for PositionalSequenceHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PSH(pos={}, seq={:#x}, lbh={:#x})",
+            self.position(),
+            self.sequence_hash(),
+            self.local_block_hash(),
+        )
+    }
+}
+
 impl std::fmt::Debug for PositionalSequenceHash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PositionalSequenceHash")
