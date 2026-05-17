@@ -363,10 +363,8 @@ impl ConnectorLeader {
         // to `final_end - effective_start`. Without this the wrapper's
         // `local_g2.len() == split.local_match_blocks` invariant fails on any
         // shard with a partial match or any race against vLLM's eviction.
-        crate::connector::leader::onboard::collect_g2_blocks_from_shards(
-            onboarding, block_size,
-        )
-        .with_context(|| format!("slot {} G2 collection failed", request_id))
+        crate::connector::leader::onboard::collect_g2_blocks_from_shards(onboarding, block_size)
+            .with_context(|| format!("slot {} G2 collection failed", request_id))
     }
 
     /// Clone a contiguous slice of the slot's `TokenBlock`s.
