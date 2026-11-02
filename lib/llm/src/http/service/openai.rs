@@ -1421,13 +1421,17 @@ async fn completions_single(
             error_signal,
         );
 
-        let mut sse_stream = Sse::new(stream);
+        // axum 0.8.5 and later return another type from `keep_alive`, so
+        // each branch makes its own response.
+        let sse_stream = Sse::new(stream);
+        let sse_stream = match state.sse_keep_alive() {
+            Some(keep_alive) => sse_stream
+                .keep_alive(KeepAlive::default().interval(keep_alive))
+                .into_response(),
+            None => sse_stream.into_response(),
+        };
 
-        if let Some(keep_alive) = state.sse_keep_alive() {
-            sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
-        }
-
-        Ok(sse_stream.into_response())
+        Ok(sse_stream)
     } else {
         // Observe metrics as frames arrive, ahead of the backend-error preflight,
         // for the same reason as the chat handler (#11349): the preflight buffers
@@ -1786,13 +1790,17 @@ async fn completions_batch(
             error_signal,
         );
 
-        let mut sse_stream = Sse::new(stream);
+        // axum 0.8.5 and later return another type from `keep_alive`, so
+        // each branch makes its own response.
+        let sse_stream = Sse::new(stream);
+        let sse_stream = match state.sse_keep_alive() {
+            Some(keep_alive) => sse_stream
+                .keep_alive(KeepAlive::default().interval(keep_alive))
+                .into_response(),
+            None => sse_stream.into_response(),
+        };
 
-        if let Some(keep_alive) = state.sse_keep_alive() {
-            sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
-        }
-
-        Ok(sse_stream.into_response())
+        Ok(sse_stream)
     } else {
         // Tap the stream to collect metrics for non-streaming requests without altering items
         let mut http_queue_guard = Some(http_queue_guard);
@@ -3866,11 +3874,16 @@ async fn chat_completions(
             }
         };
 
-        let mut sse_stream = Sse::new(stream);
-        if let Some(keep_alive) = keep_alive {
-            sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
-        }
-        Ok(sse_stream.into_response())
+        // axum 0.8.5 and later return another type from `keep_alive`, so
+        // each branch makes its own response.
+        let sse_stream = Sse::new(stream);
+        let sse_stream = match keep_alive {
+            Some(keep_alive) => sse_stream
+                .keep_alive(KeepAlive::default().interval(keep_alive))
+                .into_response(),
+            None => sse_stream.into_response(),
+        };
+        Ok(sse_stream)
     } else {
         // Observe metrics as frames arrive, ahead of the backend-error preflight:
         // the preflight buffers leading annotation frames, so observing after it
@@ -4546,12 +4559,17 @@ async fn responses(
             error_signal,
         );
 
-        let mut sse_stream = Sse::new(stream);
-        if let Some(keep_alive) = state.sse_keep_alive_for_response(stream_can_defer_all_output) {
-            sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
-        }
+        // axum 0.8.5 and later return another type from `keep_alive`, so
+        // each branch makes its own response.
+        let sse_stream = Sse::new(stream);
+        let sse_stream = match state.sse_keep_alive_for_response(stream_can_defer_all_output) {
+            Some(keep_alive) => sse_stream
+                .keep_alive(KeepAlive::default().interval(keep_alive))
+                .into_response(),
+            None => sse_stream.into_response(),
+        };
 
-        Ok(sse_stream.into_response())
+        Ok(sse_stream)
     } else {
         // Non-streaming path: aggregate stream into single response
 
@@ -5468,14 +5486,19 @@ async fn videos(
             error_signal,
         );
 
-        let mut sse_stream = Sse::new(stream);
-        if let Some(keep_alive) = state.sse_keep_alive() {
-            sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
-        }
+        // axum 0.8.5 and later return another type from `keep_alive`, so
+        // each branch makes its own response.
+        let sse_stream = Sse::new(stream);
+        let sse_stream = match state.sse_keep_alive() {
+            Some(keep_alive) => sse_stream
+                .keep_alive(KeepAlive::default().interval(keep_alive))
+                .into_response(),
+            None => sse_stream.into_response(),
+        };
         // Disarm immediately: we return the body directly, so disconnect detection
         // transfers to stream_handle (armed inside monitor_for_disconnects).
         connection_handle.disarm();
-        Ok(sse_stream.into_response())
+        Ok(sse_stream)
     } else {
         let stream = stream.inspect(move |response| {
             process_response_and_observe_metrics(

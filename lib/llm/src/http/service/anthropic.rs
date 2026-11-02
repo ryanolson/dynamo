@@ -890,11 +890,16 @@ async fn anthropic_messages(
             error_signal,
         );
 
-        let mut sse_stream = Sse::new(stream);
-        if let Some(keep_alive) = keep_alive {
-            sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
-        }
-        Ok(sse_stream.into_response())
+        // axum 0.8.5 and later return another type from `keep_alive`, so
+        // each branch makes its own response.
+        let sse_stream = Sse::new(stream);
+        let sse_stream = match keep_alive {
+            Some(keep_alive) => sse_stream
+                .keep_alive(KeepAlive::default().interval(keep_alive))
+                .into_response(),
+            None => sse_stream.into_response(),
+        };
+        Ok(sse_stream)
     } else {
         // Non-streaming path: aggregate stream into single response
 

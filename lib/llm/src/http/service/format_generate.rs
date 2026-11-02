@@ -573,11 +573,15 @@ impl Dispatch {
             stream_handle,
             move |error| stream_error(&format, error),
         );
-        let mut response = Sse::new(stream);
-        if let Some(keep_alive) = state.sse_keep_alive() {
-            response = response.keep_alive(KeepAlive::default().interval(keep_alive));
+        // axum 0.8.5 and later return another type from `keep_alive`, so
+        // each branch makes its own response.
+        let response = Sse::new(stream);
+        match state.sse_keep_alive() {
+            Some(keep_alive) => response
+                .keep_alive(KeepAlive::default().interval(keep_alive))
+                .into_response(),
+            None => response.into_response(),
         }
-        response.into_response()
     }
 }
 
