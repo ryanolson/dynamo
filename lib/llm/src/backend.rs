@@ -306,6 +306,7 @@ impl Backend {
         let context = next_stream.context();
         let state = self.decoder(next_stream, decoder_params)?;
 
+        // hot path: per-item-response
         let processed_stream = stream::unfold(state, |mut state| async move {
             // If we've already detected a local stop condition, end the stream
             if state.finished {
