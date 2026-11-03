@@ -19,6 +19,8 @@ anyhow = { workspace = true }
 dynamo-runtime = { workspace = true }
 
 [dev-dependencies]
+dynamo-kv-router = { workspace = true }
+dynamo-mocker = { workspace = true }
 reqwest = { workspace = true }
 temp-env = { version = "0.3.6", features = ["async_closure"] }
 tokio = { workspace = true }

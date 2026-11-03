@@ -12,4 +12,5 @@
 
 use gdl as _;
 
+pub mod config;
 pub mod metrics;

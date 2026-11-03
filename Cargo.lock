@@ -2493,6 +2493,8 @@ name = "dynamo-gdl-adapters"
 version = "1.7.0"
 dependencies = [
  "anyhow",
+ "dynamo-kv-router",
+ "dynamo-mocker",
  "dynamo-runtime",
  "gdl",
  "reqwest 0.12.28",
