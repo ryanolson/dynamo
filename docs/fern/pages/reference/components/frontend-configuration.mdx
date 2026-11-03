@@ -779,6 +779,16 @@ curl -s localhost:8000/metrics | grep dynamo_frontend_inter_token_latency_second
   Environment variable: `DYN_PREPROCESS_WORKERS`
 </ParamField>
 
+<ParamField path="DYN_LOCAL_PIPELINE" type="string" default="dynamo">
+  Experimental. How the frontend composes the routed chat and completions pipeline (preprocessor,
+  migration, detokenizer, encoder router, prefill router, router). `gdl` composes the same stages
+  as a gdl local pipeline of nested calls. It makes more heap allocations per request than
+  `dynamo` until the stages are ported to gdl. Any other value fails the model's pipeline build.
+  The frontend logs the pipeline it built for each model in the `local_pipeline` field.
+
+  <span className="enum-values"><span className="enum-label">Allowed values:</span> <Badge intent="note" minimal>dynamo</Badge> <Badge intent="note" minimal>gdl</Badge></span>
+</ParamField>
+
 <ParamField path="-i / --interactive" type="boolean" default="false">
   Interactive text chat mode.
 

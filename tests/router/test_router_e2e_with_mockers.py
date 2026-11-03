@@ -29,6 +29,7 @@ from tests.router.common import (
     _test_disagg_topology_required_prefill_pin_match_and_mismatch,
     _test_python_router_bindings,
     _test_remote_indexer_decisions,
+    _test_repeated_prompt_cache_hit,
     _test_router_decisions_disagg_round_robin_prefill_dp_rank,
     _test_router_overload_529,
     _test_router_override_router_config,
@@ -598,6 +599,13 @@ def test_mocker_two_kv_router(
         )
 
 
+LOCAL_PIPELINES = (
+    pytest.param(None, id="dynamo"),
+    pytest.param("gdl", id="gdl"),
+)
+
+
+@pytest.mark.parametrize("local_pipeline", LOCAL_PIPELINES)
 @pytest.mark.parametrize("store_backend", ["etcd", "file"])
 @pytest.mark.timeout(180)
 def test_mocker_session_affinity(
@@ -606,6 +614,7 @@ def test_mocker_session_affinity(
     predownload_tokenizers,
     file_storage_backend,
     store_backend,
+    local_pipeline,
 ):
     """Replica affinity overrides conflicting per-frontend KV-prefix placement."""
     mocker_args = {
@@ -626,6 +635,43 @@ def test_mocker_session_affinity(
             router_ports=allocate_frontend_ports(request, 2),
             test_payload=TEST_PAYLOAD,
             store_backend=store_backend,
+            local_pipeline=local_pipeline,
+        )
+
+
+@pytest.mark.parametrize("local_pipeline", LOCAL_PIPELINES)
+# The frontend subscribes to KV events over NATS; the mockers must publish there.
+@pytest.mark.parametrize("event_plane", ["nats"], indirect=True)
+@pytest.mark.timeout(180)
+def test_mocker_repeated_prompt_cache_hit(
+    request,
+    runtime_services_dynamic_ports,
+    predownload_tokenizers,
+    file_storage_backend,
+    event_plane,
+    local_pipeline,
+):
+    """The same chat prompt twice through the HTTP frontend's routed pipeline:
+    the second hits the prefix cache, on Dynamo's local pipeline and on gdl's."""
+    mocker_args = {
+        "speedup_ratio": SPEEDUP_RATIO,
+        "block_size": BLOCK_SIZE,
+    }
+
+    with MockerProcess(
+        request,
+        mocker_args=mocker_args,
+        num_mockers=NUM_MOCKERS,
+        store_backend="file",
+    ) as mockers:
+        _test_repeated_prompt_cache_hit(
+            engine_workers=mockers,
+            block_size=BLOCK_SIZE,
+            request=request,
+            frontend_port=allocate_frontend_ports(request, 1)[0],
+            test_payload=TEST_PAYLOAD,
+            store_backend="file",
+            local_pipeline=local_pipeline,
         )
 
 

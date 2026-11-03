@@ -36,6 +36,7 @@ from tests.utils.router_logs import (
     parse_kv_event_diagnostics,
     select_kv_event_diagnostics,
     wait_for_kv_event_diagnostics,
+    wait_for_local_pipeline_records,
 )
 from tests.utils.router_nvext import parse_sse_json_chunks
 
@@ -550,6 +551,29 @@ def _test_router_two_routers(
             kv_router.__exit__(None, None, None)
 
 
+def local_pipeline_env(local_pipeline: str | None) -> dict[str, str | None]:
+    """Frontend environment that selects ``local_pipeline`` (``None`` removes
+    ``DYN_LOCAL_PIPELINE``, so an inherited value cannot select gdl) and logs
+    JSONL, so the pipeline the frontend built can be read back. The console
+    format is set, not the legacy ``DYN_LOGGING_JSONL``, which an inherited
+    ``DYN_LOGGING_CONSOLE_FORMAT`` would override."""
+
+    return {
+        "DYN_LOCAL_PIPELINE": local_pipeline,
+        "DYN_LOGGING_CONSOLE_FORMAT": "jsonl",
+        "DYN_LOG": "info",
+    }
+
+
+def assert_local_pipeline(frontend, local_pipeline: str | None) -> None:
+    """Fail unless the frontend built every routed pipeline on ``local_pipeline``
+    (``None`` means the default, Dynamo's). A flag the frontend ignored fails here."""
+
+    expected = local_pipeline or "dynamo"
+    records = wait_for_local_pipeline_records(frontend, timeout_s=30)
+    assert {record.local_pipeline for record in records} == {expected}, records
+
+
 def _test_session_affinity(
     engine_workers,
     block_size: int,
@@ -557,6 +581,7 @@ def _test_session_affinity(
     router_ports: list[int],
     test_payload: dict[str, Any],
     store_backend: str = "etcd",
+    local_pipeline: str | None = None,
 ):
     """Verify replica affinity overrides conflicting per-frontend KV placement."""
     with (
@@ -570,7 +595,8 @@ def _test_session_affinity(
             min_initial_workers=engine_workers.num_workers,
             event_plane="nats",
             session_affinity_ttl_secs=300,
-        ),
+            extra_env=local_pipeline_env(local_pipeline),
+        ) as frontend_a,
         FrontendRouterProcess(
             request,
             block_size,
@@ -581,7 +607,8 @@ def _test_session_affinity(
             min_initial_workers=engine_workers.num_workers,
             event_plane="nats",
             session_affinity_ttl_secs=300,
-        ),
+            extra_env=local_pipeline_env(local_pipeline),
+        ) as frontend_b,
     ):
         urls = [f"http://localhost:{port}/v1/chat/completions" for port in router_ports]
 
@@ -605,6 +632,8 @@ def _test_session_affinity(
                     store_backend=store_backend,
                     request_plane="nats",
                 )
+            for frontend in (frontend_a, frontend_b):
+                assert_local_pipeline(frontend, local_pipeline)
 
             suffix = uuid.uuid4().hex
             prefix_a = " ".join([f"affinity-alpha-{suffix}"] * (block_size * 2))
@@ -732,6 +761,121 @@ def _test_session_affinity(
                 assert await send(
                     client, urls[1], payload(prefix_b), session_a_headers
                 ) == (worker_a, 0)
+
+        asyncio.run(run_test())
+
+
+def _test_repeated_prompt_cache_hit(
+    engine_workers,
+    block_size: int,
+    request,
+    frontend_port: int,
+    test_payload: dict[str, Any],
+    store_backend: str = "etcd",
+    local_pipeline: str | None = None,
+):
+    """Send the same chat prompt twice through the HTTP frontend with KV routing.
+    Both requests stream content. The second must be routed by its KV overlap
+    (``nvext.timing.kv_hit_rate`` above 0) and report a prefix-cache hit
+    (``usage.prompt_tokens_details.cached_tokens`` above 0)."""
+    with FrontendRouterProcess(
+        request,
+        block_size,
+        frontend_port,
+        engine_workers.namespace,
+        store_backend,
+        router_mode="kv",
+        min_initial_workers=engine_workers.num_workers,
+        event_plane="nats",
+        extra_env=local_pipeline_env(local_pipeline),
+    ) as frontend:
+        url = f"http://localhost:{frontend_port}/v1/chat/completions"
+
+        async def run_test() -> None:
+            await wait_for_frontend_ready(
+                frontend_url=f"http://localhost:{frontend_port}",
+                expected_num_workers=engine_workers.num_workers,
+                timeout=120,
+                engine_workers=engine_workers,
+                store_backend=store_backend,
+                request_plane="nats",
+            )
+            assert_local_pipeline(frontend, local_pipeline)
+
+            # Several KV blocks long: cached tokens count only whole blocks.
+            content = " ".join([f"cache-hit-{uuid.uuid4().hex}"] * (block_size * 4))
+
+            def payload() -> dict[str, Any]:
+                return {
+                    **test_payload,
+                    "messages": [{"role": "user", "content": content}],
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                    "max_tokens": 8,
+                    "nvext": {"extra_fields": ["worker_id", "timing"]},
+                }
+
+            async def send(
+                client: aiohttp.ClientSession, request_payload: dict[str, Any]
+            ) -> dict[str, Any]:
+                async with client.post(url, json=request_payload) as response:
+                    body = await response.text()
+                    assert response.status == 200, body
+                text, worker, cached, kv_hit_rate = "", None, None, None
+                for chunk in parse_sse_json_chunks(body):
+                    for choice in chunk.get("choices") or []:
+                        text += (choice.get("delta") or {}).get("content") or ""
+                    nvext = chunk.get("nvext", {})
+                    worker = nvext.get("worker_id") or worker
+                    timing = nvext.get("timing") or {}
+                    if timing.get("kv_hit_rate") is not None:
+                        kv_hit_rate = timing["kv_hit_rate"]
+                    details = (chunk.get("usage") or {}).get(
+                        "prompt_tokens_details"
+                    ) or {}
+                    if details.get("cached_tokens") is not None:
+                        cached = details["cached_tokens"]
+                assert worker is not None, body
+                return {
+                    "text": text,
+                    "worker": (worker["decode_worker_id"], worker["decode_dp_rank"]),
+                    "cached_tokens": cached,
+                    "kv_hit_rate": kv_hit_rate,
+                    "body": body,
+                }
+
+            async with aiohttp.ClientSession() as client:
+                first = await send(client, payload())
+                assert first["text"], first["body"]
+
+                # The router learns the first request's blocks from the worker's
+                # KV events, a moment after the first response. Until then a
+                # repeat is routed without overlap, possibly to the same worker
+                # by a tie-break, and a cache hit there would prove nothing about
+                # routing. So repeat until the router reports overlap; usually
+                # the first repeat does. Query-only requests report no overlap.
+                for requests in range(2, 52):
+                    await asyncio.sleep(0.1)
+                    second = await send(client, payload())
+                    assert second["text"], second["body"]
+                    if (second["kv_hit_rate"] or 0) > 0:
+                        break
+                else:
+                    raise AssertionError(
+                        "the router never routed the repeated prompt by its KV overlap"
+                    )
+                assert (second["cached_tokens"] or 0) > 0, second["body"]
+                logger.info(
+                    "local_pipeline=%s requests=%s cached_tokens first=%s last=%s "
+                    "kv_hit_rate last=%s worker first=%s last=%s",
+                    local_pipeline or "dynamo",
+                    requests,
+                    first["cached_tokens"],
+                    second["cached_tokens"],
+                    second["kv_hit_rate"],
+                    first["worker"],
+                    second["worker"],
+                )
 
         asyncio.run(run_test())
 
