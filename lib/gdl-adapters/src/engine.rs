@@ -76,7 +76,7 @@ where
 struct Exit<T> {
     items: Option<Items<Annotated<T>>>,
     /// The `Cx` derived from `context`. Only a kill of `context` cancels it,
-    /// and it stays cancelled after a later stop, where `context` does not.
+    /// and both stay so after a later stop.
     root: gdl::Cx,
     context: Arc<dyn AsyncEngineContext>,
 }

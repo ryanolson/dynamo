@@ -3,14 +3,13 @@
 
 //! A bridge made while a stop or a kill is under way.
 //!
-//! Dynamo's controller tells its children of a stop or a kill before it
-//! publishes the new state. A `Cx` linked in between is not told, and the
-//! state it reads after linking is still live, so it misses the signal. The
-//! same window exists for every `link_child` followed by a state check,
-//! Migration's included. Closing it means publishing the state before telling
-//! the children, in `dynamo-runtime`.
+//! Dynamo's controller publishes a stop or a kill before it tells its
+//! children. A `Cx` linked while the children are being told is not told, but
+//! the state it reads after linking is the new one, so it does not miss the
+//! signal.
 //!
-//! And a stop forwarded from a gdl `Cx` while a kill is under way.
+//! And a stop forwarded from a gdl `Cx` while a kill is under way: the
+//! controller keeps a kill once set, so the stop cannot replace it.
 
 use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::time::Duration;
@@ -95,8 +94,8 @@ fn signal_during_registration(kill: bool) {
     });
     on_enter.recv_timeout(Duration::from_secs(5)).unwrap();
 
-    // The signal has taken its child snapshot, but has not published its state.
-    assert!(!context.is_stopped());
+    // The signal has published its state and is telling the children.
+    assert!(context.is_stopped());
     let cx = CxBridge::cx(request.controller());
     release.send(()).unwrap();
     signal.join().unwrap();
@@ -111,13 +110,11 @@ fn signal_during_registration(kill: bool) {
 }
 
 #[test]
-#[ignore = "bridge registration race: the controller tells its children before it publishes the state, so a Cx linked in between misses the signal; the fix is in dynamo-runtime's Controller"]
 fn a_kill_in_progress_reaches_a_new_bridge() {
     signal_during_registration(true);
 }
 
 #[test]
-#[ignore = "bridge registration race: the controller tells its children before it publishes the state, so a Cx linked in between misses the signal; the fix is in dynamo-runtime's Controller"]
 fn a_stop_in_progress_reaches_a_new_bridge() {
     signal_during_registration(false);
 }
@@ -152,7 +149,7 @@ impl AsyncEngineContext for KillDuringStop {
 
     fn stop_generating(&self) {
         let target = self.target.upgrade().unwrap();
-        // Complete a concurrent kill before the parent's stop publishes its state.
+        // Complete a concurrent kill while the parent's stop tells its children.
         std::thread::spawn(move || {
             target.kill();
             assert!(target.is_killed());
@@ -234,7 +231,7 @@ impl AsyncEngineContext for PauseReplayedKill {
 
     fn kill(&self) {
         if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
-            // Hold the replay so the consumer can poll before it republishes Killed.
+            // Hold the replayed kill while the consumer polls.
             self.entered
                 .lock()
                 .unwrap()
@@ -286,7 +283,6 @@ impl
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "kill replay window: a forwarded stop can publish Stopped over a concurrent kill until the latch replays it; closing it needs dynamo-runtime's Controller to keep a kill once set"]
 async fn a_forwarded_stop_does_not_revive_a_killed_workers_buffered_output() {
     use dynamo_gdl_adapters::EngineSink;
     use futures::StreamExt;

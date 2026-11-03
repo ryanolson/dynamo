@@ -363,8 +363,7 @@ async fn a_kill_after_a_stop_stays_a_kill_at_the_gdl_sink() {
     let _stream = pipeline.generate(request).await.unwrap();
     context.stop_generating();
     context.kill();
-    // Dynamo's controller lets this stop replace the kill; the sink's `Cx`
-    // stays cancelled.
+    // A later stop leaves the kill in place; the sink's `Cx` stays cancelled.
     context.stop_generating();
     assert!(sink.seen.lock().unwrap()[0].is_cancelled());
 }
