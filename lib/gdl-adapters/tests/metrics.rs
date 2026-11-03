@@ -158,6 +158,17 @@ async fn metrics_scrape_with_dynamos_prefix_and_identity() {
         for family in ["prompts_total", "refused_total", "first_token_seconds"] {
             assert!(samples(&text, family).is_empty(), "{family} in {text}");
         }
+        // The OTLP export gathers the same families.
+        let exported = drt
+            .get_metrics_registry()
+            .metric_families_combined()
+            .expect("structured export");
+        for family in FAMILIES {
+            assert!(
+                exported.families.iter().any(|f| f.name() == family),
+                "{family} not exported"
+            );
+        }
         drt.shutdown();
     })
     .await;
@@ -247,5 +258,159 @@ async fn identity_matches_under_a_nested_namespace() {
         .endpoint("generate");
     let [dynamo, bridge] = dynamo_and_bridge(&drt, &endpoint).await;
     assert_eq!(bridge, dynamo);
+    drt.shutdown();
+}
+
+#[derive(gdl::Metrics)]
+struct ByteMetrics {
+    /// Bytes handled inside the node.
+    request_bytes_total: gdl::prometheus::IntCounter,
+}
+
+/// A node metric named like a work-handler metric the endpoint already
+/// serves is refused, and exports stay usable.
+#[tokio::test]
+async fn a_node_family_clash_preserves_existing_exports() {
+    use dynamo_runtime::pipeline::network::ingress::push_handler::WorkHandlerMetrics;
+
+    temp_env::async_with_vars([("DYN_SYSTEM_PORT", Some("0"))], async {
+        let drt = runtime().await;
+        let endpoint = drt
+            .namespace("family-clash")
+            .and_then(|ns| ns.component("worker"))
+            .expect("component")
+            .endpoint("generate");
+        let handler = WorkHandlerMetrics::from_endpoint(&endpoint, None).expect("handler metrics");
+        handler.request_bytes.inc_by(17);
+        let before = scrape(&drt).await;
+        let native = samples(&before, "dynamo_component_request_bytes_total");
+        assert_eq!(native.len(), 1, "{before}");
+        assert!(native[0].ends_with(" 17"), "{}", native[0]);
+        drt.get_metrics_registry()
+            .metric_families_combined()
+            .expect("structured export before registration");
+
+        assert!(metrics::register::<ByteMetrics>(&endpoint).is_err());
+        let structured = drt.get_metrics_registry().metric_families_combined();
+        let address = drt.system_status_server_info().expect("server").socket_addr;
+        let response = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .expect("client")
+            .get(format!("http://{address}/metrics"))
+            .send()
+            .await
+            .expect("scrape after registration");
+        let status = response.status();
+        let after = response.text().await.expect("body");
+        drt.shutdown();
+
+        assert!(
+            status == reqwest::StatusCode::OK && structured.is_ok(),
+            "registering a legal node metric broke exports: HTTP {status}, structured error {:?}, body {after}",
+            structured.as_ref().err()
+        );
+        let native = samples(&after, "dynamo_component_request_bytes_total");
+        assert_eq!(native.len(), 1, "{after}");
+        assert!(native[0].ends_with(" 17"), "{}", native[0]);
+    })
+    .await;
+}
+
+/// A second registration on one endpoint is refused, so no handles are
+/// handed out that the scrape would not serve.
+#[tokio::test]
+async fn a_second_registration_cannot_return_invisible_metrics() {
+    temp_env::async_with_vars([("DYN_SYSTEM_PORT", Some("0"))], async {
+        let drt = runtime().await;
+        let endpoint = drt
+            .namespace("duplicate-registration")
+            .and_then(|ns| ns.component("router"))
+            .expect("component")
+            .endpoint("generate");
+        let first = metrics::register::<NodeMetrics>(&endpoint).expect("first registration");
+        first.prompts_total.inc_by(2);
+        let before = scrape(&drt).await;
+        let lines = samples(&before, FAMILIES[0]);
+        assert_eq!(lines.len(), 1, "{before}");
+        assert!(lines[0].ends_with(" 2"), "{}", lines[0]);
+
+        // A clone shares the endpoint's registry.
+        assert!(metrics::register::<NodeMetrics>(&endpoint.clone()).is_err());
+        let after = scrape(&drt).await;
+        drt.shutdown();
+        let lines = samples(&after, FAMILIES[0]);
+        assert_eq!(lines.len(), 1, "{after}");
+        assert!(lines[0].ends_with(" 2"), "{}", lines[0]);
+    })
+    .await;
+}
+
+/// The other order: a node takes a work-handler name first. Dynamo's
+/// work-handler metrics then fail to register, which fails the endpoint's
+/// start, and the scrape still renders.
+#[tokio::test]
+async fn a_clash_fails_the_later_registration_in_either_order() {
+    use dynamo_runtime::pipeline::network::ingress::push_handler::WorkHandlerMetrics;
+
+    temp_env::async_with_vars([("DYN_SYSTEM_PORT", Some("0"))], async {
+        let drt = runtime().await;
+        let endpoint = drt
+            .namespace("clash-order")
+            .and_then(|ns| ns.component("worker"))
+            .expect("component")
+            .endpoint("generate");
+        metrics::register::<ByteMetrics>(&endpoint)
+            .expect("registered")
+            .request_bytes_total
+            .inc_by(3);
+
+        assert!(WorkHandlerMetrics::from_endpoint(&endpoint, None).is_err());
+        let text = scrape(&drt).await;
+        let lines = samples(&text, "dynamo_component_request_bytes_total");
+        assert_eq!(lines.len(), 1, "{text}");
+        assert!(lines[0].ends_with(" 3"), "{}", lines[0]);
+        drt.shutdown();
+    })
+    .await;
+}
+
+/// What registration cannot see, and what the bridge shares with Dynamo's
+/// own metrics: one name with two help texts on two endpoints fails the
+/// scrape, which merges every endpoint's families.
+#[tokio::test]
+async fn dynamos_own_metrics_clash_across_endpoints_at_scrape() {
+    let drt = runtime().await;
+    let component = drt
+        .namespace("across")
+        .and_then(|ns| ns.component("worker"))
+        .expect("component");
+    for (endpoint, help) in [("first", "One help."), ("second", "Another help.")] {
+        component
+            .endpoint(endpoint)
+            .metrics()
+            .create_intcounter("shared_total", help, &[])
+            .expect("dynamo metric")
+            .inc();
+    }
+    assert!(
+        drt.get_metrics_registry()
+            .prometheus_expfmt_combined()
+            .is_err()
+    );
+    drt.shutdown();
+}
+
+/// A node without metrics registers nothing, so it can register again.
+#[tokio::test]
+async fn a_node_without_metrics_registers_on_any_endpoint() {
+    let drt = runtime().await;
+    let endpoint = drt
+        .namespace("empty")
+        .and_then(|ns| ns.component("worker"))
+        .expect("component")
+        .endpoint("generate");
+    metrics::register::<()>(&endpoint).expect("first");
+    metrics::register::<()>(&endpoint).expect("second");
     drt.shutdown();
 }
