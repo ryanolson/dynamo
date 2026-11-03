@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Backend and the preprocessor as native gdl operators (`GdlOperator`) against the same
-//! operators as Dynamo operators, over the same scripted terminal engine.
+//! Dynamo's operators as native gdl operators (`GdlOperator`) against the same operators as
+//! Dynamo operators, over the same scripted terminal engine: Backend, the preprocessor,
+//! Migration, and the encoder and prefill routers.
 //!
 //! Each test runs one request both ways and compares what comes out: the items, an eager
 //! error and what it downcasts to, and what the terminal saw. The gdl side is composed as
@@ -16,12 +17,20 @@ use std::time::Duration;
 use base64::Engine as _;
 use dynamo_gdl_adapters::{DynOperatorStage, EngineSink, PipelineEngine};
 use dynamo_llm::backend::Backend;
+use dynamo_llm::discovery::ModelManager;
+use dynamo_llm::http::service::axum::http::HeaderMap;
 use dynamo_llm::http::service::error::HttpError;
+use dynamo_llm::http::service::metrics::Metrics;
+use dynamo_llm::kv_router::{EncoderRouter, PrefillRouter};
+use dynamo_llm::migration::Migration;
 use dynamo_llm::model_card::ModelDeploymentCard;
 use dynamo_llm::model_type::ModelType;
 use dynamo_llm::operator::GdlOperator;
 use dynamo_llm::preprocessor::prompt::prompt_formatter_from_mdc;
 use dynamo_llm::preprocessor::{OpenAIPreprocessor, PreprocessedEmbeddingRequest};
+use dynamo_llm::protocols::common::extensions::{
+    SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId, session_affinity_from_headers,
+};
 use dynamo_llm::protocols::common::llm_backend::{
     BackendOutput, EmbeddingsEngineOutput, FinishReason, LLMEngineOutput, PreprocessedRequest,
 };
@@ -37,7 +46,8 @@ use dynamo_renderer::PromptFormatter;
 use dynamo_runtime::engine::{AsyncEngine, AsyncEngineContext, Data, ResponseStream};
 use dynamo_runtime::error::{DynamoError, ErrorClass};
 use dynamo_runtime::pipeline::{
-    AsyncEngineContextProvider, Context, Error, ManyOut, Operator, SingleIn, async_trait,
+    AsyncEngineContextProvider, Context, Error, ManyOut, Operator, RouterMode, SingleIn,
+    async_trait,
 };
 use dynamo_runtime::protocols::annotated::Annotated;
 use dynamo_runtime::protocols::maybe_error::MaybeError;
@@ -119,6 +129,7 @@ where
 struct Call {
     id: String,
     tenant: Option<String>,
+    session: Option<String>,
     request: PreprocessedRequest,
     context: Arc<dyn AsyncEngineContext>,
 }
@@ -133,14 +144,19 @@ enum Reply {
 /// A worker that answers each call with `reply`, and a speculative prefill with one
 /// finished token.
 struct Script {
-    reply: Reply,
+    /// The reply to each call in turn; the last one answers every call after it.
+    replies: Vec<Reply>,
     calls: Mutex<Vec<Call>>,
 }
 
 impl Script {
     fn new(reply: Reply) -> Arc<Self> {
+        Self::sequence(vec![reply])
+    }
+
+    fn sequence(replies: Vec<Reply>) -> Arc<Self> {
         Arc::new(Self {
-            reply,
+            replies,
             calls: Mutex::default(),
         })
     }
@@ -159,19 +175,27 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
         request: SingleIn<PreprocessedRequest>,
     ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
         let context = request.context();
-        self.calls.lock().unwrap().push(Call {
-            id: request.id().to_string(),
-            tenant: request.metadata().get("tenant").cloned(),
-            request: request.content().clone(),
-            context: context.clone(),
-        });
+        let reply = {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(Call {
+                id: request.id().to_string(),
+                tenant: request.metadata().get("tenant").cloned(),
+                session: request
+                    .get_optional::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
+                    .unwrap()
+                    .map(|session| session.as_str().to_string()),
+                request: request.content().clone(),
+                context: context.clone(),
+            });
+            &self.replies[(calls.len() - 1).min(self.replies.len() - 1)]
+        };
         if request.content().model == "speculative_prefill" {
             let mut output = LLMEngineOutput::stop();
             output.token_ids = vec![450];
             let items = stream::iter([Annotated::from_data(output)]);
             return Ok(ResponseStream::new(Box::pin(items), context));
         }
-        match &self.reply {
+        match reply {
             Reply::Items(items) => Ok(ResponseStream::new(
                 Box::pin(stream::iter(items.clone())),
                 context,
@@ -728,6 +752,238 @@ async fn embeddings_are_the_same_both_ways() {
         assert_eq!(g.len(), 1, "{format}: {g:?}");
         assert!(!g[0].is_error(), "{format}: {g:?}");
         assert_eq!(normalized(&d), normalized(&g), "{format}");
+    }
+}
+
+fn migration(limit: u32) -> Arc<Migration> {
+    Migration::new(
+        limit,
+        None,
+        "TinyLlama_v1.1".to_string(),
+        Arc::new(Metrics::new()),
+    )
+}
+
+/// Migration over `terminal`, on Dynamo's chain and as a native gdl operator.
+fn migration_both(
+    limit: u32,
+    terminals: [Arc<Script>; 2],
+) -> [Engine<PreprocessedRequest, LLMEngineOutput>; 2] {
+    let [dynamo, gdl] = terminals;
+    type Pre = PreprocessedRequest;
+    type Out = LLMEngineOutput;
+    [
+        linked::<_, Pre, Out, Pre, Out>(migration(limit), dynamo),
+        pipeline(native::<_, Out, _>(
+            migration(limit),
+            sink(gdl as Engine<_, _>),
+        )),
+    ]
+}
+
+fn with_session(mut request: SingleIn<PreprocessedRequest>) -> SingleIn<PreprocessedRequest> {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-dynamo-session-id", "session-123".parse().unwrap());
+    request.insert(
+        SESSION_AFFINITY_CONTEXT_KEY,
+        session_affinity_from_headers(&headers).unwrap(),
+    );
+    request
+}
+
+/// What the terminal saw of each call: id, metadata, session, prompt and token budget.
+fn attempts(
+    terminal: &Script,
+) -> Vec<(
+    String,
+    Option<String>,
+    Option<String>,
+    Vec<u32>,
+    Option<u32>,
+)> {
+    terminal
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|call| {
+            (
+                call.id.clone(),
+                call.tenant.clone(),
+                call.session.clone(),
+                call.request.token_ids.to_vec(),
+                call.request.stop_conditions.max_tokens,
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn migration_retries_an_eager_worker_unavailable_the_same_both_ways() {
+    let fixture = Fixture::load();
+    let replies = || {
+        Script::sequence(vec![
+            Reply::Fail(worker_unavailable),
+            Reply::Items(fixture.tokens("The fox")),
+        ])
+    };
+    let terminals = [replies(), replies()];
+    let [dynamo, gdl] = migration_both(3, terminals.clone());
+    let [d, g] = both(dynamo, gdl, || {
+        with_session(request(preprocessed(&fixture, false)))
+    })
+    .await;
+    let (d, g) = (d.unwrap(), g.unwrap());
+    assert!(!g.is_empty());
+    assert_eq!(normalized(&d), normalized(&g));
+    let [d, g] = terminals.map(|terminal| attempts(&terminal));
+    assert_eq!(d.len(), 2, "{d:?}");
+    assert_eq!(d[1].2.as_deref(), Some("session-123"));
+    assert_eq!(d, g);
+}
+
+/// A migratable error item mid-stream: Migration sends the delivered tokens again, with the
+/// rest of the token budget, on both paths.
+#[tokio::test]
+async fn migration_retries_a_stream_error_the_same_both_ways() {
+    let fixture = Fixture::load();
+    let mut first = fixture.tokens("The fox");
+    first
+        .last_mut()
+        .unwrap()
+        .data
+        .as_mut()
+        .unwrap()
+        .finish_reason = None;
+    first.push(Annotated::from_err(
+        DynamoError::builder()
+            .class(ErrorClass::WorkerUnavailable)
+            .message("worker went away")
+            .build(),
+    ));
+    let replies = || {
+        Script::sequence(vec![
+            Reply::Items(first.clone()),
+            Reply::Items(fixture.tokens("crossed the river.")),
+        ])
+    };
+    let terminals = [replies(), replies()];
+    let [dynamo, gdl] = migration_both(3, terminals.clone());
+    let [d, g] = both(dynamo, gdl, || request(preprocessed(&fixture, false))).await;
+    let (d, g) = (d.unwrap(), g.unwrap());
+    assert!(g.iter().all(|item| !item.is_error()), "{g:?}");
+    assert_eq!(normalized(&d), normalized(&g));
+    let [d, g] = terminals.map(|terminal| attempts(&terminal));
+    assert_eq!(d.len(), 2, "{d:?}");
+    assert!(
+        d[1].3.len() > d[0].3.len(),
+        "the retry replays the delivered tokens"
+    );
+    assert_eq!(d, g);
+}
+
+/// An eager error Migration does not retry leaves the native operator as the error the
+/// terminal raised: Migration keeps no clone of it, so `PipelineEngine` gives back the
+/// original `anyhow::Error`, and the HTTP handler still finds its `HttpError`.
+#[tokio::test]
+async fn migration_returns_an_eager_error_it_does_not_retry_as_itself_both_ways() {
+    let fixture = Fixture::load();
+    let terminals = [
+        Script::new(Reply::Fail(forbidden)),
+        Script::new(Reply::Fail(forbidden)),
+    ];
+    let [dynamo, gdl] = migration_both(3, terminals.clone());
+    let results = both(dynamo, gdl, || request(preprocessed(&fixture, false))).await;
+    for result in results {
+        let error = result.expect_err("an eager error");
+        let status = error
+            .downcast::<HttpError>()
+            .expect("the terminal's HttpError");
+        assert_eq!(status.code, 403);
+    }
+    assert_eq!(terminals.map(|terminal| terminal.calls()), [1, 1]);
+}
+
+/// With its retries spent, Migration returns the last attempt's error, still as itself.
+#[tokio::test]
+async fn migration_returns_the_last_eager_error_when_its_retries_run_out_both_ways() {
+    let fixture = Fixture::load();
+    let terminals = [
+        Script::new(Reply::Fail(worker_unavailable)),
+        Script::new(Reply::Fail(worker_unavailable)),
+    ];
+    let [dynamo, gdl] = migration_both(1, terminals.clone());
+    let results = both(dynamo, gdl, || request(preprocessed(&fixture, false))).await;
+    for result in results {
+        let error = result.expect_err("an eager error");
+        let error = error
+            .downcast::<DynamoError>()
+            .expect("the terminal's DynamoError");
+        assert_eq!(error.reason().as_str(), "backend.worker_unavailable");
+    }
+    assert_eq!(terminals.map(|terminal| terminal.calls()), [2, 2]);
+}
+
+/// The encoder router over the prefill router over `terminal`, both disabled as in
+/// aggregated serving, on Dynamo's chain and as native gdl operators.
+fn routers_both(terminals: [Arc<Script>; 2]) -> [Engine<PreprocessedRequest, LLMEngineOutput>; 2] {
+    let [dynamo, gdl] = terminals;
+    let prefill = || PrefillRouter::disabled(Arc::new(ModelManager::new()), RouterMode::KV, None);
+    type Pre = PreprocessedRequest;
+    type Out = LLMEngineOutput;
+    [
+        linked::<_, Pre, Out, Pre, Out>(
+            EncoderRouter::disabled(),
+            linked::<_, Pre, Out, Pre, Out>(prefill(), dynamo),
+        ),
+        pipeline(native::<_, Pre, _>(
+            EncoderRouter::disabled(),
+            native::<_, Pre, _>(prefill(), sink(gdl as Engine<_, _>)),
+        )),
+    ]
+}
+
+#[tokio::test]
+async fn the_routers_pass_a_request_through_the_same_both_ways() {
+    let fixture = Fixture::load();
+    let mut reply = fixture.tokens("The fox");
+    reply.insert(
+        1,
+        Annotated::from_err(
+            DynamoError::builder()
+                .class(ErrorClass::Internal)
+                .message("a worker error item")
+                .build(),
+        ),
+    );
+    let terminals = [
+        Script::new(Reply::Items(reply.clone())),
+        Script::new(Reply::Items(reply)),
+    ];
+    let [dynamo, gdl] = routers_both(terminals.clone());
+    let [d, g] = both(dynamo, gdl, || {
+        with_session(request(preprocessed(&fixture, false)))
+    })
+    .await;
+    let (d, g) = (d.unwrap(), g.unwrap());
+    assert!(g[1].is_error(), "{g:?}");
+    assert_eq!(normalized(&d), normalized(&g));
+    let [d, g] = terminals.map(|terminal| attempts(&terminal));
+    assert_eq!(d.len(), 1);
+    assert_eq!(d, g);
+}
+
+#[tokio::test]
+async fn the_routers_return_the_terminals_eager_error_as_itself_both_ways() {
+    let fixture = Fixture::load();
+    let [dynamo, gdl] = routers_both([
+        Script::new(Reply::Fail(forbidden)),
+        Script::new(Reply::Fail(forbidden)),
+    ]);
+    let results = both(dynamo, gdl, || request(preprocessed(&fixture, false))).await;
+    for result in results {
+        let error = result.expect_err("an eager error");
+        assert_eq!(error.downcast::<HttpError>().unwrap().code, 403);
     }
 }
 

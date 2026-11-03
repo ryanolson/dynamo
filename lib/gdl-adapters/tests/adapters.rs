@@ -445,6 +445,35 @@ async fn a_request_killed_before_it_starts_fails_as_cancelled() {
     assert!(engine.seen().is_empty());
 }
 
+/// A call that must reach its stage after the request is killed, such as the leg that
+/// releases staged KV, runs under a cleanup `Cx`: the kill neither cancels nor stops it, so gdl
+/// starts the call, and the stage still sees the kill through the request's context.
+#[tokio::test]
+async fn a_call_under_a_cleanup_cx_reaches_its_sink_after_a_kill() {
+    let engine = Scripted::new(vec![Annotated::from_data(2)]);
+    let pipeline = Source::new(sink_hop(engine.clone()));
+
+    let request = make_request(1);
+    let context = request.context();
+    context.kill();
+    let refused = pipeline
+        .call(CxBridge::cx(context.as_ref()), make_request(1))
+        .await;
+    assert_eq!(
+        refused.err().map(|error| error.kind()),
+        Some(gdl::ErrorKind::Cancelled)
+    );
+
+    let cx = CxBridge::cx_for_cleanup(context.as_ref());
+    assert_eq!(cx.meta().get(REQUEST_ID).map(String::as_str), Some("req-1"));
+    assert!(!cx.is_stopping());
+    let items: Vec<_> = pipeline.call(cx, request).await.unwrap().collect().await;
+    assert_eq!(items.len(), 2);
+    let seen = engine.seen();
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].is_killed());
+}
+
 #[tokio::test]
 async fn an_operator_stage_matches_the_link_chain() {
     let script = vec![

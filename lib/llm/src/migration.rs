@@ -3,15 +3,18 @@
 
 use std::collections::BTreeMap;
 use std::error::Error as StdError;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Error, Result};
-use futures::{stream, stream::StreamExt};
+use futures::{FutureExt, stream, stream::StreamExt};
 
 use crate::{
     http::service::metrics::Metrics,
     model_card::ModelDeploymentCard,
+    operator::{Downstream, DynamoDownstream, GdlDownstream, GdlOperator, native},
     protocols::{
         TokenIdType,
         common::{
@@ -31,7 +34,7 @@ use dynamo_runtime::error::{self, DynamoError, ErrorReason, ErrorType};
 use dynamo_runtime::metrics::prometheus_names::frontend_service;
 use dynamo_runtime::pipeline::{
     AsyncEngineContext, AsyncEngineContextProvider, Context, ManyOut, Operator, PipelineOperator,
-    ResponseStream, ServerStreamingEngine, SingleIn, async_trait, attach_first_response_guard,
+    ServerStreamingEngine, SingleIn, attach_first_response_guard,
     network::egress::route_span::{RouteTraceContext, attach_route_trace_context, error_type_name},
 };
 use dynamo_runtime::protocols::annotated::Annotated;
@@ -301,7 +304,7 @@ impl Migration {
     }
 }
 
-#[async_trait]
+// Transition: remove when the gdl pipeline is the only local pipeline.
 impl<Resp>
     Operator<
         SingleIn<PreprocessedRequest>,
@@ -312,11 +315,58 @@ impl<Resp>
 where
     Resp: Data + HasTokenIds,
 {
-    async fn generate(
-        &self,
+    fn generate<'life0, 'async_trait>(
+        &'life0 self,
         request: SingleIn<PreprocessedRequest>,
         next: ServerStreamingEngine<PreprocessedRequest, Annotated<Resp>>,
-    ) -> Result<ManyOut<Annotated<Resp>>> {
+    ) -> Pin<Box<dyn Future<Output = Result<ManyOut<Annotated<Resp>>>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(self.migrate(request, DynamoDownstream(next)))
+    }
+}
+
+impl<Resp> gdl::Operator for GdlOperator<Migration, Resp>
+where
+    Resp: Data + HasTokenIds,
+{
+    type UpReq = SingleIn<PreprocessedRequest>;
+    type UpItem = Annotated<Resp>;
+    type DownReq = SingleIn<PreprocessedRequest>;
+    type DownItem = Annotated<Resp>;
+
+    fn generate<N>(
+        &self,
+        cx: gdl::Cx,
+        request: SingleIn<PreprocessedRequest>,
+        next: N,
+    ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<Resp>>>> + Send
+    where
+        N: gdl::Next<SingleIn<PreprocessedRequest>, Annotated<Resp>>,
+    {
+        // Each attempt is a call of `next` under `cx`, so gdl runs it in a child of `cx`.
+        self.op
+            .migrate(request, GdlDownstream::new(cx, next))
+            .map(native)
+    }
+}
+
+impl Migration {
+    /// Send `request` on, and send it again on a migratable failure: the body of Migration's
+    /// Dynamo and gdl operators.
+    ///
+    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
+    async fn migrate<Resp, D>(
+        &self,
+        request: SingleIn<PreprocessedRequest>,
+        next: D,
+    ) -> Result<D::Response<Resp>>
+    where
+        Resp: Data + HasTokenIds,
+        D: Downstream<PreprocessedRequest, Resp> + 'static,
+    {
         // NOTE: Keep the migration operator in the request path at limit zero. The limit controls
         // replacement attempts; RetryManager continues to own the initial attempt uniformly.
         let (preprocessed_request, context) = request.transfer(());
@@ -345,7 +395,7 @@ where
                 .map(|response| (response, retry_manager))
         })
         .fuse();
-        Ok(ResponseStream::new(Box::pin(response_stream), engine_ctx_))
+        Ok(D::respond(response_stream, engine_ctx_))
     }
 }
 
@@ -363,16 +413,17 @@ impl MigrationEvent {
     }
 }
 
-struct RetryManager<Resp>
+struct RetryManager<Resp, D>
 where
     Resp: Data + HasTokenIds,
+    D: Downstream<PreprocessedRequest, Resp>,
 {
     context: Arc<dyn AsyncEngineContext>,
     metadata: BTreeMap<String, String>,
     request: PreprocessedRequest,
     session_affinity: Option<SessionAffinityId>,
-    next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<Resp>>,
-    next_stream: Option<ManyOut<Annotated<Resp>>>,
+    next_generate: D,
+    next_stream: Option<D::Stream>,
     attempts: AttemptBudget,
     max_seq_len: Option<u32>,
     model_name: Arc<String>,
@@ -404,16 +455,17 @@ struct MigrationCause {
     attempt: u32,
 }
 
-impl<Resp> RetryManager<Resp>
+impl<Resp, D> RetryManager<Resp, D>
 where
     Resp: Data + HasTokenIds,
+    D: Downstream<PreprocessedRequest, Resp>,
 {
     #[allow(clippy::too_many_arguments)]
     pub async fn build(
         context: Arc<dyn AsyncEngineContext>,
         metadata: BTreeMap<String, String>,
         mut preprocessed_request: PreprocessedRequest,
-        next: ServerStreamingEngine<PreprocessedRequest, Annotated<Resp>>,
+        next: D,
         mut retries_left: u32,
         max_seq_len: Option<u32>,
         model_name: Arc<String>,
@@ -670,7 +722,7 @@ where
             {
                 release.release().await;
             }
-            let response_stream = self.next_generate.generate(request).await;
+            let response_stream = self.next_generate.send(request).await;
             match response_stream {
                 Ok(next_stream) => {
                     // A dispatch cancelled before its response prologue returns `Ok` empty,
@@ -925,6 +977,7 @@ mod tests {
     use dynamo_runtime::error::{BackendError, DynamoError, ErrorType};
     use dynamo_runtime::pipeline::AsyncEngine;
     use dynamo_runtime::pipeline::context::Controller;
+    use dynamo_runtime::pipeline::{ResponseStream, async_trait};
     use dynamo_runtime::protocols::maybe_error::MaybeError;
     use std::sync::atomic::{AtomicU32, Ordering};
     use tokio::sync::mpsc;
@@ -1251,7 +1304,7 @@ mod tests {
             Arc::new(Controller::new(context_id)),
             BTreeMap::new(),
             request,
-            engine,
+            DynamoDownstream(engine),
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -1818,7 +1871,7 @@ mod tests {
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            DynamoDownstream(next_generate),
             0,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -1849,7 +1902,7 @@ mod tests {
         behavior: MockBehavior,
         migration_limit: u32,
     ) -> (
-        RetryManager<BackendOutput>,
+        RetryManager<BackendOutput, DynamoDownstream<PreprocessedRequest, BackendOutput>>,
         std::sync::Weak<Vec<TokenIdType>>,
     ) {
         let context_id = uuid::Uuid::new_v4().to_string();
@@ -1861,7 +1914,7 @@ mod tests {
             Arc::new(Controller::new(context_id)),
             BTreeMap::new(),
             request,
-            next_generate,
+            DynamoDownstream(next_generate),
             migration_limit,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2044,7 +2097,7 @@ mod tests {
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            DynamoDownstream(next_generate),
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2106,7 +2159,7 @@ mod tests {
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            DynamoDownstream(next_generate),
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2199,7 +2252,7 @@ mod tests {
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            DynamoDownstream(next_generate),
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2249,7 +2302,7 @@ mod tests {
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            DynamoDownstream(next_generate),
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2318,7 +2371,7 @@ mod tests {
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            DynamoDownstream(next_generate),
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2400,7 +2453,7 @@ mod tests {
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            DynamoDownstream(next_generate),
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2453,7 +2506,7 @@ mod tests {
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            DynamoDownstream(next_generate),
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2508,7 +2561,7 @@ mod tests {
             Arc::new(Controller::new(context_id)),
             BTreeMap::new(),
             request,
-            next_generate,
+            DynamoDownstream(next_generate),
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2589,7 +2642,7 @@ mod tests {
                 ctx.clone(),
                 BTreeMap::new(),
                 create_mock_request(10),
-                next_generate,
+                DynamoDownstream(next_generate),
                 3,
                 None,
                 Arc::new(TEST_MODEL.to_string()),
@@ -2716,7 +2769,7 @@ mod tests {
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            DynamoDownstream(next_generate),
             3, // migration_limit=3 — should be ignored for guided-decoding requests
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2795,7 +2848,7 @@ mod tests {
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            DynamoDownstream(next_generate),
             3,
             Some(5), // prompt(3) + 3 generated = 6 > 5 → disables migration
             Arc::new(TEST_MODEL.to_string()),
@@ -2868,7 +2921,7 @@ mod tests {
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            DynamoDownstream(next_generate),
             3,
             Some(5), // prompt(3) + 2 generated = 5 == max_seq_len → still migratable
             Arc::new(TEST_MODEL.to_string()),
@@ -2933,7 +2986,7 @@ mod tests {
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            DynamoDownstream(next_generate),
             3,
             Some(2), // prompt(3) > max_seq_len(2) → migration disabled at build time
             Arc::new(TEST_MODEL.to_string()),
@@ -3015,7 +3068,7 @@ mod tests {
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            DynamoDownstream(next_generate),
             1,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -3130,7 +3183,7 @@ mod tests {
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            DynamoDownstream(next_generate),
             1,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -3236,7 +3289,7 @@ mod tests {
             Arc::new(Controller::new(context_id)),
             BTreeMap::new(),
             request,
-            next_generate,
+            DynamoDownstream(next_generate),
             failing_attempts.max(1),
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -3378,7 +3431,7 @@ mod tests {
             root,
             BTreeMap::new(),
             create_mock_request(5),
-            next_generate,
+            DynamoDownstream(next_generate),
             2,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -3527,7 +3580,7 @@ mod tests {
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            DynamoDownstream(next_generate),
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -3710,7 +3763,7 @@ mod tests {
                     root,
                     BTreeMap::new(),
                     create_mock_request(50),
-                    next_generate,
+                    DynamoDownstream(next_generate),
                     retries,
                     None,
                     Arc::new(TEST_MODEL.to_string()),
@@ -3922,7 +3975,7 @@ mod tests {
             ctx,
             BTreeMap::new(),
             jail_request(stop),
-            next_generate,
+            DynamoDownstream(next_generate),
             1,
             None,
             Arc::new(TEST_MODEL.to_string()),

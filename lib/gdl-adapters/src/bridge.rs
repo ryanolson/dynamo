@@ -57,6 +57,20 @@ impl CxBridge {
         Self::linked(context, false)
     }
 
+    /// A fresh root `Cx` that nothing of `context` cancels or stops, for a call that must
+    /// reach its stage after the request is killed: the leg that releases what a worker holds
+    /// for the request, such as the prefill router's decode leg after a KV handoff. The stage
+    /// sees the request's stop and kill through `context`, which the request carries. The
+    /// Dynamo id is in its metadata under [`REQUEST_ID`].
+    ///
+    /// It is not linked to `context`: the call's own attempt ends when its response stream
+    /// ends or is dropped.
+    pub fn cx_for_cleanup(context: &dyn AsyncEngineContext) -> Cx {
+        let mut cx = Cx::new();
+        cx.insert_meta(REQUEST_ID, context.id());
+        cx
+    }
+
     fn linked(context: &dyn AsyncEngineContext, cancel_on_kill: bool) -> Cx {
         let mut cx = Cx::new();
         cx.insert_meta(REQUEST_ID, context.id());

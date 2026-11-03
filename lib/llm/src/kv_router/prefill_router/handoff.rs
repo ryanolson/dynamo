@@ -7,7 +7,7 @@ use std::{future::Future, sync::Arc};
 
 use dynamo_runtime::{
     error::{DynamoError, ErrorClass},
-    pipeline::{AsyncEngineContext, AsyncEngineContextProvider, ManyOut, ResponseStream},
+    pipeline::{AsyncEngineContext, AsyncEngineContextProvider},
     protocols::{annotated::Annotated, maybe_error::MaybeError},
 };
 use futures::{StreamExt, stream};
@@ -15,8 +15,9 @@ use tokio::task::JoinHandle;
 use tracing::Instrument;
 
 use super::PrefillError;
+use crate::operator::Downstream;
 use crate::protocols::{
-    common::llm_backend::{FinishReason, LLMEngineOutput},
+    common::llm_backend::{FinishReason, LLMEngineOutput, PreprocessedRequest},
     response_merge::{PREFILL_OUTPUT_ANNOTATION, PrefillNeed},
 };
 
@@ -107,13 +108,16 @@ impl PrefillTask {
     /// held until prefill finishes so a late failure cannot follow success.
     /// `output` sends prefill's output into the stream as soon as prefill
     /// finishes (`BeforeLast`), or before any decode output (`BeforeFirst`).
-    pub(super) async fn forward_decode(
+    pub(super) async fn forward_decode<D>(
         self,
-        decode: impl Future<Output = anyhow::Result<ManyOut<Annotated<LLMEngineOutput>>>>,
+        decode: impl Future<Output = anyhow::Result<D::Stream>>,
         request_context: Arc<dyn AsyncEngineContext>,
         output: PrefillNeed,
         prefill_context: Arc<dyn AsyncEngineContext>,
-    ) -> anyhow::Result<ManyOut<Annotated<LLMEngineOutput>>> {
+    ) -> anyhow::Result<D::Response<LLMEngineOutput>>
+    where
+        D: Downstream<PreprocessedRequest, LLMEngineOutput>,
+    {
         let emit = output != PrefillNeed::None;
         let mut completion = Box::pin(self.wait());
         tokio::pin!(decode);
@@ -123,11 +127,11 @@ impl PrefillTask {
                 let prefill = result.inspect_err(|_| request_context.stop_generating())?;
                 let response = decode.await?;
                 if !emit {
-                    return Ok(response);
+                    return Ok(D::pass(response));
                 }
                 let context = response.context();
                 let stream = stream::iter(output_item(prefill)).chain(response);
-                return Ok(ResponseStream::new(Box::pin(stream), context));
+                return Ok(D::respond(stream, context));
             }
             result = &mut decode => match result {
                 Ok(response) => response,
@@ -249,7 +253,7 @@ impl PrefillTask {
                 }
             }
         };
-        Ok(ResponseStream::new(Box::pin(stream), context))
+        Ok(D::respond(stream, context))
     }
 }
 
@@ -278,6 +282,10 @@ fn cancel_prefill_on_decode_rejection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operator::DynamoDownstream;
+    use dynamo_runtime::pipeline::{ManyOut, ResponseStream};
+
+    type Dynamo = DynamoDownstream<PreprocessedRequest, LLMEngineOutput>;
     use dynamo_runtime::{
         error::{BackendError, ErrorType},
         pipeline::context::Controller,
@@ -308,7 +316,7 @@ mod tests {
     async fn failure_interrupts_pending_decode_dispatch() {
         let (tx, task) = pending_prefill();
         let context = Arc::new(Controller::default());
-        let mut response = Box::pin(task.forward_decode(
+        let mut response = Box::pin(task.forward_decode::<Dynamo>(
             std::future::pending(),
             context.clone(),
             PrefillNeed::None,
@@ -331,7 +339,7 @@ mod tests {
         let decode: ManyOut<Annotated<LLMEngineOutput>> =
             ResponseStream::new(Box::pin(stream::pending()), context.clone());
         let mut response = task
-            .forward_decode(
+            .forward_decode::<Dynamo>(
                 async { Ok(decode) },
                 context.clone(),
                 PrefillNeed::None,
@@ -371,7 +379,7 @@ mod tests {
             context.clone(),
         );
         let mut response = task
-            .forward_decode(
+            .forward_decode::<Dynamo>(
                 async { Ok(decode) },
                 context.clone(),
                 PrefillNeed::None,
@@ -401,7 +409,7 @@ mod tests {
             context.clone(),
         );
         let mut response = task
-            .forward_decode(
+            .forward_decode::<Dynamo>(
                 async { Ok(decode) },
                 context,
                 PrefillNeed::None,
@@ -433,7 +441,7 @@ mod tests {
             context.clone(),
         );
         let mut response = task
-            .forward_decode(
+            .forward_decode::<Dynamo>(
                 async { Ok(decode) },
                 context,
                 PrefillNeed::None,
@@ -467,7 +475,7 @@ mod tests {
             context.clone(),
         );
         let mut response = task
-            .forward_decode(
+            .forward_decode::<Dynamo>(
                 async { Ok(decode) },
                 context.clone(),
                 PrefillNeed::None,
@@ -499,7 +507,7 @@ mod tests {
         let decode: ManyOut<Annotated<LLMEngineOutput>> =
             ResponseStream::new(Box::pin(stream::pending()), context.clone());
         let response = task
-            .forward_decode(
+            .forward_decode::<Dynamo>(
                 async { Ok(decode) },
                 context.clone(),
                 PrefillNeed::None,
@@ -535,7 +543,7 @@ mod tests {
             );
             let context = Arc::new(Controller::default());
             let mut response = task
-                .forward_decode(
+                .forward_decode::<Dynamo>(
                     async { Ok(decode) },
                     context.clone(),
                     PrefillNeed::BeforeFirst,
@@ -566,7 +574,7 @@ mod tests {
         let context = Arc::new(Controller::default());
         let decode: ManyOut<Annotated<LLMEngineOutput>> =
             ResponseStream::new(Box::pin(stream::pending()), context.clone());
-        let response = task.forward_decode(
+        let response = task.forward_decode::<Dynamo>(
             async { Ok(decode) },
             context.clone(),
             PrefillNeed::BeforeFirst,
@@ -594,7 +602,7 @@ mod tests {
         );
         let context = Arc::new(Controller::default());
         let mut response = task
-            .forward_decode(
+            .forward_decode::<Dynamo>(
                 async { Ok(decode) },
                 context,
                 PrefillNeed::BeforeLast,
@@ -645,7 +653,7 @@ mod tests {
                 context.clone(),
             );
             let mut response = task
-                .forward_decode(
+                .forward_decode::<Dynamo>(
                     async { Ok(decode) },
                     context.clone(),
                     PrefillNeed::BeforeFirst,
@@ -696,7 +704,7 @@ mod tests {
         let error = anyhow::Error::new(error).context("decode admission rejected");
         let request_context = Arc::new(Controller::default());
         let result = task
-            .forward_decode(
+            .forward_decode::<Dynamo>(
                 async { Err(error) },
                 request_context,
                 output,
@@ -742,7 +750,7 @@ mod tests {
             request_context.clone(),
         );
         let mut response = task
-            .forward_decode(
+            .forward_decode::<Dynamo>(
                 async { Ok(decode) },
                 request_context,
                 output,
@@ -781,7 +789,7 @@ mod tests {
             .message("decode connection lost after possible dispatch")
             .build();
         let result = task
-            .forward_decode(
+            .forward_decode::<Dynamo>(
                 async { Err(error.into()) },
                 request_context,
                 output,

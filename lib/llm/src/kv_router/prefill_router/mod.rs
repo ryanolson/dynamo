@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::AtomicU8;
 use std::sync::{Arc, OnceLock};
 
@@ -19,15 +21,18 @@ use dynamo_runtime::{
     error::{DynamoError, ErrorClass, ErrorType, match_error_chain},
     pipeline::{
         AsyncEngineContextProvider, Context, ManyOut, Operator, ResponseStream, RouterMode,
-        ServerStreamingEngine, SingleIn, async_trait, propagate_first_response_guard,
+        ServerStreamingEngine, SingleIn, propagate_first_response_guard,
     },
     protocols::{EndpointId, annotated::Annotated},
 };
+use futures::FutureExt;
 use futures::stream::{self, StreamExt};
+use tracing::Instrument;
 
 use crate::{
     discovery::{ModelManager, WorkerSetTarget, WorkerSetTargetId},
     kv_router::{RoutingHost, SelectionPolicySource, routing_host::PrefillDispatch},
+    operator::{Downstream, DynamoDownstream, GdlDownstream, GdlOperator, native},
     protocols::common::{
         extensions::{SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId},
         llm_backend::{LLMEngineOutput, PreprocessedRequest},
@@ -375,7 +380,7 @@ impl Drop for PrefillRouter {
     }
 }
 
-#[async_trait]
+// Transition: remove when the gdl pipeline is the only local pipeline.
 impl
     Operator<
         SingleIn<PreprocessedRequest>,
@@ -384,11 +389,78 @@ impl
         ManyOut<Annotated<LLMEngineOutput>>,
     > for PrefillRouter
 {
-    async fn generate(
-        &self,
+    fn generate<'life0, 'async_trait>(
+        &'life0 self,
         request: SingleIn<PreprocessedRequest>,
         next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
-    ) -> Result<ManyOut<Annotated<LLMEngineOutput>>> {
+    ) -> Pin<
+        Box<dyn Future<Output = Result<ManyOut<Annotated<LLMEngineOutput>>>> + Send + 'async_trait>,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(self.route(request, DynamoDownstream(next)))
+    }
+}
+
+impl gdl::Operator for GdlOperator<PrefillRouter, PreprocessedRequest> {
+    type UpReq = SingleIn<PreprocessedRequest>;
+    type UpItem = Annotated<LLMEngineOutput>;
+    type DownReq = SingleIn<PreprocessedRequest>;
+    type DownItem = Annotated<LLMEngineOutput>;
+
+    fn generate<N>(
+        &self,
+        cx: gdl::Cx,
+        request: SingleIn<PreprocessedRequest>,
+        next: N,
+    ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<LLMEngineOutput>>>> + Send
+    where
+        N: gdl::Next<SingleIn<PreprocessedRequest>, Annotated<LLMEngineOutput>>,
+    {
+        let router = Arc::clone(&self.op);
+        let next = GdlDownstream::new(cx, next);
+        async move {
+            if !router.may_route_to_prefill() {
+                return router.route(request, next).await;
+            }
+            // Remote prefill stages KV on the prefill worker that only the decode leg
+            // releases, and gdl drops this future when a kill cancels the request's `cx`.
+            // So the route runs as a task that the drop detaches, and its decode leg runs
+            // under a cleanup `Cx` that the kill does not cancel (`send_cleanup`).
+            let route = async move { router.route(request, next).await };
+            match tokio::spawn(route.instrument(tracing::Span::current())).await {
+                Ok(result) => result,
+                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                Err(error) => Err(anyhow::Error::new(error).context("prefill routing task ended")),
+            }
+        }
+        .map(native)
+    }
+}
+
+impl PrefillRouter {
+    /// Whether a request may go to remote prefill now. Untargeted requests pass straight
+    /// through; the route reads the target again, under its lock, and passes through
+    /// whenever this said no and nothing activated in between.
+    fn may_route_to_prefill(&self) -> bool {
+        self.lifecycle_state() == PrefillLifecycleState::Active
+            || !matches!(self.activation_snapshot(), ActivationSnapshot::Untargeted)
+    }
+
+    /// Route `request` through remote prefill when the router is active, then send its decode
+    /// leg on: the body of the prefill router's Dynamo and gdl operators.
+    ///
+    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
+    async fn route<D>(
+        &self,
+        request: SingleIn<PreprocessedRequest>,
+        next: D,
+    ) -> Result<D::Response<LLMEngineOutput>>
+    where
+        D: Downstream<PreprocessedRequest, LLMEngineOutput>,
+    {
         // Extract request data while preserving context
         let (mut req, mut context) = request.into_parts();
         let request_id = context.id().to_string();
@@ -445,13 +517,13 @@ impl
                 // target was ever set (aggregated-capable deployment) or every prefill
                 // worker left (target cleared): route directly to the backend.
                 ActivationSnapshot::Pending | ActivationSnapshot::Untargeted => {
-                    return next.generate(context.map(|_| req)).await;
+                    return next.forward(context.map(|_| req)).await;
                 }
             }
         }
 
         if query_only {
-            return next.generate(context.map(|_| req)).await;
+            return next.forward(context.map(|_| req)).await;
         }
 
         let session_affinity = context
@@ -494,7 +566,8 @@ impl
                     let response_stream = decode_host
                         .dispatch_kv_plan(conditional_request, decision.plan)
                         .await?;
-                    return with_bypass_marker(response_stream, client_requested_bypass_marker);
+                    return with_bypass_marker(response_stream, client_requested_bypass_marker)
+                        .map(D::adopt);
                 }
                 Ok(None) => {
                     (req, context) = conditional_request.into_parts();
@@ -563,7 +636,7 @@ impl
                     ));
                 }
                 ActivationSnapshot::Untargeted => {
-                    return next.generate(context.map(|_| req)).await;
+                    return next.forward(context.map(|_| req)).await;
                 }
             },
         };
@@ -664,10 +737,7 @@ impl
         let outcome = match outcome {
             PrefillOutcome::Terminal { output } => {
                 let output = strip_terminal_disaggregated_params(*output);
-                return Ok(dynamo_runtime::pipeline::ResponseStream::new(
-                    Box::pin(stream::once(async move { output })),
-                    engine_ctx,
-                ));
+                return Ok(D::respond(stream::once(async move { output }), engine_ctx));
             }
             outcome => outcome,
         };
@@ -719,14 +789,15 @@ impl
             (true, false) => PrefillNeed::BeforeLast,
             (true, true) => PrefillNeed::BeforeFirst,
         };
-        let decode = next.generate(context.map(|_| decode_req));
+        // The leg that releases the staged KV: a kill of the request must not end it.
+        let decode = next.send_cleanup(context.map(|_| decode_req));
         match prefill_completion {
             Some(completion) => {
                 completion
-                    .forward_decode(decode, engine_ctx, output, prefill_engine_ctx)
+                    .forward_decode::<D>(decode, engine_ctx, output, prefill_engine_ctx)
                     .await
             }
-            None => decode.await,
+            None => decode.await.map(D::pass),
         }
     }
 }
@@ -879,7 +950,10 @@ fn merge_decode_topology_constraints(
 mod tests {
     use super::*;
     use dynamo_kv_router::config::{KvRouterConfig, RouterConfigOverride};
-    use dynamo_runtime::{engine::AsyncEngine, pipeline::Error};
+    use dynamo_runtime::{
+        engine::AsyncEngine,
+        pipeline::{Error, async_trait},
+    };
     use futures::StreamExt;
     use std::{
         collections::{HashMap, HashSet},
@@ -1206,7 +1280,7 @@ mod tests {
             // Decode can enter its phase even though prefill is still observed.
             let _decode_permit = tracker.set_phase(RequestPhase::Decode).await;
             let error = task
-                .forward_decode(
+                .forward_decode::<crate::operator::DynamoDownstream<PreprocessedRequest, LLMEngineOutput>>(
                     std::future::pending(),
                     Context::new(()).context(),
                     PrefillNeed::None,

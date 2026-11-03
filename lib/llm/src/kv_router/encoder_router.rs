@@ -3,12 +3,14 @@
 
 //! Optional multimodal encoder hop for token-serving pipelines.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use anyhow::{Context as _, Result};
 use arc_swap::ArcSwapOption;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use parking_lot::Mutex;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -17,12 +19,12 @@ use dynamo_runtime::{
     engine::AsyncEngine,
     pipeline::{
         Context, ManyOut, Operator, PushRouter, RouterMode, ServerStreamingEngine, SingleIn,
-        async_trait,
     },
     protocols::{EndpointId, annotated::Annotated, maybe_error::MaybeError},
 };
 
 use crate::discovery::{WorkerSetTarget, WorkerSetTargetId};
+use crate::operator::{Downstream, DynamoDownstream, GdlDownstream, GdlOperator, native};
 use crate::protocols::common::{
     llm_backend::{LLMEngineOutput, PreprocessedRequest},
     preprocessor::TraceLink,
@@ -370,7 +372,7 @@ impl EncoderRouter {
     }
 }
 
-#[async_trait]
+// Transition: remove when the gdl pipeline is the only local pipeline.
 impl
     Operator<
         SingleIn<PreprocessedRequest>,
@@ -379,15 +381,59 @@ impl
         ManyOut<Annotated<LLMEngineOutput>>,
     > for EncoderRouter
 {
-    async fn generate(
-        &self,
+    fn generate<'life0, 'async_trait>(
+        &'life0 self,
         request: SingleIn<PreprocessedRequest>,
         next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
-    ) -> Result<ManyOut<Annotated<LLMEngineOutput>>> {
+    ) -> Pin<
+        Box<dyn Future<Output = Result<ManyOut<Annotated<LLMEngineOutput>>>> + Send + 'async_trait>,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(self.encode(request, DynamoDownstream(next)))
+    }
+}
+
+impl gdl::Operator for GdlOperator<EncoderRouter, PreprocessedRequest> {
+    type UpReq = SingleIn<PreprocessedRequest>;
+    type UpItem = Annotated<LLMEngineOutput>;
+    type DownReq = SingleIn<PreprocessedRequest>;
+    type DownItem = Annotated<LLMEngineOutput>;
+
+    fn generate<N>(
+        &self,
+        cx: gdl::Cx,
+        request: SingleIn<PreprocessedRequest>,
+        next: N,
+    ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<LLMEngineOutput>>>> + Send
+    where
+        N: gdl::Next<SingleIn<PreprocessedRequest>, Annotated<LLMEngineOutput>>,
+    {
+        self.op
+            .encode(request, GdlDownstream::new(cx, next))
+            .map(native)
+    }
+}
+
+impl EncoderRouter {
+    /// Run the encode hop when the request needs one, then send the request on: the body of
+    /// the encoder router's Dynamo and gdl operators.
+    ///
+    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
+    async fn encode<D>(
+        &self,
+        request: SingleIn<PreprocessedRequest>,
+        next: D,
+    ) -> Result<D::Response<LLMEngineOutput>>
+    where
+        D: Downstream<PreprocessedRequest, LLMEngineOutput>,
+    {
         let (mut request, context) = request.into_parts();
         if self.lifecycle_state() != EncoderLifecycleState::Active || !Self::should_encode(&request)
         {
-            return next.generate(context.map(|_| request)).await;
+            return next.forward(context.map(|_| request)).await;
         }
 
         let encode_context = Context::with_id_and_metadata(
@@ -422,7 +468,7 @@ impl
                 );
             }
         }
-        next.generate(context.map(|_| request)).await
+        next.forward(context.map(|_| request)).await
     }
 }
 
@@ -442,7 +488,7 @@ mod tests {
         discovery::EventTransportKind,
         distributed::{DiscoveryBackend, DistributedConfig, RequestPlaneMode},
         engine::AsyncEngineContextProvider,
-        pipeline::{Error, ResponseStream, context::Controller, network::Ingress},
+        pipeline::{Error, ResponseStream, async_trait, context::Controller, network::Ingress},
         storage::kv,
     };
 
