@@ -168,6 +168,15 @@ else
     echo "ok hotpath.sh same"
 fi
 
+# The change columns against an unchanged base are all zero, the per-item one included.
+FAKE_VALGRIND_MODE=ok run "$here/hotpath.sh" --base "$work/base"
+if ! awk '/^pipeline / { rows = 1; next } rows && NF >= 13 && ($10 != 0 || $11 != 0 || $12 != 0 || $13 != 0) { bad = 1 }
+    END { exit bad }' "$work/stdout"; then
+    fail same-changes "a change column is not zero against an unchanged base"
+else
+    echo "ok hotpath.sh same-changes"
+fi
+
 # One more allocation per request on the default path: RISE, exit 1.
 FAKE_RISE_ROW=b FAKE_RISE_ALLOCS=1 run "$here/hotpath.sh" --base "$work/base"
 if [[ $status -ne 1 ]] || ! grep -Eq '^B +dynamo .* RISE$' "$work/stdout" \
