@@ -51,23 +51,25 @@
 //! |---|---:|---:|---:|---:|
 //! | `engine` | 7 | 2,752 | 22 | 2,812 |
 //! | `a` | 349 | 100,958 | 862 | 122,446 |
-//! | `a-gdl` | 362 | 96,857 | 875 | 118,345 |
+//! | `a-gdl` | 359 | 96,809 | 872 | 118,297 |
 //! | `b` | 402 | 227,025 | 915 | 248,513 |
-//! | `b-gdl` | 427 | 221,463 | 940 | 242,951 |
+//! | `b-gdl` | 421 | 221,367 | 934 | 242,855 |
 //! | `c` | 71 | 144,683 | 86 | 144,743 |
-//! | `c-gdl` | 86 | 140,671 | 101 | 140,731 |
+//! | `c-gdl` | 82 | 140,607 | 97 | 140,667 |
 //! | `embed-engine` | 8 | 6,548 | 23 | 88,868 |
 //! | `embed` | 199 | 44,406 | 2,283 | 529,854 |
-//! | `embeddings-gdl` | 212 | 48,617 | 2,296 | 534,065 |
+//! | `embeddings-gdl` | 209 | 48,569 | 2,294 | 534,017 |
 //!
 //! Each gdl row costs the same number of allocations more than its dynamo row at both item
-//! counts, so nothing per item: `a-gdl` +13, `b-gdl` +25, `c-gdl` +15, `embeddings-gdl` +13.
-//! That is the Phase 1 adapters' cost. `lib/gdl-adapters/tests/allocations.rs` measures it in
-//! isolation: 18 allocations per adapted operator against 14 for a `link` stage, and 22 against
-//! 19 at the boundary (`PipelineEngine` above, `EngineSink` below). Native gdl operators remove
-//! the adapted stages. `a-gdl`, `b-gdl` and `c-gdl` ask for fewer bytes than their dynamo rows
-//! (the `link` chain boxes a future per edge, the gdl composition one per `PipelineEngine`);
-//! `embeddings-gdl` asks for more, because its `link` futures are small.
+//! counts, so nothing per item: `a-gdl` +10, `b-gdl` +19, `c-gdl` +11, `embeddings-gdl` +10 (+11
+//! at 16 items). The gdl rows other than `c-gdl` vary by up to two allocations between runs, and
+//! their records hold the higher count. That is the Phase 1 adapters' cost.
+//! `lib/gdl-adapters/tests/allocations.rs` measures it in isolation: 17 allocations per adapted
+//! operator against 14 for a `link` stage, and 21 against 19 at the boundary (`PipelineEngine`
+//! above, `EngineSink` below). Native gdl operators remove the adapted stages.
+//! `a-gdl`, `b-gdl` and `c-gdl` ask for fewer bytes than their dynamo rows (the `link` chain
+//! boxes a future per edge, the gdl composition one per `PipelineEngine`); `embeddings-gdl` asks
+//! for more, because its `link` futures are small.
 //!
 //! The largest allocation of `b`, `c` and their gdl rows is one boxed future of 59,592 bytes per
 //! request, the same on both local pipelines. `a` and `embed`, which have no Migration, do not
@@ -120,22 +122,22 @@ const BASELINE: &[Row] = &[
     row("engine", 16, 22, 2812),
     row("a", 1, 349, 100958),
     row("a", 16, 862, 122446),
-    row("a-gdl", 1, 362, 96857),
-    row("a-gdl", 16, 875, 118345),
+    row("a-gdl", 1, 359, 96809),
+    row("a-gdl", 16, 872, 118297),
     row("b", 1, 402, 227025),
     row("b", 16, 915, 248513),
-    row("b-gdl", 1, 427, 221463),
-    row("b-gdl", 16, 940, 242951),
+    row("b-gdl", 1, 421, 221367),
+    row("b-gdl", 16, 934, 242855),
     row("c", 1, 71, 144683),
     row("c", 16, 86, 144743),
-    row("c-gdl", 1, 86, 140671),
-    row("c-gdl", 16, 101, 140731),
+    row("c-gdl", 1, 82, 140607),
+    row("c-gdl", 16, 97, 140667),
     row("embed-engine", 1, 8, 6548),
     row("embed-engine", 16, 23, 88868),
     row("embed", 1, 199, 44406),
     row("embed", 16, 2283, 529854),
-    row("embeddings-gdl", 1, 212, 48617),
-    row("embeddings-gdl", 16, 2296, 534065),
+    row("embeddings-gdl", 1, 209, 48569),
+    row("embeddings-gdl", 16, 2294, 534017),
 ];
 
 #[global_allocator]
