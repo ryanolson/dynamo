@@ -51,26 +51,24 @@
 //! |---|---:|---:|---:|---:|
 //! | `engine` | 7 | 2,752 | 22 | 2,812 |
 //! | `a` | 349 | 100,958 | 862 | 122,446 |
-//! | `a-gdl` | 335 | 81,439 | 848 | 102,927 |
+//! | `a-gdl` | 333 | 81,407 | 846 | 102,895 |
 //! | `b` | 402 | 227,025 | 915 | 248,513 |
-//! | `b-gdl` | 397 | 206,061 | 910 | 227,549 |
+//! | `b-gdl` | 395 | 206,317 | 908 | 227,805 |
 //! | `c` | 71 | 144,683 | 86 | 144,743 |
-//! | `c-gdl` | 82 | 140,607 | 97 | 140,667 |
+//! | `c-gdl` | 82 | 140,991 | 97 | 141,051 |
 //! | `embed-engine` | 8 | 6,548 | 23 | 88,868 |
 //! | `embed` | 199 | 44,406 | 2,283 | 529,854 |
-//! | `embeddings-gdl` | 186 | 44,471 | 2,271 | 529,919 |
+//! | `embeddings-gdl` | 184 | 44,439 | 2,268 | 529,887 |
 //!
 //! Each gdl row differs from its dynamo row by the same number of allocations at both item
-//! counts, so nothing per item: `a-gdl` −14, `b-gdl` −5, `c-gdl` +11, `embeddings-gdl` −13 (−12
-//! at 16 items). The gdl rows other than `c-gdl` vary by up to two allocations between runs,
-//! and their records hold the higher count.
+//! counts, so nothing per item: `a-gdl` −16, `b-gdl` −7, `c-gdl` +11, `embeddings-gdl` −15.
 //! `lib/gdl-adapters/tests/allocations.rs` measures the parts in isolation: 14 allocations for a
 //! `link` stage, 17 for an adapted operator, 5 for a native gdl operator, and 21 against 19 at the
 //! boundary (`PipelineEngine` above, `EngineSink` below). The preprocessor and backend are native
 //! in every gdl row that has them; Migration and the routers are still adapted, which is why
 //! `c-gdl` (3 adapted, nothing native) costs more than `c`.
 //! `a-gdl`, `b-gdl` and `c-gdl` ask for fewer bytes than their dynamo rows (the `link` chain
-//! boxes a future per edge, the gdl composition one per stage); `embeddings-gdl` asks for 65 more,
+//! boxes a future per edge, the gdl composition one per stage); `embeddings-gdl` asks for 33 more,
 //! because its `link` futures are small.
 //!
 //! The largest allocation of `b`, `c` and their gdl rows is one boxed future of 59,592 bytes per
@@ -78,8 +76,11 @@
 //! make it.
 //!
 //! Run: `cargo test -p dynamo-llm --test allocations`. For instructions per request, see
-//! `lib/llm/benches/callgrind.sh`, which runs this binary as
-//! `allocations row <row> <items> <requests>`.
+//! `lib/llm/benches/callgrind.sh` and `hotpath.sh`, which run this binary under callgrind as
+//! `allocations row <row> <items> <requests>`. Callgrind counts only the measured requests: the
+//! binary asks it for one dump after warm-up and one after the last measured request (see
+//! `lib/runtime/tests/common/callgrind.rs`). Callgrind does not count the system allocator,
+//! whose cost follows its heap state, nor this thread while it waits at the end of a window.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -113,6 +114,9 @@ use dynamo_llm::types::openai::embeddings::NvCreateEmbeddingRequest;
 use dynamo_runtime::engine::{AsyncEngine, AsyncEngineContextProvider, ResponseStream};
 use dynamo_runtime::pipeline::{Context, Error, ManyOut, RouterMode, ServiceEngine, SingleIn};
 
+#[path = "../../runtime/tests/common/callgrind.rs"]
+mod callgrind;
+
 const MODEL_PATH: &str = "tests/data/sample-models/TinyLlama_v1.1";
 const WARMUP: usize = 50;
 const REQUESTS: usize = 200;
@@ -125,25 +129,25 @@ const BASELINE: &[Row] = &[
     // Transition: remove when the gdl pipeline is the only local pipeline.
     row("a", 1, 349, 100958),
     row("a", 16, 862, 122446),
-    row("a-gdl", 1, 335, 81439),
-    row("a-gdl", 16, 848, 102927),
+    row("a-gdl", 1, 333, 81407),
+    row("a-gdl", 16, 846, 102895),
     // Transition: remove when the gdl pipeline is the only local pipeline.
     row("b", 1, 402, 227025),
     row("b", 16, 915, 248513),
-    row("b-gdl", 1, 397, 206061),
-    row("b-gdl", 16, 910, 227549),
+    row("b-gdl", 1, 395, 206317),
+    row("b-gdl", 16, 908, 227805),
     // Transition: remove when the gdl pipeline is the only local pipeline.
     row("c", 1, 71, 144683),
     row("c", 16, 86, 144743),
-    row("c-gdl", 1, 82, 140607),
-    row("c-gdl", 16, 97, 140667),
+    row("c-gdl", 1, 82, 140991),
+    row("c-gdl", 16, 97, 141051),
     row("embed-engine", 1, 8, 6548),
     row("embed-engine", 16, 23, 88868),
     // Transition: remove when the gdl pipeline is the only local pipeline.
     row("embed", 1, 199, 44406),
     row("embed", 16, 2283, 529854),
-    row("embeddings-gdl", 1, 186, 44471),
-    row("embeddings-gdl", 16, 2271, 529919),
+    row("embeddings-gdl", 1, 184, 44439),
+    row("embeddings-gdl", 16, 2268, 529887),
 ];
 
 #[global_allocator]
@@ -186,23 +190,27 @@ impl Counting {
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         Self::record(layout.size());
+        let _pause = callgrind::pause();
         // SAFETY: forwarded unchanged to the system allocator.
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         Self::record(layout.size());
+        let _pause = callgrind::pause();
         // SAFETY: forwarded unchanged to the system allocator.
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         Self::record(new_size);
+        let _pause = callgrind::pause();
         // SAFETY: forwarded unchanged to the system allocator.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let _pause = callgrind::pause();
         // SAFETY: forwarded unchanged to the system allocator.
         unsafe { System.dealloc(ptr, layout) }
     }
@@ -270,8 +278,10 @@ async fn window<F: std::future::Future>(body: F) -> (Counts, F::Output) {
     MEASURING.with(|m| m.set(true));
     OPEN.store(true, Ordering::SeqCst);
     let out = body.await;
-    let settle_start = std::time::Instant::now();
-    let settled = || settle_start.elapsed() < std::time::Duration::from_secs(5);
+    // The window reads no clock and sets no timer unless a request leaves tasks running: under
+    // callgrind, the time driver's work follows wall-clock time, which made a row's
+    // instructions per request differ by about 1% between runs of one binary.
+    let mut settle_start = None;
     let total =
         || ON_THREAD_ALLOCS.load(Ordering::SeqCst) + OFF_THREAD_ALLOCS.load(Ordering::SeqCst);
     // Settle in rounds until one round allocates nothing. Work that spawns more work allocates
@@ -285,8 +295,9 @@ async fn window<F: std::future::Future>(body: F) -> (Counts, F::Output) {
             if alive <= tasks_before {
                 break;
             }
+            let start = *settle_start.get_or_insert_with(std::time::Instant::now);
             assert!(
-                settled(),
+                start.elapsed() < std::time::Duration::from_secs(5),
                 "a request left {} tasks running",
                 alive - tasks_before
             );
@@ -294,14 +305,17 @@ async fn window<F: std::future::Future>(body: F) -> (Counts, F::Output) {
         // `num_alive_tasks` does not see blocking jobs. The runtime has one blocking thread, so
         // a no-op job finishes only after every job queued before it. Spawning it allocates on
         // this thread; that is the harness's cost, not the request's.
-        // Await it rather than poll it, so the wait costs the same instructions every time.
+        // There is no timeout on it, for the reason above: a request that leaves blocking work
+        // running for ever hangs here, so run this binary under `timeout`.
+        // Callgrind does not count this thread while it waits: no request task is left on it,
+        // and how often it parks and wakes depends on when the blocking thread runs. The
+        // blocking thread is still counted.
+        let pause = callgrind::pause();
         HARNESS.with(|h| h.set(true));
         let barrier = tokio::task::spawn_blocking(|| ());
         HARNESS.with(|h| h.set(false));
-        tokio::time::timeout(std::time::Duration::from_secs(5), barrier)
-            .await
-            .expect("a request left blocking work running")
-            .expect("barrier");
+        barrier.await.expect("barrier");
+        drop(pause);
         if total() == before {
             break;
         }
@@ -527,6 +541,9 @@ where
 {
     let mut counts = Vec::with_capacity(requests);
     for i in 0..WARMUP + requests {
+        if i == WARMUP {
+            callgrind::dump_stats_at(c"setup and warm-up");
+        }
         let fut = make();
         let (c, drained) = window(fut).await;
         assert!(drained > 0, "{name}: empty stream");
@@ -534,6 +551,7 @@ where
             counts.push(c);
         }
     }
+    callgrind::dump_stats_at(c"measured requests");
     Measured {
         name,
         items,
@@ -828,10 +846,12 @@ fn main() {
     let fixture = Fixture::load();
     // One blocking thread, so a window can wait for the blocking work a request leaves. It must
     // not exit when idle: starting a new one allocates.
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let mut builder = tokio::runtime::Builder::new_current_thread();
+    builder
         .enable_all()
         .max_blocking_threads(1)
-        .thread_keep_alive(std::time::Duration::from_secs(24 * 3600))
+        .thread_keep_alive(std::time::Duration::from_secs(24 * 3600));
+    let rt = callgrind::uncount_parked(&mut builder)
         .build()
         .expect("runtime");
     rt.block_on(run(&fixture, &args));
