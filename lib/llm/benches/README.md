@@ -113,3 +113,17 @@ tool-call metadata recording across increasing numbers of calls.
 ```bash
 cargo bench --bench request_trace_finish_metadata -p dynamo-llm --features request-trace-bench
 ```
+
+## callgrind.sh
+
+Counts instructions per request through the frontend pipelines (A, B, C, embeddings) with
+callgrind. It runs the
+`tests/allocations.rs` binary, which builds those pipelines with a test engine at the end, and
+reports `(Ir(2N) - Ir(N)) / N`. Needs `valgrind` and `jq`.
+
+```bash
+lib/llm/benches/callgrind.sh            # every row at 1 and 16 items
+lib/llm/benches/callgrind.sh b 1 b 16   # selected rows
+```
+
+The same binary checks allocations per request: `cargo test -p dynamo-llm --test allocations`.
