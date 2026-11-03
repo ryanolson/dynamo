@@ -1940,7 +1940,25 @@ mod tests {
         crate::entrypoint::input::PreprocessedRouting,
         Arc<CleanupDecode>,
     ) {
-        use crate::kv_router::{EncoderRouter, LlmDispatch, RouterLoadSource, RoutingLoadContext};
+        prefill_routing(
+            distributed,
+            namespace,
+            Arc::new(KillOnPrefillHandoff { caller }) as crate::kv_router::LlmDispatch,
+        )
+        .await
+    }
+
+    /// Routing whose prefill worker is `prefill`, and whose decode engine records each call it
+    /// reaches as `(staged_kv_cleanup, killed)`.
+    async fn prefill_routing(
+        distributed: &dynamo_runtime::DistributedRuntime,
+        namespace: &str,
+        prefill: crate::kv_router::LlmDispatch,
+    ) -> (
+        crate::entrypoint::input::PreprocessedRouting,
+        Arc<CleanupDecode>,
+    ) {
+        use crate::kv_router::{EncoderRouter, RouterLoadSource, RoutingLoadContext};
 
         let endpoint = distributed
             .namespace(namespace)
@@ -1963,7 +1981,7 @@ mod tests {
         let host = Arc::new(
             RoutingHost::builder(client, RouterMode::RoundRobin)
                 .load_context(load_context)
-                .dispatch(Arc::new(KillOnPrefillHandoff { caller }) as LlmDispatch)
+                .dispatch(prefill)
                 .build()
                 .await
                 .unwrap(),
@@ -2179,5 +2197,170 @@ mod tests {
                 ("b", "gdl", cleanup),
             ]
         );
+    }
+
+    /// A prefill worker that stages KV and hands off, then fails: its stream carries an error
+    /// item after the handoff item, as a prefill worker that dies after staging does.
+    struct DiesAfterStaging;
+
+    #[async_trait]
+    impl
+        dynamo_runtime::pipeline::StreamingDispatch<PreprocessedRequest, Annotated<LLMEngineOutput>>
+        for DiesAfterStaging
+    {
+        async fn generate(
+            &self,
+            request: SingleIn<dynamo_runtime::pipeline::AddressedRequest<PreprocessedRequest>>,
+        ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+            let handoff = Annotated::from_data(LLMEngineOutput {
+                token_ids: vec![11],
+                finish_reason: Some(FinishReason::Length),
+                disaggregated_params: Some(serde_json::json!({
+                    "request_type": "context_only",
+                    "ctx_request_id": "staged-prefill",
+                })),
+                ..Default::default()
+            });
+            use dynamo_runtime::protocols::maybe_error::MaybeError;
+            let died = Annotated::from_err(
+                DynamoError::builder()
+                    .error_type(ErrorType::Disconnected)
+                    .message("prefill worker went away")
+                    .build(),
+            );
+            Ok(ResponseStream::new(
+                Box::pin(stream::iter([handoff, died])),
+                request.context(),
+            ))
+        }
+
+        async fn generate_bidirectional(
+            &self,
+            _: dynamo_runtime::component::Instance,
+            _: String,
+            _: dynamo_runtime::pipeline::ManyIn<PreprocessedRequest>,
+        ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+            unreachable!("prefill dispatch takes a single request")
+        }
+    }
+
+    /// What a call of pipeline C gives: an eager error's type, or the item and error count.
+    async fn outcome(
+        response: impl std::future::Future<Output = Result<ManyOut<Annotated<LLMEngineOutput>>, Error>>,
+    ) -> String {
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
+            .await
+            .expect("the call ends");
+        match response {
+            Ok(stream) => {
+                let items: Vec<_> = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    stream.collect::<Vec<_>>(),
+                )
+                .await
+                .expect("the stream ends");
+                format!(
+                    "ok, {} items, {} errors",
+                    items.len(),
+                    items.iter().filter(|item| item.is_error()).count()
+                )
+            }
+            Err(error) => {
+                let found = [ErrorType::WorkerUnavailable, ErrorType::Cancelled]
+                    .into_iter()
+                    .find(|kind| match_error_chain(error.as_ref(), &[*kind], &[]));
+                format!(
+                    "error {found:?}, migratable {}",
+                    crate::migration::is_migratable(error.as_ref())
+                )
+            }
+        }
+    }
+
+    /// A prefill worker that dies after its handoff item: the request fails with the prefill
+    /// error, which Migration may retry (here it has no attempts left), and no decode leg is
+    /// sent, on both local pipelines. Nothing is left to release:
+    /// the staged blocks were on the worker that died. (The decode leg that releases staged KV
+    /// is for a request killed after a live prefill; see the kill tests above.)
+    #[tokio::test]
+    async fn a_prefill_worker_that_dies_after_its_handoff_fails_the_request_on_both_local_pipelines()
+     {
+        use crate::entrypoint::input::LocalPipeline;
+        use crate::http::service::metrics::Metrics;
+        use crate::model_card::ModelDeploymentCard;
+        use dynamo_runtime::{DistributedRuntime, Runtime, distributed::DistributedConfig};
+
+        let runtime = Runtime::from_current().unwrap();
+        let distributed =
+            DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+                .await
+                .unwrap();
+        let card =
+            ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
+                .unwrap();
+        let mut seen = Vec::new();
+        // Transition: remove the Dynamo case and keep the gdl assertions when the gdl pipeline is
+        // the only local pipeline.
+        for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+            let name = local_pipeline.as_str();
+            let (routing, decode) = prefill_routing(
+                &distributed,
+                &format!("dies-after-staging-{name}"),
+                Arc::new(DiesAfterStaging) as crate::kv_router::LlmDispatch,
+            )
+            .await;
+            let pipeline = routing
+                .with_local_pipeline(local_pipeline)
+                .build_preprocessed_pipeline(&card, 0, None, Arc::new(Metrics::new()))
+                .unwrap();
+            let outcome = outcome(pipeline.generate(Context::new(inference_request()))).await;
+            // The route has ended with its error, on gdl in its own task too: a decode leg it
+            // sent is recorded by now.
+            seen.push((name, outcome, decode.requests.lock().clone()));
+        }
+        runtime.shutdown();
+        let failed = ("error None, migratable true".to_string(), vec![]);
+        assert_eq!(
+            seen,
+            [
+                ("dynamo", failed.0.clone(), failed.1.clone()),
+                ("gdl", failed.0, failed.1)
+            ]
+        );
+    }
+
+    /// A prefill target that is still activating: the request fails closed with a retryable
+    /// `WorkerUnavailable`, Migration retries it, and decode never sees it, on both local
+    /// pipelines.
+    #[tokio::test]
+    async fn a_pending_prefill_target_fails_closed_on_both_local_pipelines() {
+        use crate::entrypoint::input::{LocalPipeline, PreprocessedRouting};
+        use crate::http::service::metrics::Metrics;
+        use crate::kv_router::EncoderRouter;
+        use crate::model_card::ModelDeploymentCard;
+
+        let card =
+            ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
+                .unwrap();
+        let mut seen = Vec::new();
+        // Transition: remove the Dynamo case and keep the gdl assertions when the gdl pipeline is
+        // the only local pipeline.
+        for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+            let router = fresh_decode_router();
+            mark_target_pending(&router);
+            let decode = Arc::new(CountingDecodeHost::default());
+            let pipeline =
+                PreprocessedRouting::new(decode.clone(), router, EncoderRouter::disabled())
+                    .with_local_pipeline(local_pipeline)
+                    .build_preprocessed_pipeline(&card, 1, None, Arc::new(Metrics::new()))
+                    .unwrap();
+            let outcome = outcome(pipeline.generate(Context::new(inference_request()))).await;
+            seen.push((outcome, decode.requests.load(Ordering::Relaxed)));
+        }
+        let expected = (
+            "error Some(WorkerUnavailable), migratable true".to_string(),
+            0,
+        );
+        assert_eq!(seen, [expected.clone(), expected]);
     }
 }
