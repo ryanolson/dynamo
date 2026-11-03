@@ -9,6 +9,7 @@ members = [
     "lib/tokens",
     "lib/truthy",
     "lib/data-gen",
+    "lib/gdl-adapters",
     "lib/kv-hashing",
     "lib/mocker",
     "lib/kv-router",
