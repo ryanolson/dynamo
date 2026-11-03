@@ -746,12 +746,15 @@ fn main() {
 }
 
 async fn run(fixture: &Fixture, args: &[String]) {
-    // Start the blocking thread and let it go idle once. Its first wait sets up parking_lot's
-    // per-thread data, and that would land in whichever window is open at the time.
-    tokio::task::spawn_blocking(|| ())
-        .await
-        .expect("blocking pool");
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Start the blocking thread and set up its parking_lot per-thread data inside the job, so
+    // the setup is done when the job returns. The thread waits for work on a parking_lot
+    // condvar, and its first wait would otherwise allocate in whichever window is open.
+    tokio::task::spawn_blocking(|| {
+        let lock = parking_lot::Mutex::new(());
+        parking_lot::Condvar::new().wait_for(&mut lock.lock(), std::time::Duration::from_millis(1));
+    })
+    .await
+    .expect("blocking pool");
 
     if args.first().map(String::as_str) == Some("row") {
         let name = args.get(1).expect("row");
