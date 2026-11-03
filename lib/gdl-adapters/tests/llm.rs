@@ -1068,3 +1068,92 @@ async fn a_kill_during_dispatch_ends_pipeline_a_on_both_local_pipelines() {
     }
     assert_eq!(outcomes, ["ok, 0 items", "error Cancelled"]);
 }
+
+/// Pipeline A behind the HTTP service, as the in-process HTTP input serves it: one model per
+/// local pipeline over the same kind of engine, the same chat, streamed and not.
+#[tokio::test]
+async fn pipeline_a_serves_the_same_chat_over_http_on_both_local_pipelines() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let service = HttpService::builder()
+        .port(port)
+        .host("127.0.0.1")
+        .enable_chat_endpoints(true)
+        .build()
+        .unwrap();
+    let mut engines = Vec::new();
+    for (model, local_pipeline) in [
+        ("dynamo", LocalPipeline::Dynamo),
+        ("gdl", LocalPipeline::Gdl),
+    ] {
+        let engine = Flaky::new(0, false);
+        let card = ModelDeploymentCard::with_name_only(model);
+        service
+            .model_manager()
+            .add_chat_completions_model(
+                model,
+                card.mdcsum(),
+                pipeline_a(local_pipeline, engine.clone()).await,
+            )
+            .unwrap();
+        engines.push(engine);
+    }
+    let cancel = CancellationToken::new();
+    let join = service.spawn_with_listener(cancel.clone(), listener).await;
+
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while client.get(format!("{base}/health")).send().await.is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the service is up");
+
+    for stream in [false, true] {
+        let mut texts = Vec::new();
+        for model in ["dynamo", "gdl"] {
+            let response = client
+                .post(format!("{base}/v1/chat/completions"))
+                .json(&serde_json::json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "Write one sentence about a fox."}],
+                    "max_tokens": 8,
+                    "stream": stream,
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK, "{model}");
+            let body = response.text().await.unwrap();
+            let text = if stream {
+                body.lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter(|data| *data != "[DONE]")
+                    .map(|data| serde_json::from_str::<serde_json::Value>(data).unwrap())
+                    .filter_map(|chunk| {
+                        chunk["choices"][0]["delta"]["content"]
+                            .as_str()
+                            .map(str::to_string)
+                    })
+                    .collect::<String>()
+            } else {
+                let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+                body["choices"][0]["message"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            assert!(!text.is_empty(), "{model}, stream {stream}: {body}");
+            texts.push(text);
+        }
+        assert_eq!(texts[0], texts[1], "stream {stream}");
+    }
+    for engine in &engines {
+        assert_eq!(engine.calls.lock().unwrap().len(), 2);
+    }
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
+}
