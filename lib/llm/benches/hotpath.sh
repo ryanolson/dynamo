@@ -16,9 +16,15 @@
 #   The environment variables of callgrind.sh apply, and HOTPATH_RUNS (below).
 #
 # Columns, per request:
-#   allocs, instr          at 1 item
+#   allocs, instr            at 1 item
 #   allocs/item, instr/item  each extra item: (count at 16 items - count at 1 item) / 15
+#   allocs@16, instr@16      at 16 items; the comparison uses these, not the rounded per-item
+#   range                    the lowest and highest allocations of a single request, at 1 and
+#                            at 16 items
 # For the embeddings rows, an item is an input; their stream has one item for any number.
+# A dynamo row's allocations are its typical request's. A gdl row's are its highest request's:
+# a gdl request can lose an allocation or two from its window, so its typical count moves
+# between runs.
 #
 # Instructions per request vary a little between runs of one binary (see the README). A rise
 # counts only above the row's tolerance: the larger of a share of the base (the table below,
@@ -80,28 +86,34 @@ awk -v base="$base" -v table_rows="$table_rows" \
     -v floor="${HOTPATH_FLOOR:-300}" -v item_floor="${HOTPATH_ITEM_FLOOR:-50}" '
 function tolerance(b, pct, least) { t = b * pct / 100; return t > least ? t : least }
 function change(now, was) { d = now - was; return (d > 0 ? "+" : "") d }
+function lo(range) { split(range, p, "[.][.]"); return p[1] + 0 }
+function hi(range) { split(range, p, "[.][.]"); return p[2] + 0 }
 BEGIN {
     if (base != "") {
         while ((getline line < base) > 0) {
             n = split(line, f)
-            if (n >= 6 && f[3] ~ /^[0-9]+$/) {
+            if (n >= 9 && f[3] ~ /^[0-9]+$/ && f[7] ~ /^[0-9]+$/) {
                 key = f[1] " " f[2]
-                b_allocs[key] = f[3]; b_allocs_item[key] = f[4]
-                b_instr[key] = f[5]; b_instr_item[key] = f[6]
+                b_allocs[key] = f[3]; b_instr[key] = f[5]
+                b_allocs16[key] = f[7]; b_instr16[key] = f[8]
             }
         }
     }
 }
-# Repeated runs: the highest allocations (they must not vary) and the lowest instructions.
+# Over repeated runs: the highest typical allocations, the lowest and highest single request,
+# and the lowest instructions.
 NR > 1 {
-    if (!(($1, $2) in instr) || $4 < instr[$1, $2]) instr[$1, $2] = $4
-    if (!(($1, $2) in allocs) || $3 > allocs[$1, $2]) allocs[$1, $2] = $3
+    k = $1 SUBSEP $2
+    if (!(k in instr) || $4 < instr[k]) instr[k] = $4
+    if (!(k in allocs) || $3 > allocs[k]) allocs[k] = $3
+    if (!(k in low) || lo($5) < low[k]) low[k] = lo($5)
+    if (!(k in high) || hi($5) > high[k]) high[k] = hi($5)
 }
 END {
-    if (base == "")
-        printf "%-12s %-6s %8s %11s %10s %10s\n", "pipeline", "form", "allocs", "allocs/item", "instr", "instr/item"
-    else
-        printf "%-12s %-6s %8s %11s %10s %10s  %6s %11s %8s %10s  %s\n", "pipeline", "form", "allocs", "allocs/item", "instr", "instr/item", "change", "allocs/item", "instr", "instr/item", "mark"
+    header = sprintf("%-12s %-6s %7s %11s %9s %10s %9s %10s  %-19s", "pipeline", "form", "allocs", "allocs/item", "instr", "instr/item", "allocs@16", "instr@16", "range")
+    if (base != "")
+        header = header sprintf("  %6s %9s %8s %10s  %s", "change", "allocs@16", "instr", "instr/item", "mark")
+    print header
     nrows = split(table_rows, lines, "\n")
     marked = 0
     for (i = 1; i <= nrows; i++) {
@@ -113,24 +125,35 @@ END {
             missing = 1
             continue
         }
-        a = allocs[row, 1]; ai = sprintf("%.1f", (allocs[row, 16] - a) / 15)
-        r = instr[row, 1]; ri = sprintf("%.0f", (instr[row, 16] - r) / 15)
+        # A gdl row can lose an allocation or two from some windows, so it reports its highest
+        # request. The dynamo rows report their typical request.
+        if (form == "gdl") {
+            a = high[row, 1]; a16 = high[row, 16]
+        } else {
+            a = allocs[row, 1]; a16 = allocs[row, 16]
+        }
+        r = instr[row, 1]; r16 = instr[row, 16]
+        range = low[row, 1] ".." high[row, 1] "," low[row, 16] ".." high[row, 16]
+        line = sprintf("%-12s %-6s %7d %11.2f %9d %10.0f %9d %10d  %-19s", pipeline, form,
+            a, (a16 - a) / 15, r, (r16 - r) / 15, a16, r16, range)
         if (base == "") {
-            printf "%-12s %-6s %8d %11s %10d %10s\n", pipeline, form, a, ai, r, ri
+            print line
             continue
         }
         if (!(key in b_allocs)) {
-            printf "%-12s %-6s %8d %11s %10d %10s  %6s %11s %8s %10s  %s\n", pipeline, form, a, ai, r, ri, "-", "-", "-", "-", "new"
+            print line sprintf("  %6s %9s %8s %10s  %s", "-", "-", "-", "-", "new")
             continue
         }
-        worse = a > b_allocs[key] || ai + 0 > b_allocs_item[key] + 0 \
+        # Compare raw counts: a per-item figure is rounded for display.
+        ri = (r16 - r) / 15; b_ri = (b_instr16[key] - b_instr[key]) / 15
+        worse = a > b_allocs[key] || a16 > b_allocs16[key] \
             || r - b_instr[key] > tolerance(b_instr[key], pct, floor) \
-            || ri - b_instr_item[key] > tolerance(b_instr_item[key], item_pct, item_floor)
+            || ri - b_ri > tolerance(b_ri, item_pct, item_floor)
         mark = ""
         if (worse) { mark = form == "gdl" ? "WORSE" : "RISE"; marked++ }
-        printf "%-12s %-6s %8d %11s %10d %10s  %6s %11s %8s %10s  %s\n", pipeline, form, a, ai, r, ri,
-            change(a, b_allocs[key]), sprintf("%+.1f", ai - b_allocs_item[key]),
-            change(r, b_instr[key]), change(ri, b_instr_item[key]), mark
+        print line sprintf("  %6s %9s %8s %10s  %s", change(a, b_allocs[key]),
+            change(a16, b_allocs16[key]), change(r, b_instr[key]),
+            sprintf("%+.0f", ri - b_ri), mark)
     }
     if (missing) exit 2
     if (marked) exit 1

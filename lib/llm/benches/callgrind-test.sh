@@ -76,7 +76,12 @@ if [[ $mode != nowindow ]]; then
         [[ $mode == nosummary ]] || echo "summary: $((per * n))"
     } >"$out.2"
 fi
-[[ $mode == noallocs ]] || echo "$row items=$items allocs=$allocs bytes=1"
+# FAKE_FLIP_ROW: some requests make 2 allocations fewer, and they are the typical ones.
+low=$allocs
+if [[ $row == "${FAKE_FLIP_ROW:-}" ]]; then
+    low=$((allocs - 2))
+fi
+[[ $mode == noallocs ]] || echo "$row items=$items allocs=$low bytes=1 allocs_range=$low..$allocs"
 case $mode in
     segv | logonly)
         echo "==1== Process terminating with default action of signal 11 (SIGSEGV)" >&2
@@ -110,10 +115,10 @@ fail() {
 FAKE_VALGRIND_MODE=ok run "$here/callgrind.sh" b-gdl 1 ingress 16
 if [[ $status -ne 0 ]]; then
     fail ok "exit status $status, want 0"
-elif ! grep -Eq '^b-gdl +1 +6 +5010$' "$work/stdout"; then
-    fail ok "no 'b-gdl 1 6 5010' row"
-elif ! grep -Eq '^ingress +16 +23 +7160$' "$work/stdout"; then
-    fail ok "no 'ingress 16 23 7160' row"
+elif ! grep -Eq '^b-gdl +1 +6 +5010 +6\.\.6$' "$work/stdout"; then
+    fail ok "no 'b-gdl 1 6 5010 6..6' row"
+elif ! grep -Eq '^ingress +16 +23 +7160 +23\.\.23$' "$work/stdout"; then
+    fail ok "no 'ingress 16 23 7160 23..23' row"
 elif ! grep -q '"executable":"/nonexistent/ingress_allocations"' <(PATH="$work/bin:$PATH" cargo test --test ingress_allocations); then
     fail ok "the cargo stand-in does not name the ingress binary"
 else
@@ -142,12 +147,12 @@ else
 fi
 
 # hotpath.sh: the table. A dynamo: 1 + 1 = 2 allocations and 1010 instructions at 1 item,
-# 17 and 1160 at 16, so 1.0 allocations and 10 instructions per extra item.
+# 17 and 1160 at 16, so 1.00 allocations and 10 instructions per extra item.
 FAKE_VALGRIND_MODE=ok run "$here/hotpath.sh"
 if [[ $status -ne 0 ]]; then
     fail table "exit status $status, want 0"
-elif ! grep -Eq '^A +dynamo +2 +1\.0 +1010 +10$' "$work/stdout"; then
-    fail table "no 'A dynamo 2 1.0 1010 10' row"
+elif ! grep -Eq '^A +dynamo +2 +1\.00 +1010 +10 +17 +1160 +2\.\.2,17\.\.17 *$' "$work/stdout"; then
+    fail table "no 'A dynamo 2 1.00 1010 10 17 1160 2..2,17..17' row"
 elif [[ $(grep -Ec '^(engine|A|B|C|embed-engine|embeddings|ingress) ' "$work/stdout") -ne 11 ]]; then
     fail table "want 11 rows"
 else
@@ -196,6 +201,21 @@ if [[ $status -ne 0 ]] || ! diff -q "$work/stdout" "$work/base" >/dev/null; then
     fail runs "exit status $status, want 0 and the base table"
 else
     echo "ok hotpath.sh runs"
+fi
+
+# A gdl row whose typical request makes 2 allocations fewer reports its highest request, and
+# its range shows the low one: no change, no mark. A dynamo row reports its typical request.
+FAKE_FLIP_ROW=b-gdl run "$here/hotpath.sh" --base "$work/base"
+if [[ $status -ne 0 ]] || ! grep -Eq '^B +gdl +6 .* 4\.\.6,19\.\.21 +0 ' "$work/stdout"; then
+    fail gdl-highest "exit status $status, want 0 and B gdl at 6 with range 4..6,19..21"
+else
+    echo "ok hotpath.sh gdl-highest"
+fi
+FAKE_FLIP_ROW=b run "$here/hotpath.sh"
+if [[ $status -ne 0 ]] || ! grep -Eq '^B +dynamo +0 .* 0\.\.2,15\.\.17 *$' "$work/stdout"; then
+    fail dynamo-typical "exit status $status, want 0 and B dynamo at its typical 0"
+else
+    echo "ok hotpath.sh dynamo-typical"
 fi
 
 # A failed run fails the table.

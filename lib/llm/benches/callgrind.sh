@@ -20,8 +20,9 @@
 #   (default: the number of CPUs). CALLGRIND_PROFILE sets the cargo profile (default
 #   profiling). CARGO_TARGET_DIR is honored.
 #
-# Output: a header, then one line per argument pair, "ROW ITEMS ALLOCATIONS INSTRUCTIONS", in
-# argument order. A pair may repeat, for repeated runs. A row that fails prints no line, and the
+# Output: a header, then one line per argument pair, "ROW ITEMS ALLOCATIONS INSTRUCTIONS RANGE",
+# in argument order. ALLOCATIONS is the binary's typical request; RANGE is the lowest and
+# highest of its measured requests, "LOW..HIGH". A pair may repeat, for repeated runs. A row that fails prints no line, and the
 # script exits non-zero.
 #
 # Record counts from the `profiling` profile (release with symbols); debug counts mean little.
@@ -82,7 +83,7 @@ for ((i = 1; i <= $#; i += 2)); do
     fi
 done
 
-# "ALLOCATIONS INSTRUCTIONS" per request for one run of a row. Check the exit status, the log and
+# "ALLOCATIONS INSTRUCTIONS RANGE" per request for one run of a row. Check the exit status, the log and
 # the window dump before reading a count.
 measure() {
     local bin=$1 row=$2 items=$3 n=$4 i=$5
@@ -112,13 +113,16 @@ measure() {
         echo "callgrind.sh: $what: no instruction total in $window; see $out.log" >&2
         return 1
     fi
-    local allocs
+    local allocs range
     allocs=$(grep -o 'allocs=[0-9]*' "$out.stdout" | head -n 1 | cut -d= -f2) || true
     if [[ ! $allocs =~ ^[0-9]+$ ]]; then
         echo "callgrind.sh: $what: no allocs= in the program's output $out.stdout" >&2
         return 1
     fi
-    echo "$allocs $((ir / n))"
+    # The ingress row prints no range: it fails unless every request allocates the same.
+    range=$(grep -o 'allocs_range=[0-9]*\.\.[0-9]*' "$out.stdout" | head -n 1 | cut -d= -f2) || true
+    [[ -n $range ]] || range=$allocs..$allocs
+    echo "$allocs $((ir / n)) $range"
 }
 
 # Rows run in parallel, CALLGRIND_JOBS at a time (default: the number of CPUs). Each run is one
@@ -143,16 +147,16 @@ done
 wait
 failed=0
 
-printf '%-14s %6s %12s %14s\n' row items allocations instructions
+printf '%-14s %6s %12s %14s %12s\n' row items allocations instructions range
 for i in "${!rows[@]}"; do
     read -r row items <<<"${rows[$i]}"
     counts=$(cat "$out_dir/result.$i" 2>/dev/null) || true
-    if [[ ! $counts =~ ^[0-9]+\ [0-9]+$ ]]; then
+    if [[ ! $counts =~ ^[0-9]+\ [0-9]+\ [0-9]+\.\.[0-9]+$ ]]; then
         failed=1
         continue
     fi
-    read -r allocs ir <<<"$counts"
-    printf '%-14s %6s %12s %14s\n' "$row" "$items" "$allocs" "$ir"
+    read -r allocs ir range <<<"$counts"
+    printf '%-14s %6s %12s %14s %12s\n' "$row" "$items" "$allocs" "$ir" "$range"
 done
 echo "callgrind output: $out_dir" >&2
 exit "$failed"

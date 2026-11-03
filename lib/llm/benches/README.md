@@ -128,12 +128,18 @@ lib/llm/benches/hotpath.sh --base table.txt         # the table, and each row's 
 ```
 
 Per request, `allocs` and `instr` are at 1 item, and `allocs/item` and `instr/item` are the
-cost of each item after the first: `(count at 16 items - count at 1 item) / 15`. For the
-embeddings rows, an item is an input.
+cost of each item after the first: `(count at 16 items - count at 1 item) / 15`. `allocs@16`
+and `instr@16` are the counts at 16 items, and `range` is the lowest and highest allocations
+of one request, at 1 and at 16 items. For the embeddings rows, an item is an input.
+
+A dynamo row's allocations are its typical request's. A gdl row's are its highest request's:
+at gdl `79bcc11d`, under CPU load, some gdl requests make 2 allocations fewer in their window,
+so the typical count moves between runs. `range` shows how far.
 
 With `--base`, the script marks a row `RISE` when the default path got worse and `WORSE` when a
-gdl row did, and exits 1 if it marked any row. A row gets worse when its allocations rise at
-all, or when its instructions rise by more than the tolerance (see below).
+gdl row did, and exits 1 if it marked any row. A row gets worse when its allocations at 1 or at
+16 items rise at all, or when its instructions rise by more than the tolerance (see below). It
+compares the raw counts, not the rounded per-item figures.
 
 `callgrind.sh` measures single rows, one run each, and prints raw counts:
 
