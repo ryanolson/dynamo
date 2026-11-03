@@ -13,12 +13,18 @@ per item grows with every token of every stream. A cost per request is paid once
 The per-item path of a chat response: Backend's decoder stream, then the preprocessor's response
 transform, through the stream layers between the stages.
 
-- **Entry points:** `Backend::generate_tokens` in `lib/llm/src/backend.rs` (the `unfold` over the
-  engine's stream), and `transform_postprocessor_stream_with_image_tokens` in
-  `lib/llm/src/preprocessor.rs`.
-- **Guard:** `lib/llm/benches/hotpath.sh`, rows `A dynamo` and `A gdl`, the `instr/item` column.
-  Tolerance 2% per item, at least 50 instructions. Two builds of the same tree agree within 0.25%
-  per row (aarch64).
+- **Entry points:** `DecoderStream::poll_next` in `lib/llm/src/backend.rs` (Backend's stream over
+  the engine's stream, built by `Backend::generate_tokens`), and
+  `transform_postprocessor_stream_with_image_tokens` in `lib/llm/src/preprocessor.rs`, with the
+  in-place edits of `lib/llm/src/preprocessor/edit.rs` after the parsers.
+- **Guard:** `lib/llm/benches/hotpath.sh`, rows `A dynamo` and `A gdl`: the `memcpy/item` and
+  `memcpy@16` columns, with no tolerance (the count is the same in every run of one build), and
+  the `instr/item` column, tolerance 2% per item, at least 50 instructions. Two builds of the
+  same tree agree within 0.25% per row (aarch64). One more move of an item costs about 100 to
+  200 instructions, inside the instruction tolerance, so the `memcpy` columns are what catch it.
+- **Rule:** a stage edits a stream item through `&mut` in a stream that owns its state. It does
+  not take the item by value and return it (`map(|mut item| { ...; item })`, `unfold`), because
+  each such step moves the 1 KB item two or three times.
 - **Profile:** callgrind over the measured window (`lib/llm/benches/callgrind.sh`) of rows `a` and
   `a-gdl`, at 1 and 16 items, 200 and 400 requests. Per extra item = (16 items - 1 item) / 15.
   Self instructions, grouped by component. Commit 845f5a9993, x86_64 bench host
