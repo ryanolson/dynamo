@@ -519,3 +519,24 @@ async fn each_downstream_call_gets_a_cx_of_the_context_it_passes() {
     context.kill();
     assert!(cx.is_cancelled());
 }
+
+#[tokio::test]
+async fn a_stop_after_a_kill_still_ends_the_stream_quietly() {
+    let sink = Arc::new(StopAwareSink::default());
+    let pipeline = engine_of(Source::new(Hop::new(
+        (),
+        gdl::SinkStage::new(sink.clone()),
+        (),
+    )));
+    let request = make_request(1);
+    let context = request.context();
+    let mut stream = pipeline.generate(request).await.unwrap();
+    assert_eq!(stream.next().await.unwrap().data, Some(0));
+
+    context.stop_generating();
+    context.kill();
+    context.stop_generating();
+    assert!(sink.seen.lock().unwrap()[0].is_cancelled());
+    let item = stream.next().await;
+    assert!(item.is_none(), "a killed stream emitted {item:?}");
+}
