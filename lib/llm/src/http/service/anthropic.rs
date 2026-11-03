@@ -84,7 +84,7 @@ pub fn anthropic_messages_router(
     path: Option<String>,
 ) -> (Vec<RouteDoc>, Router) {
     let path = path.unwrap_or_else(|| DEFAULT_MESSAGES_PATH.to_string());
-    let count_tokens_path = format!("{}/count_tokens", &path);
+    let count_tokens_path = format!("{}/count_tokens", path);
     let doc = RouteDoc::new(axum::http::Method::POST, &path);
     let count_doc = RouteDoc::new(axum::http::Method::POST, &count_tokens_path);
     let router = Router::new()
@@ -368,6 +368,7 @@ fn validate_anthropic_tools(
 }
 
 /// Top-level HTTP handler for POST /v1/messages.
+#[allow(clippy::result_large_err)]
 async fn handler_anthropic_messages(
     State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
     headers: HeaderMap,
@@ -467,6 +468,7 @@ async fn handler_anthropic_messages(
 
 /// Core logic for the Anthropic Messages endpoint.
 #[tracing::instrument(level = "debug", skip_all, fields(request_id = %request.id()))]
+#[allow(clippy::result_large_err)]
 async fn anthropic_messages(
     state: Arc<service_v2::State>,
     template: Option<RequestTemplate>,
@@ -959,6 +961,7 @@ async fn anthropic_messages(
 
 /// Handler for POST /v1/messages/count_tokens.
 /// Returns an estimated input token count using a len/3 heuristic.
+#[allow(clippy::result_large_err)]
 async fn handler_count_tokens(
     State((state, _template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
     Json(mut request): Json<AnthropicCountTokensRequest>,

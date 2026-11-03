@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "dynamo-gdl-adapters"
+description = "Bridge between Dynamo's engines and operators and gdl's local pipeline traits"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Only the `gdl` crate, never gdl's runtime or code generator: they bring a
+# second velo from git. `tests/dependencies.rs` checks.
+[dependencies]
+gdl = { workspace = true }

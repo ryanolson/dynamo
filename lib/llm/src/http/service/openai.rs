@@ -1563,6 +1563,7 @@ type BoxedCompletionResponseStream =
 /// `select_all` cannot safely provide this check after merging because a normal
 /// event from one prompt may arrive before a typed backend error from another.
 /// Poll all streams concurrently so batch startup is not serialized.
+#[allow(clippy::result_large_err)]
 async fn check_completion_batch_streams<S>(
     streams: Vec<S>,
     check: BackendErrorCheck,
@@ -3077,6 +3078,7 @@ const MAX_LEADING_ANNOTATIONS: usize = 16;
 ///
 /// Returns `Err(BackendErrorInfo)` if the first non-annotation event is a backend
 /// error, `Ok(stream)` otherwise.
+#[allow(clippy::result_large_err)]
 pub(super) async fn check_for_backend_error_info<T>(
     stream: impl futures::Stream<Item = Annotated<T>> + Send + 'static,
     check: BackendErrorCheck,

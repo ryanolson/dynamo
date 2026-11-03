@@ -229,7 +229,7 @@ impl DynamicSubscriber {
 
             // Cancel all active endpoints on shutdown
             let endpoints_guard = endpoints.write().await;
-            for (_id, (_endpoint, cancel)) in endpoints_guard.iter() {
+            for (_endpoint, cancel) in endpoints_guard.values() {
                 cancel.cancel();
             }
             tracing::info!("Discovery watch stream ended");

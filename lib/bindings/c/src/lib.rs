@@ -256,7 +256,7 @@ fn kv_event_create_stored_from_parts(
 
         if num_toks != (kv_block_size as usize) {
             if WARN_COUNT
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
                     if c < 3 { Some(c + 1) } else { None }
                 })
                 .is_ok()

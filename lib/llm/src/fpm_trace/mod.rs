@@ -123,7 +123,7 @@ impl FpmTrace {
         // after its shutdown has begun.
         inner
             .leases
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |leases| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |leases| {
                 if leases == 0 {
                     None
                 } else {

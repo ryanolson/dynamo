@@ -914,7 +914,7 @@ impl RequestMetrics {
 
     fn update_input_tokens(&self, input_tokens: impl Fn(u64) -> u64) {
         let mut added = 0;
-        let Ok(previous) = self.state.fetch_update(Relaxed, Relaxed, |state| {
+        let Ok(previous) = self.state.try_update(Relaxed, Relaxed, |state| {
             if state & FINISHED != 0 {
                 return None;
             }
@@ -1298,7 +1298,7 @@ impl Metrics {
                 "Sanitized HTTP metrics prefix"
             );
         }
-        let frontend_metric_name = |suffix: &str| format!("{}_{}", &prefix, suffix);
+        let frontend_metric_name = |suffix: &str| format!("{}_{}", prefix, suffix);
         let systemone = SystemOneMetrics::new(&prefix);
 
         let awaiting_first_token_requests = IntGaugeVec::new(

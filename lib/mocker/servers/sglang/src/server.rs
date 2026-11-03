@@ -221,6 +221,7 @@ impl SglangMockerService {
         self.engine.metrics_receiver()
     }
 
+    #[allow(clippy::result_large_err)]
     async fn start_generation(
         &self,
         request: pb::GenerateRequest,

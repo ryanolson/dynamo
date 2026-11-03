@@ -9,6 +9,7 @@ members = [
     "lib/tokens",
     "lib/truthy",
     "lib/data-gen",
+    "lib/gdl-adapters",
     "lib/kv-hashing",
     "lib/mocker",
     "lib/kv-router",
@@ -98,6 +99,10 @@ dynamo-sidecar-common = { path = "lib/sidecar/common", version = "1.7.0" }
 
 # velo
 velo = { version = "=0.21.0", default-features = false }
+
+# gdl's node traits, without its runtime, which takes velo from git rather
+# than the crates.io release above.
+gdl = { git = "https://github.com/ryanolson/gdl", rev = "37864fbb59ceb3da04db3d2965dab3633430c283" }
 
 # External dependencies
 anyhow = { version = "1" }
