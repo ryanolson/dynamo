@@ -398,6 +398,19 @@ impl Controller {
     pub fn id(&self) -> &str {
         &self.id
     }
+
+    /// Move to `state`, unless the context is already killed. A kill is
+    /// final: a stop that lands after it, or races it, must not turn it back
+    /// into a stop, or `killed()` would wait again.
+    fn publish(&self, state: State) {
+        self.tx.send_if_modified(|current| {
+            if *current == State::Killed || *current == state {
+                return false;
+            }
+            *current = state;
+            true
+        });
+    }
 }
 
 impl Default for Controller {
@@ -453,7 +466,7 @@ impl AsyncEngineContext for Controller {
             child.stop_generating();
         }
 
-        let _ = self.tx.send(State::Stopped);
+        self.publish(State::Stopped);
     }
 
     fn stop(&self) {
@@ -469,7 +482,7 @@ impl AsyncEngineContext for Controller {
             child.stop();
         }
 
-        let _ = self.tx.send(State::Stopped);
+        self.publish(State::Stopped);
     }
 
     fn kill(&self) {
@@ -485,7 +498,7 @@ impl AsyncEngineContext for Controller {
             child.kill();
         }
 
-        let _ = self.tx.send(State::Killed);
+        self.publish(State::Killed);
     }
 
     fn link_child(&self, child: Arc<dyn AsyncEngineContext>) {
@@ -647,5 +660,112 @@ mod tests {
         let ctx: Context<Final> = ctx.into_context();
 
         assert_eq!(ctx.current.message, "Processed length: 5");
+    }
+
+    /// A child that runs a hook on the first signal its parent sends it.
+    struct OnSignal(Mutex<Option<Box<dyn FnOnce() + Send>>>);
+
+    impl OnSignal {
+        fn new(hook: impl FnOnce() + Send + 'static) -> Arc<Self> {
+            Arc::new(Self(Mutex::new(Some(Box::new(hook)))))
+        }
+
+        fn signal(&self) {
+            let hook = self.0.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+    }
+
+    impl std::fmt::Debug for OnSignal {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("OnSignal")
+        }
+    }
+
+    #[async_trait]
+    impl AsyncEngineContext for OnSignal {
+        fn id(&self) -> &str {
+            "on-signal"
+        }
+
+        fn is_stopped(&self) -> bool {
+            false
+        }
+
+        fn is_killed(&self) -> bool {
+            false
+        }
+
+        async fn stopped(&self) {
+            std::future::pending().await
+        }
+
+        async fn killed(&self) {
+            std::future::pending().await
+        }
+
+        fn stop_generating(&self) {
+            self.signal();
+        }
+
+        fn stop(&self) {
+            self.signal();
+        }
+
+        fn kill(&self) {
+            self.signal();
+        }
+
+        fn link_child(&self, _: Arc<dyn AsyncEngineContext>) {}
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Signal {
+        StopGenerating,
+        Stop,
+        Kill,
+    }
+
+    impl Signal {
+        fn send(self, context: &dyn AsyncEngineContext) {
+            match self {
+                Signal::StopGenerating => context.stop_generating(),
+                Signal::Stop => context.stop(),
+                Signal::Kill => context.kill(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stop_after_a_kill_keeps_the_kill() {
+        for stop in [Signal::StopGenerating, Signal::Stop] {
+            let controller = Controller::default();
+            controller.kill();
+            stop.send(&controller);
+
+            assert!(controller.is_stopped(), "{stop:?}");
+            assert!(controller.is_killed(), "{stop:?} replaced the kill");
+            tokio::time::timeout(std::time::Duration::from_secs(1), controller.killed())
+                .await
+                .unwrap_or_else(|_| panic!("killed() waits again after {stop:?}"));
+        }
+    }
+
+    /// A kill that lands while a stop is telling the children wins, even
+    /// though the stop publishes its own state afterwards.
+    #[test]
+    fn a_stop_does_not_replace_a_kill_made_during_it() {
+        for stop in [Signal::StopGenerating, Signal::Stop] {
+            let controller = Arc::new(Controller::default());
+            let target = Arc::downgrade(&controller);
+            controller.link_child(OnSignal::new(move || {
+                target.upgrade().unwrap().kill();
+            }));
+            stop.send(controller.as_ref());
+
+            assert!(controller.is_killed(), "{stop:?} replaced the kill");
+        }
     }
 }
