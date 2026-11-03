@@ -4,6 +4,7 @@
 //! Stop and kill between a Dynamo request context and a gdl [`Cx`].
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use dynamo_runtime::engine::{AsyncEngineContext, Data};
@@ -42,7 +43,10 @@ impl CxBridge {
         }));
         // `link_child` does not replay what already happened to `context`.
         // Checked after linking, so a signal that lands in between reaches
-        // the `Cx` one way or the other; both are idempotent.
+        // the `Cx` one way or the other; both are idempotent. Except one under
+        // way: Dynamo's controller tells its children before it publishes the
+        // state, so a `Cx` linked in between misses it (`tests/races.rs`).
+        // Every `link_child` has this window, Migration's included.
         if context.is_killed() {
             cx.cancel();
         } else if context.is_stopped() {
@@ -69,17 +73,29 @@ impl CxBridge {
         // The controller drops this guard when it is dropped, which ends the
         // task: the task holds the controller only weakly.
         controller.retain(Arc::new(released));
-        tokio::spawn(forward(cx.clone(), Arc::downgrade(&controller), on_release));
+        let latch = Arc::new(KillLatch::default());
+        controller.link_child(latch.clone());
+        tokio::spawn(forward(
+            cx.clone(),
+            Arc::downgrade(&controller),
+            latch,
+            on_release,
+        ));
         request
     }
 }
 
-/// Forward `cx`'s stop and cancel to `target` until `released` resolves. A
-/// stop is never sent after a kill: Dynamo's controller would replace the
-/// kill with it.
+/// Forward `cx`'s stop and cancel to `target` until `released` resolves.
+///
+/// Dynamo's controller lets a stop replace a kill, so a forwarded stop must
+/// not land after one. A kill can arrive from anywhere while the stop is
+/// being sent; `killed` is a child of `target`, which the controller tells
+/// before it publishes the kill, so a kill it saw is sent again after the
+/// stop.
 async fn forward(
     cx: Cx,
     target: Weak<dyn AsyncEngineContext>,
+    killed: Arc<KillLatch>,
     mut released: oneshot::Receiver<()>,
 ) {
     tokio::select! {
@@ -93,6 +109,9 @@ async fn forward(
         };
         if !context.is_stopped() {
             context.stop_generating();
+            if killed.0.load(Ordering::Acquire) {
+                context.kill();
+            }
         }
         drop(context);
         tokio::select! {
@@ -104,6 +123,45 @@ async fn forward(
     if let Some(context) = target.upgrade() {
         context.kill();
     }
+}
+
+/// Whether a Dynamo controller has been killed, as a child it tells before
+/// it publishes the kill. A controller calls only a child's stop and kill, so
+/// the waits never resolve.
+#[derive(Debug, Default)]
+struct KillLatch(AtomicBool);
+
+#[async_trait]
+impl AsyncEngineContext for KillLatch {
+    fn id(&self) -> &str {
+        ""
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.is_killed()
+    }
+
+    fn is_killed(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    async fn stopped(&self) {
+        std::future::pending().await
+    }
+
+    async fn killed(&self) {
+        std::future::pending().await
+    }
+
+    fn stop_generating(&self) {}
+
+    fn stop(&self) {}
+
+    fn kill(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn link_child(&self, _child: Arc<dyn AsyncEngineContext>) {}
 }
 
 /// A `Cx` as a child of a Dynamo controller, which calls it when the request
