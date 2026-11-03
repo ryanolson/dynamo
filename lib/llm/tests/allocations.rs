@@ -12,7 +12,7 @@
 //! | `engine` | the test LLM engine, called directly | itself |
 //! | `a` | `build_pipeline`: preprocessor, backend | test LLM engine |
 //! | `b` | `PreprocessedRouting::build_pipeline`: preprocessor, migration, backend, encoder router, prefill router | test LLM engine, in place of `RoutingHost` |
-//! | `b-gdl` | `b` composed as a gdl local pipeline (`LocalPipeline::Gdl`, what `DYN_LOCAL_PIPELINE=gdl` selects) | test LLM engine, in place of `RoutingHost` |
+//! | `b-gdl` | `b` composed as a gdl local pipeline (`LocalPipeline::Gdl`, what `DYN_LOCAL_PIPELINE=gdl` selects): the preprocessor and backend native, the others adapted | test LLM engine, in place of `RoutingHost` |
 //! | `c` | `PreprocessedRouting::build_preprocessed_pipeline`: migration, encoder router, prefill router | test LLM engine, in place of `RoutingHost` |
 //! | `embed-engine` | the test embeddings engine, called directly | itself |
 //! | `embed` | `build_embeddings_pipeline`: preprocessor, backend | test embeddings engine, in place of `PushRouter` |
@@ -49,15 +49,17 @@
 //! | `engine` | 7 | 2,752 | 22 | 2,812 |
 //! | `a` | 349 | 100,958 | 862 | 122,446 |
 //! | `b` | 402 | 227,025 | 915 | 248,513 |
-//! | `b-gdl` | 455 | 223,943 | 968 | 245,431 |
+//! | `b-gdl` | 429 | 208,445 | 942 | 229,933 |
 //! | `c` | 71 | 144,683 | 86 | 144,743 |
 //! | `embed-engine` | 8 | 6,548 | 23 | 88,868 |
 //! | `embed` | 199 | 44,406 | 2,283 | 529,854 |
 //!
-//! `b-gdl` costs 53 allocations more than `b` at both item counts, so nothing per item. That is
-//! the adapters' cost in `lib/gdl-adapters/tests/allocations.rs`: 23 allocations per adapted
-//! operator against 14 for a `link` stage, 5 operators, and 8 more at the boundary
-//! (`PipelineEngine` above, `EngineSink` below): 5 × 9 + 8 = 53. Native gdl operators remove it.
+//! `b-gdl` costs 27 allocations more than `b` at both item counts, so nothing per item. Per stage,
+//! `lib/gdl-adapters/tests/allocations.rs` measures 14 allocations for a `link` stage, 23 for an
+//! adapted operator and 10 for a native gdl operator, and 8 more at the boundary
+//! (`PipelineEngine` above, `EngineSink` below). Here the preprocessor and backend are native
+//! and Migration, the encoder router and the prefill router adapted:
+//! 3 × (23 − 14) − 2 × (14 − 10) + 8 = 27. With all five native it would be 8 − 5 × 4 = −12.
 //!
 //! Most of `c`'s bytes are two boxed futures of 59,592 bytes each, allocated by the edge that
 //! carries the request from Migration (`RetryManager::new_stream`) to the next stage.
@@ -111,8 +113,8 @@ const BASELINE: &[Row] = &[
     row("a", 16, 862, 122446),
     row("b", 1, 402, 227025),
     row("b", 16, 915, 248513),
-    row("b-gdl", 1, 455, 223943),
-    row("b-gdl", 16, 968, 245431),
+    row("b-gdl", 1, 429, 208445),
+    row("b-gdl", 16, 942, 229933),
     row("c", 1, 71, 144683),
     row("c", 16, 86, 144743),
     row("embed-engine", 1, 8, 6548),

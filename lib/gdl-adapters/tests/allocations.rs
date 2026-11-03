@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Allocations per request through the adapters, against Dynamo's `link`
-//! chain over the same engine and the same identity operators.
+//! chain over the same engine and the same identity operators, and against
+//! native gdl operators that read their downstream as Dynamo's native
+//! operators do (`dynamo_llm::operator`).
 //!
 //! Run with `--nocapture` to see the table. The counts are per request after
 //! a warm-up, on a current-thread runtime, so every allocation is the
@@ -13,7 +15,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use dynamo_gdl_adapters::{CxBridge, DynOperatorStage, EngineSink, PipelineEngine};
+use dynamo_gdl_adapters::{AnnotatedItems, CxBridge, DynOperatorStage, EngineSink, PipelineEngine};
 use dynamo_runtime::engine::{AsyncEngine, ResponseStream};
 use dynamo_runtime::pipeline::{
     AsyncEngineContextProvider, Context, Error, ManyOut, Operator, ServiceBackend, ServiceFrontend,
@@ -21,7 +23,7 @@ use dynamo_runtime::pipeline::{
 };
 use dynamo_runtime::protocols::annotated::Annotated;
 use futures::{StreamExt, stream};
-use gdl::{Hop, SinkStage, Source};
+use gdl::{Cx, Hop, Items, OperatorStage, SinkStage, Source};
 
 struct Counting;
 
@@ -98,6 +100,35 @@ impl Operator<SingleIn<u32>, Out, SingleIn<u32>, Out> for Identity {
     }
 }
 
+/// The identity as a native gdl operator, shaped as Backend's and the
+/// preprocessor's are: it keeps the request's Dynamo context, reads its
+/// downstream through `AnnotatedItems`, and boxes its response once.
+struct NativeIdentity;
+
+impl gdl::Operator for NativeIdentity {
+    type UpReq = SingleIn<u32>;
+    type UpItem = Annotated<u32>;
+    type DownReq = SingleIn<u32>;
+    type DownItem = Annotated<u32>;
+
+    async fn generate<N>(
+        &self,
+        cx: Cx,
+        request: SingleIn<u32>,
+        next: N,
+    ) -> gdl::Result<Items<Annotated<u32>>>
+    where
+        N: gdl::Next<SingleIn<u32>, Annotated<u32>>,
+    {
+        let context = request.context();
+        let root = cx.clone();
+        let items = next.generate(cx, request).await?;
+        Ok(gdl::items(
+            AnnotatedItems::new(items, root, context).map(Ok),
+        ))
+    }
+}
+
 /// `stages` identity operators above `engine` in one `link` chain, as
 /// `lib/llm/src/entrypoint/input/common.rs` builds its pipelines.
 fn link(stages: usize, engine: Engine) -> Engine {
@@ -138,6 +169,28 @@ fn adapted(stages: usize, engine: Engine) -> Engine {
         hop: H,
     ) -> Hop<(), DynOperatorStage<Identity, u32, u32, u32, u32>, ()> {
         Hop::new((), DynOperatorStage::new(Arc::new(Identity), hop), ())
+    }
+    let sink = Hop::new((), SinkStage::new(Arc::new(EngineSink::new(engine))), ());
+    match stages {
+        0 => wrap(Source::new(sink)),
+        1 => wrap(Source::new(stage(sink))),
+        2 => wrap(Source::new(stage(stage(sink)))),
+        3 => wrap(Source::new(stage(stage(stage(sink))))),
+        4 => wrap(Source::new(stage(stage(stage(stage(sink)))))),
+        5 => wrap(Source::new(stage(stage(stage(stage(stage(sink))))))),
+        _ => unreachable!("up to {MAX_STAGES} stages"),
+    }
+}
+
+/// `stages` native gdl operators above an adapted engine.
+fn native(stages: usize, engine: Engine) -> Engine {
+    fn wrap<N: gdl::Next<SingleIn<u32>, Annotated<u32>>>(next: N) -> Engine {
+        Arc::new(PipelineEngine::<_, u32, u32>::new(next))
+    }
+    fn stage<H: gdl::Next<SingleIn<u32>, Annotated<u32>>>(
+        hop: H,
+    ) -> Hop<(), OperatorStage<NativeIdentity, H>, ()> {
+        Hop::new((), OperatorStage::new(Arc::new(NativeIdentity), hop), ())
     }
     let sink = Hop::new((), SinkStage::new(Arc::new(EngineSink::new(engine))), ());
     match stages {
@@ -195,18 +248,21 @@ fn allocations_per_request() {
         .unwrap();
 
     println!(
-        "items stages | engine | link: allocs reallocs bytes | adapted: allocs reallocs bytes"
+        "items stages | engine | link: allocs reallocs bytes | adapted: allocs reallocs bytes | native: allocs reallocs bytes"
     );
     let mut adapted_by_items = Vec::new();
+    let mut native_by_items = Vec::new();
     for items in [1, 16] {
         let engine: Engine = Arc::new(Repeat(items));
         let alone = measure(&runtime, &engine);
         let mut row = Vec::new();
+        let mut native_row = Vec::new();
         for stages in 0..=MAX_STAGES {
             let linked = measure(&runtime, &link(stages, engine.clone()));
             let composed = measure(&runtime, &adapted(stages, engine.clone()));
+            let natively = measure(&runtime, &native(stages, engine.clone()));
             println!(
-                "{items:>5} {stages:>6} | {:>6.1} | {:>6.1} {:>4.1} {:>7.0} | {:>6.1} {:>4.1} {:>7.0}",
+                "{items:>5} {stages:>6} | {:>6.1} | {:>6.1} {:>4.1} {:>7.0} | {:>6.1} {:>4.1} {:>7.0} | {:>6.1} {:>4.1} {:>7.0}",
                 alone.allocations,
                 linked.allocations,
                 linked.reallocations,
@@ -214,10 +270,15 @@ fn allocations_per_request() {
                 composed.allocations,
                 composed.reallocations,
                 composed.bytes,
+                natively.allocations,
+                natively.reallocations,
+                natively.bytes,
             );
             row.push(composed);
+            native_row.push(natively);
         }
         adapted_by_items.push(row);
+        native_by_items.push(native_row);
     }
 
     // The bridge alone: one `Cx` derived from a fresh request context,
@@ -236,9 +297,11 @@ fn allocations_per_request() {
         derived as f64 / REQUESTS as f64
     );
 
-    // Nothing in the adapters allocates per item: 16 items cost what 1 does
+    // Nothing in the adapters or a native stage allocates per item: 16 items cost what 1 does
     // on top of what the engine's own items cost, which `Repeat` keeps at none.
-    for (one, sixteen) in adapted_by_items[0].iter().zip(&adapted_by_items[1]) {
+    let ones = adapted_by_items[0].iter().chain(&native_by_items[0]);
+    let sixteens = adapted_by_items[1].iter().chain(&native_by_items[1]);
+    for (one, sixteen) in ones.zip(sixteens) {
         assert!(
             (one.allocations - sixteen.allocations).abs() < 0.5,
             "per-item allocation: {one:?} against {sixteen:?}"

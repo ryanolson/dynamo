@@ -19,6 +19,7 @@ use crate::{
     migration::Migration,
     model_card::ModelDeploymentCard,
     namespace::NamespaceFilter,
+    operator::GdlOperator,
     preprocessor::{
         OpenAIPreprocessor, PreprocessedEmbeddingRequest, prompt::prompt_formatter_from_mdc,
     },
@@ -72,8 +73,8 @@ pub enum LocalPipeline {
     /// Dynamo's `link` chain.
     #[default]
     Dynamo,
-    /// A gdl local pipeline of nested calls, with Dynamo's operators and engine
-    /// wrapped by `dynamo-gdl-adapters`.
+    /// A gdl local pipeline of nested calls. The preprocessor and Backend are native gdl
+    /// operators; the other operators and the engine are wrapped by `dynamo-gdl-adapters`.
     Gdl,
 }
 
@@ -553,6 +554,12 @@ impl PreprocessedRouting {
                 Context<PreprocessedRequest>,
                 Pin<Box<dyn AsyncEngineStream<Annotated<BackendOutput>>>>,
             >,
+        GdlOperator<OpenAIPreprocessor, Req>: gdl::Operator<
+                UpReq = SingleIn<Req>,
+                UpItem = Annotated<Resp>,
+                DownReq = SingleIn<PreprocessedRequest>,
+                DownItem = Annotated<BackendOutput>,
+            >,
     {
         let token_backend = Backend::from_tokenizer(tokenizer);
         let migration = Migration::from_mdc(card, migration_limit, migration_max_seq_len, metrics);
@@ -588,10 +595,11 @@ impl PreprocessedRouting {
     /// [`build_pipeline`](Self::build_pipeline)'s chain as a gdl local pipeline: each
     /// operator calls the hop below it directly, with no response map per stage.
     ///
-    /// Built from the terminal up, since each stage owns the hop it calls. Each operator
-    /// is a `DynOperatorStage`, so it still gets its downstream as an `AsyncEngine`; the
-    /// types are spelled out because Backend and the preprocessor implement `Operator`
-    /// more than once.
+    /// Built from the terminal up, since each stage owns the hop it calls. The preprocessor
+    /// and Backend are native gdl operators (`GdlOperator`), which take gdl's `cx` and static
+    /// `next`. Migration and the routers are still Dynamo operators in a `DynOperatorStage`,
+    /// which gets its downstream as an `AsyncEngine`; their types are spelled out because
+    /// Backend and the preprocessor implement Dynamo's `Operator` more than once.
     fn compose_gdl_pipeline<Req, Resp>(
         &self,
         preprocessor: Arc<OpenAIPreprocessor>,
@@ -607,8 +615,14 @@ impl PreprocessedRouting {
                 Context<PreprocessedRequest>,
                 Pin<Box<dyn AsyncEngineStream<Annotated<BackendOutput>>>>,
             >,
+        GdlOperator<OpenAIPreprocessor, Req>: gdl::Operator<
+                UpReq = SingleIn<Req>,
+                UpItem = Annotated<Resp>,
+                DownReq = SingleIn<PreprocessedRequest>,
+                DownItem = Annotated<BackendOutput>,
+            >,
     {
-        use gdl::{Hop, SinkStage};
+        use gdl::{Hop, OperatorStage, SinkStage};
         type Pre = PreprocessedRequest;
         type Out = LLMEngineOutput;
 
@@ -621,16 +635,16 @@ impl PreprocessedRouting {
             self.encoder_router.clone(),
             Hop::new((), prefill, ()),
         );
-        let token_backend = DynOperatorStage::<_, Pre, BackendOutput, Pre, Out>::new(
-            token_backend,
+        let token_backend = OperatorStage::new(
+            Arc::new(GdlOperator::<_, Pre>::new(token_backend)),
             Hop::new((), encoder, ()),
         );
         let migration = DynOperatorStage::<_, Pre, BackendOutput, Pre, BackendOutput>::new(
             migration,
             Hop::new((), token_backend, ()),
         );
-        let preprocessor = DynOperatorStage::<_, Req, Resp, Pre, BackendOutput>::new(
-            preprocessor,
+        let preprocessor = OperatorStage::new(
+            Arc::new(GdlOperator::<_, Req>::new(preprocessor)),
             Hop::new((), migration, ()),
         );
         Arc::new(PipelineEngine::<_, Req, Resp>::new(gdl::Source::new(
