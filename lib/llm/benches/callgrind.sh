@@ -46,21 +46,38 @@ if (( $# % 2 != 0 )); then
     exit 1
 fi
 
-# Total instructions (Ir) for one run of the binary.
+# Total instructions (Ir) for one run of the binary. A run that dies still leaves a summary,
+# so check the exit status and the log before reading it.
 instructions() {
     local row=$1 items=$2 n=$3
     local out="$out_dir/$row-$items-$n.out"
+    local what="row $row, $items items, $n requests"
+    local status=0
     valgrind --tool=callgrind --callgrind-out-file="$out" \
-        "$bin" row "$row" "$items" "$n" >/dev/null 2>"$out.log"
-    awk '/^(summary|totals):/ { print $2; exit }' "$out"
+        "$bin" row "$row" "$items" "$n" >/dev/null 2>"$out.log" || status=$?
+    if (( status != 0 )); then
+        echo "callgrind.sh: $what: valgrind exited with status $status; see $out.log" >&2
+        return 1
+    fi
+    if grep -q 'Process terminating with default action of signal' "$out.log"; then
+        echo "callgrind.sh: $what: the program died by a signal; see $out.log" >&2
+        return 1
+    fi
+    local ir
+    ir=$(awk '/^(summary|totals):/ { print $2; exit }' "$out" 2>/dev/null) || true
+    if [[ ! $ir =~ ^[0-9]+$ ]]; then
+        echo "callgrind.sh: $what: no instruction total in $out; see $out.log" >&2
+        return 1
+    fi
+    echo "$ir"
 }
 
 printf '%-14s %6s %14s\n' row items instructions/request
 while (( $# > 0 )); do
     row=$1 items=$2
     shift 2
-    one=$(instructions "$row" "$items" "$requests")
-    two=$(instructions "$row" "$items" $((requests * 2)))
+    one=$(instructions "$row" "$items" "$requests") || exit 1
+    two=$(instructions "$row" "$items" $((requests * 2))) || exit 1
     printf '%-14s %6s %14s\n' "$row" "$items" $(((two - one) / requests))
 done
 echo "callgrind output: $out_dir"
