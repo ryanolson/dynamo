@@ -9,7 +9,8 @@
 #
 # Usage: lib/llm/benches/callgrind.sh [ROW ITEMS]...
 #   With no arguments it measures every row at 1 and 16 items.
-#   ROW is engine, a, b, b-gdl, c, embed-engine or embed (see tests/allocations.rs).
+#   ROW is engine, a, a-gdl, b, b-gdl, c, c-gdl, embed-engine, embed or embeddings-gdl (see
+#   tests/allocations.rs).
 #   CALLGRIND_REQUESTS sets N (default 20). CALLGRIND_PROFILE sets the cargo profile
 #   (default profiling). CARGO_TARGET_DIR is honored.
 #
@@ -21,9 +22,11 @@
 # log says the program died by a signal. A run that dies still writes a total, so a count
 # from such a run would be wrong.
 #
-# The gdl rows (b-gdl) died with SIGSEGV under valgrind, likely in rustix's auxv lookup.
-# Building with `--cfg rustix_use_libc` likely fixes it. RUSTFLAGS replaces the flags in
-# .cargo/config.toml, so copy your target's list from there and add the cfg. On x86_64:
+# The gdl rows die with SIGSEGV under valgrind: gdl's `Cx` reads the clock through rustix's
+# vDSO path (`rustix::backend::param::auxv::check_elf_base`), and valgrind does not map the
+# vDSO. Building with `--cfg rustix_use_libc` fixes it (measured on aarch64). RUSTFLAGS
+# replaces the flags in .cargo/config.toml, so copy your target's list from there and add the
+# cfg. On x86_64:
 #   RUSTFLAGS="-C target-cpu=x86-64-v3 -C force-frame-pointers=yes --cfg tokio_unstable \
 #     --cfg rustix_use_libc" CARGO_TARGET_DIR=$PWD/target/valgrind lib/llm/benches/callgrind.sh
 # Changing RUSTFLAGS rebuilds every dependency, so give it its own CARGO_TARGET_DIR.
@@ -49,8 +52,9 @@ if [[ -z "$bin" ]]; then
 fi
 
 if [[ $# -eq 0 ]]; then
-    set -- engine 1 engine 16 a 1 a 16 b 1 b 16 b-gdl 1 b-gdl 16 c 1 c 16 \
-        embed-engine 1 embed-engine 16 embed 1 embed 16
+    set -- engine 1 engine 16 a 1 a 16 a-gdl 1 a-gdl 16 b 1 b 16 b-gdl 1 b-gdl 16 \
+        c 1 c 16 c-gdl 1 c-gdl 16 embed-engine 1 embed-engine 16 embed 1 embed 16 \
+        embeddings-gdl 1 embeddings-gdl 16
 fi
 if (( $# % 2 != 0 )); then
     echo "callgrind.sh: arguments must be ROW ITEMS pairs" >&2

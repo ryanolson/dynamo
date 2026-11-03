@@ -11,13 +11,16 @@
 //! |---|---|---|
 //! | `engine` | the test LLM engine, called directly | itself |
 //! | `a` | `build_pipeline`: preprocessor, backend | test LLM engine |
+//! | `a-gdl` | `a` composed as a gdl local pipeline | test LLM engine |
 //! | `b` | `PreprocessedRouting::build_pipeline`: preprocessor, migration, backend, encoder router, prefill router | test LLM engine, in place of `RoutingHost` |
 //! | `b-gdl` | `b` composed as a gdl local pipeline (`LocalPipeline::Gdl`, what `DYN_LOCAL_PIPELINE=gdl` selects) | test LLM engine, in place of `RoutingHost` |
 //! | `c` | `PreprocessedRouting::build_preprocessed_pipeline`: migration, encoder router, prefill router | test LLM engine, in place of `RoutingHost` |
+//! | `c-gdl` | `c` composed as a gdl local pipeline | test LLM engine, in place of `RoutingHost` |
 //! | `embed-engine` | the test embeddings engine, called directly | itself |
 //! | `embed` | `build_embeddings_pipeline`: preprocessor, backend | test embeddings engine, in place of `PushRouter` |
+//! | `embeddings-gdl` | `embed` composed as a gdl local pipeline | test embeddings engine, in place of `PushRouter` |
 //!
-//! The second number of a row is stream items: 1 and 16. For `embed` and `embed-engine` it is
+//! The second number of a row is stream items: 1 and 16. For the embeddings rows it is
 //! inputs per request instead, because an embeddings stream carries one item for any number of
 //! inputs.
 //!
@@ -48,19 +51,39 @@
 //! |---|---:|---:|---:|---:|
 //! | `engine` | 7 | 2,752 | 22 | 2,812 |
 //! | `a` | 349 | 100,958 | 862 | 122,446 |
+//! | `a-gdl` | 375 | 98,017 | 888 | 119,505 |
 //! | `b` | 402 | 227,025 | 915 | 248,513 |
-//! | `b-gdl` | 455 | 223,943 | 968 | 245,431 |
+//! | `b-gdl` | 455 | 224,039 | 968 | 245,527 |
 //! | `c` | 71 | 144,683 | 86 | 144,743 |
+//! | `c-gdl` | 106 | 142,559 | 121 | 142,619 |
 //! | `embed-engine` | 8 | 6,548 | 23 | 88,868 |
 //! | `embed` | 199 | 44,406 | 2,283 | 529,854 |
+//! | `embeddings-gdl` | 225 | 49,777 | 2,309 | 535,225 |
 //!
 //! `b-gdl` costs 53 allocations more than `b` at both item counts, so nothing per item. That is
 //! the adapters' cost in `lib/gdl-adapters/tests/allocations.rs`: 23 allocations per adapted
 //! operator against 14 for a `link` stage, 5 operators, and 8 more at the boundary
 //! (`PipelineEngine` above, `EngineSink` below): 5 × 9 + 8 = 53. Native gdl operators remove it.
 //!
-//! Most of `c`'s bytes are two boxed futures of 59,592 bytes each, allocated by the edge that
-//! carries the request from Migration (`RetryManager::new_stream`) to the next stage.
+//! `a-gdl` costs 26 allocations more than `a` at both item counts: 2 adapted operators × 9 + 8
+//! at the boundary. It asks for 2,941 fewer bytes. By size, the `link` chain's 13 boxed futures
+//! of 2.2 to 5 KB (43,984 bytes) give way to one boxed future of 11.7 to 13.1 KB per
+//! `PipelineEngine` (36,544 bytes); the 26 extra allocations are small and add 4,499 bytes.
+//!
+//! `c-gdl` costs 35 allocations more than `c` at both item counts: 3 adapted operators × 9 + 8
+//! at the boundary, as for `b-gdl`. It asks for 2,124 fewer bytes. By size, the `link` chain's
+//! 16 boxed futures of 2.2 to 4.4 KB (54,936 bytes) give way to one boxed future of about
+//! 11.7 KB per `PipelineEngine`, one at the boundary and one below each operator (46,800 bytes);
+//! the 35 extra allocations are small and add 6,012 bytes.
+//!
+//! `embeddings-gdl` costs 26 allocations and 5,371 bytes more than `embed` at both input counts:
+//! 2 adapted operators × 9 + 8 at the boundary. Its three `PipelineEngine`s box one future of
+//! 2.4 KB each (7,200 bytes); the rest are small and take 1,829 bytes fewer than the `link`
+//! chain's.
+//!
+//! The largest allocation of `b`, `c` and their gdl rows is one boxed future of 59,592 bytes per
+//! request, the same on both local pipelines. `a` and `embed`, which have no Migration, do not
+//! make it.
 //!
 //! Run: `cargo test -p dynamo-llm --test allocations`. For instructions per request, see
 //! `lib/llm/benches/callgrind.sh`, which runs this binary as
@@ -109,16 +132,22 @@ const BASELINE: &[Row] = &[
     row("engine", 16, 22, 2812),
     row("a", 1, 349, 100958),
     row("a", 16, 862, 122446),
+    row("a-gdl", 1, 375, 98017),
+    row("a-gdl", 16, 888, 119505),
     row("b", 1, 402, 227025),
     row("b", 16, 915, 248513),
-    row("b-gdl", 1, 455, 223943),
-    row("b-gdl", 16, 968, 245431),
+    row("b-gdl", 1, 455, 224039),
+    row("b-gdl", 16, 968, 245527),
     row("c", 1, 71, 144683),
     row("c", 16, 86, 144743),
+    row("c-gdl", 1, 106, 142559),
+    row("c-gdl", 16, 121, 142619),
     row("embed-engine", 1, 8, 6548),
     row("embed-engine", 16, 23, 88868),
     row("embed", 1, 199, 44406),
     row("embed", 16, 2283, 529854),
+    row("embeddings-gdl", 1, 225, 49777),
+    row("embeddings-gdl", 16, 2309, 535225),
 ];
 
 #[global_allocator]
@@ -526,15 +555,24 @@ async fn measure_engine(fixture: &Fixture, items: usize, requests: usize) -> Mea
     .await
 }
 
-async fn measure_a(fixture: &Fixture, items: usize, requests: usize) -> Measured {
+async fn measure_a(
+    fixture: &Fixture,
+    name: &'static str,
+    local_pipeline: LocalPipeline,
+    items: usize,
+    requests: usize,
+) -> Measured {
     let engine: ExecutionContext = fixture.llm_engine(items);
-    let pipeline = build_pipeline::<
-        NvCreateChatCompletionRequest,
-        NvCreateChatCompletionStreamResponse,
-    >(&fixture.card, engine, fixture.tokenizer.clone())
-    .await
-    .expect("pipeline a");
-    measure("a", items, requests, || {
+    let pipeline =
+        build_pipeline::<NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse>(
+            &fixture.card,
+            engine,
+            fixture.tokenizer.clone(),
+            local_pipeline,
+        )
+        .await
+        .expect("pipeline a");
+    measure(name, items, requests, || {
         let pipeline = pipeline.clone();
         let request = chat_request();
         async move { drain(pipeline.generate(Context::new(request)).await.unwrap()).await }
@@ -578,12 +616,19 @@ async fn measure_b(
     .await
 }
 
-async fn measure_c(fixture: &Fixture, items: usize, requests: usize) -> Measured {
+async fn measure_c(
+    fixture: &Fixture,
+    name: &'static str,
+    local_pipeline: LocalPipeline,
+    items: usize,
+    requests: usize,
+) -> Measured {
     let pipeline = fixture
         .routing(items)
+        .with_local_pipeline(local_pipeline)
         .build_preprocessed_pipeline(&fixture.card, 0, None, Arc::new(Metrics::new()))
         .expect("pipeline c");
-    measure("c", items, requests, || {
+    measure(name, items, requests, || {
         let pipeline = pipeline.clone();
         let request = preprocessed_request(fixture);
         async move { drain(pipeline.generate(Context::new(request)).await.unwrap()).await }
@@ -618,14 +663,21 @@ async fn measure_embed_engine(fixture: &Fixture, inputs: usize, requests: usize)
     .await
 }
 
-async fn measure_embed(fixture: &Fixture, inputs: usize, requests: usize) -> Measured {
+async fn measure_embed(
+    fixture: &Fixture,
+    name: &'static str,
+    local_pipeline: LocalPipeline,
+    inputs: usize,
+    requests: usize,
+) -> Measured {
     let mut card = fixture.card.clone();
     card.model_type = ModelType::Embedding;
     let preprocessor =
         OpenAIPreprocessor::new_for_embeddings(card.clone()).expect("embeddings preprocessor");
-    let pipeline = build_embeddings_pipeline(&card, preprocessor, embeddings_engine())
-        .expect("pipeline embed");
-    measure("embed", inputs, requests, || {
+    let pipeline =
+        build_embeddings_pipeline(&card, preprocessor, embeddings_engine(), local_pipeline)
+            .expect("pipeline embed");
+    measure(name, inputs, requests, || {
         let pipeline = pipeline.clone();
         let request = embedding_request(inputs);
         async move { drain(pipeline.generate(Context::new(request)).await.unwrap()).await }
@@ -636,12 +688,24 @@ async fn measure_embed(fixture: &Fixture, inputs: usize, requests: usize) -> Mea
 async fn measure_row(fixture: &Fixture, name: &str, items: usize, requests: usize) -> Measured {
     match name {
         "engine" => measure_engine(fixture, items, requests).await,
-        "a" => measure_a(fixture, items, requests).await,
+        "a" => measure_a(fixture, "a", LocalPipeline::Dynamo, items, requests).await,
+        "a-gdl" => measure_a(fixture, "a-gdl", LocalPipeline::Gdl, items, requests).await,
         "b" => measure_b(fixture, "b", LocalPipeline::Dynamo, items, requests).await,
         "b-gdl" => measure_b(fixture, "b-gdl", LocalPipeline::Gdl, items, requests).await,
-        "c" => measure_c(fixture, items, requests).await,
+        "c" => measure_c(fixture, "c", LocalPipeline::Dynamo, items, requests).await,
+        "c-gdl" => measure_c(fixture, "c-gdl", LocalPipeline::Gdl, items, requests).await,
         "embed-engine" => measure_embed_engine(fixture, items, requests).await,
-        "embed" => measure_embed(fixture, items, requests).await,
+        "embed" => measure_embed(fixture, "embed", LocalPipeline::Dynamo, items, requests).await,
+        "embeddings-gdl" => {
+            measure_embed(
+                fixture,
+                "embeddings-gdl",
+                LocalPipeline::Gdl,
+                items,
+                requests,
+            )
+            .await
+        }
         other => panic!("unknown row {other}"),
     }
 }
@@ -726,16 +790,22 @@ const ROWS: &[(&str, usize)] = &[
     ("engine", 16),
     ("a", 1),
     ("a", 16),
+    ("a-gdl", 1),
+    ("a-gdl", 16),
     ("b", 1),
     ("b", 16),
     ("b-gdl", 1),
     ("b-gdl", 16),
     ("c", 1),
     ("c", 16),
+    ("c-gdl", 1),
+    ("c-gdl", 16),
     ("embed-engine", 1),
     ("embed-engine", 16),
     ("embed", 1),
     ("embed", 16),
+    ("embeddings-gdl", 1),
+    ("embeddings-gdl", 16),
 ];
 
 fn main() {

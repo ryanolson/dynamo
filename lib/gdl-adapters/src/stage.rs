@@ -24,7 +24,9 @@ type Downstream<Req, T> = Arc<dyn AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T
 ///
 /// A Dynamo operator takes its downstream as an `Arc<dyn AsyncEngine>`, so the
 /// stage wraps its downstream hop in a [`PipelineEngine`] once, when it is
-/// built, and hands each call a clone of that `Arc`. Each call into the hop
+/// built, and hands each call a clone of that `Arc`. The operator handles a
+/// kill itself, so a kill does not cancel the hop
+/// ([`PipelineEngine::for_dynamo_stages`]). Each call into the hop
 /// derives a fresh `Cx` from the context the operator passes down: Migration,
 /// for one, builds a new context for every attempt.
 ///
@@ -47,7 +49,7 @@ impl<O: ?Sized, UpReq, UpT, DownReq: Data, DownT: Data>
     {
         Self {
             op,
-            next: Arc::new(PipelineEngine::new(next)),
+            next: Arc::new(PipelineEngine::for_dynamo_stages(next)),
             types: PhantomData,
         }
     }

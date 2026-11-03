@@ -137,8 +137,10 @@ for `cargo` and `valgrind`, so it needs neither a build nor valgrind:
 lib/llm/benches/callgrind-test.sh
 ```
 
-Under valgrind, the gdl rows (`b-gdl`) died with SIGSEGV, likely in rustix's auxv lookup.
-Building with `--cfg rustix_use_libc` likely fixes it. `RUSTFLAGS` replaces the flags in
+Under valgrind, the gdl rows (`a-gdl`, `b-gdl`, `c-gdl`, `embeddings-gdl`) die with SIGSEGV:
+gdl's `Cx` reads the clock through rustix's vDSO path (`rustix::backend::param::auxv::check_elf_base`),
+and valgrind does not map the vDSO. Building with `--cfg rustix_use_libc` fixes it (measured on
+aarch64). `RUSTFLAGS` replaces the flags in
 `.cargo/config.toml`, including `--cfg tokio_unstable`, so copy your target's list from that
 file and add the cfg. On x86_64:
 

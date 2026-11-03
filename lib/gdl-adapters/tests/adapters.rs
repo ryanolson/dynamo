@@ -513,10 +513,13 @@ async fn each_downstream_call_gets_a_cx_of_the_context_it_passes() {
         cx.meta().get(REQUEST_ID).map(String::as_str),
         Some("req-1-attempt")
     );
-    // The attempt's context is a child of the request's, so the kill reaches
-    // the attempt's `Cx` through Dynamo.
+    // The attempt's context is a child of the request's, so a stop reaches
+    // the attempt's `Cx` through Dynamo. A kill does not cancel it: below a
+    // Dynamo operator the kill is the operator's to handle (see `CxBridge`).
+    context.stop_generating();
+    assert!(cx.is_stopping());
     context.kill();
-    assert!(cx.is_cancelled());
+    assert!(!cx.is_cancelled());
 }
 
 #[tokio::test]

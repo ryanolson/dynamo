@@ -12,6 +12,7 @@ from typing import Generator
 import pytest
 
 from tests.frontend.conftest import MockerWorkerProcess, wait_for_http_completions_ready
+from tests.router.common import assert_local_pipeline, local_pipeline_env
 from tests.utils.client import send_request
 from tests.utils.constants import QWEN
 from tests.utils.managed_process import DynamoFrontendProcess
@@ -34,7 +35,15 @@ pytestmark = [
 ]
 
 
-@pytest.fixture(scope="function")
+# The Generate route runs the frontend's preprocessed pipeline, so each test runs on Dynamo's
+# local pipeline and on gdl's.
+LOCAL_PIPELINES = (
+    pytest.param(None, id="dynamo"),
+    pytest.param("gdl", id="gdl"),
+)
+
+
+@pytest.fixture(scope="function", params=LOCAL_PIPELINES)
 def sglang_generate_mocker(
     request: pytest.FixtureRequest,
     runtime_services_dynamic_ports: object,
@@ -43,6 +52,7 @@ def sglang_generate_mocker(
     tmp_path: Path,
 ) -> Generator[int, None, None]:
     _ = runtime_services_dynamic_ports, predownload_tokenizers
+    local_pipeline = request.param
     frontend_port = dynamo_dynamic_ports.frontend_port
     system_port = dynamo_dynamic_ports.system_ports[0]
     replay_trace = tmp_path / "sglang-response-replay.jsonl"
@@ -61,9 +71,12 @@ def sglang_generate_mocker(
     with DynamoFrontendProcess(
         request,
         frontend_port=frontend_port,
-        extra_env={"DYN_SGLANG_ENABLE_GENERATE": "1"},
+        extra_env={
+            "DYN_SGLANG_ENABLE_GENERATE": "1",
+            **local_pipeline_env(local_pipeline),
+        },
         terminate_all_matching_process_names=False,
-    ):
+    ) as frontend:
         with MockerWorkerProcess(
             request,
             TEST_MODEL,
@@ -81,6 +94,7 @@ def sglang_generate_mocker(
                 frontend_port=frontend_port,
                 model=TEST_MODEL,
             )
+            assert_local_pipeline(frontend, local_pipeline)
             yield frontend_port
 
 
