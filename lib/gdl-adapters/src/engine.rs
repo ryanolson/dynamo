@@ -21,9 +21,11 @@ use crate::error::{exit, exit_item};
 /// `AsyncEngine`, so that `ModelManager`, the HTTP service and Python store it
 /// as they store any engine.
 ///
-/// Each call derives a fresh `Cx` from the request's context
-/// ([`CxBridge::cx`]) and passes the request on as it is: the gdl request type
-/// is Dynamo's `SingleIn<Req>`. The response stream carries the request's
+/// Each call derives a fresh `Cx` from the request's context and passes the
+/// request on as it is: the gdl request type is Dynamo's `SingleIn<Req>`. The
+/// `Cx` follows the context's stop and, unless the pipeline's stages are
+/// Dynamo operators ([`for_dynamo_stages`](Self::for_dynamo_stages)), its
+/// kill (see [`CxBridge`]). The response stream carries the request's
 /// context, so a kill through the stream reaches the request.
 ///
 /// An eager error that entered gdl through an adapter leaves as the
@@ -33,14 +35,30 @@ use crate::error::{exit, exit_item};
 /// Dynamo stream just ends.
 pub struct PipelineEngine<N, Req, T> {
     next: N,
+    /// Whether a kill of the request cancels the `Cx` (see [`CxBridge`]).
+    cancel_on_kill: bool,
     types: PhantomData<fn(Req) -> T>,
 }
 
 impl<N, Req, T> PipelineEngine<N, Req, T> {
-    /// Wrap a gdl pipeline.
+    /// Wrap a gdl pipeline of gdl-native nodes: a kill of the request cancels
+    /// it ([`CxBridge::cx`]).
     pub fn new(next: N) -> Self {
         Self {
             next,
+            cancel_on_kill: true,
+            types: PhantomData,
+        }
+    }
+
+    /// Wrap a gdl pipeline whose stages are Dynamo operators and engines: a
+    /// kill reaches them through the request's context only, so gdl does not
+    /// drop a call an operator is still finishing
+    /// ([`CxBridge::cx_for_dynamo_stages`]).
+    pub fn for_dynamo_stages(next: N) -> Self {
+        Self {
+            next,
+            cancel_on_kill: false,
             types: PhantomData,
         }
     }
@@ -56,7 +74,11 @@ where
 {
     async fn generate(&self, request: SingleIn<Req>) -> anyhow::Result<ManyOut<Annotated<T>>> {
         let context = request.context();
-        let cx = CxBridge::cx(request.controller());
+        let cx = if self.cancel_on_kill {
+            CxBridge::cx(request.controller())
+        } else {
+            CxBridge::cx_for_dynamo_stages(request.controller())
+        };
         let root = cx.clone();
         match self.next.generate(cx, request).await {
             Ok(items) => Ok(ResponseStream::new(

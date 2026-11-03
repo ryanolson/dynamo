@@ -127,3 +127,27 @@ lib/llm/benches/callgrind.sh b 1 b 16   # selected rows
 ```
 
 The same binary checks allocations per request: `cargo test -p dynamo-llm --test allocations`.
+
+The script fails, naming the row and the valgrind log, when valgrind exits non-zero or its log
+says the program died by a signal. A run that dies still writes an instruction total, so the
+script checks the run before it reads the total. `callgrind-test.sh` tests this with stand-ins
+for `cargo` and `valgrind`, so it needs neither a build nor valgrind:
+
+```bash
+lib/llm/benches/callgrind-test.sh
+```
+
+Under valgrind, the gdl rows (`a-gdl`, `b-gdl`, `c-gdl`, `embeddings-gdl`) die with SIGSEGV:
+gdl's `Cx` reads the clock through rustix's vDSO path (`rustix::backend::param::auxv::check_elf_base`),
+and valgrind does not map the vDSO. Building with `--cfg rustix_use_libc` fixes it (measured on
+aarch64). `RUSTFLAGS` replaces the flags in
+`.cargo/config.toml`, including `--cfg tokio_unstable`, so copy your target's list from that
+file and add the cfg. On x86_64:
+
+```bash
+RUSTFLAGS="-C target-cpu=x86-64-v3 -C force-frame-pointers=yes --cfg tokio_unstable --cfg rustix_use_libc" \
+  CARGO_TARGET_DIR=$PWD/target/valgrind lib/llm/benches/callgrind.sh
+```
+
+Changing `RUSTFLAGS` rebuilds every dependency, so give the valgrind build its own
+`CARGO_TARGET_DIR`.

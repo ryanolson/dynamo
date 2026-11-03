@@ -1763,4 +1763,227 @@ mod tests {
         });
         assert!(extract_bootstrap_info(&params).is_none());
     }
+
+    struct KillOnPrefillHandoff {
+        caller: Arc<dyn dynamo_runtime::pipeline::AsyncEngineContext>,
+    }
+
+    #[async_trait]
+    impl
+        dynamo_runtime::pipeline::StreamingDispatch<PreprocessedRequest, Annotated<LLMEngineOutput>>
+        for KillOnPrefillHandoff
+    {
+        async fn generate(
+            &self,
+            request: SingleIn<dynamo_runtime::pipeline::AddressedRequest<PreprocessedRequest>>,
+        ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+            let caller = self.caller.clone();
+            let response = stream::once(async move {
+                caller.kill();
+                Annotated::from_data(LLMEngineOutput {
+                    token_ids: vec![11],
+                    finish_reason: Some(FinishReason::Length),
+                    disaggregated_params: Some(serde_json::json!({
+                        "request_type": "context_only",
+                        "ctx_request_id": "staged-prefill",
+                    })),
+                    ..Default::default()
+                })
+            });
+            Ok(ResponseStream::new(Box::pin(response), request.context()))
+        }
+
+        async fn generate_bidirectional(
+            &self,
+            _: dynamo_runtime::component::Instance,
+            _: String,
+            _: dynamo_runtime::pipeline::ManyIn<PreprocessedRequest>,
+        ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+            unreachable!("prefill dispatch takes a single request")
+        }
+    }
+
+    #[derive(Default)]
+    struct CleanupDecode {
+        requests: Mutex<Vec<(bool, bool)>>,
+    }
+
+    #[async_trait]
+    impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>, Error>
+        for CleanupDecode
+    {
+        async fn generate(
+            &self,
+            request: SingleIn<PreprocessedRequest>,
+        ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+            self.requests
+                .lock()
+                .push((request.staged_kv_cleanup, request.context().is_killed()));
+            Ok(ResponseStream::new(
+                Box::pin(stream::empty()),
+                request.context(),
+            ))
+        }
+    }
+
+    /// Routing whose prefill worker kills `caller` as it hands off, and whose decode engine
+    /// records each call it gets as `(staged_kv_cleanup, killed)`.
+    async fn prefill_handoff_routing(
+        distributed: &dynamo_runtime::DistributedRuntime,
+        namespace: &str,
+        caller: Arc<dyn dynamo_runtime::pipeline::AsyncEngineContext>,
+    ) -> (
+        crate::entrypoint::input::PreprocessedRouting,
+        Arc<CleanupDecode>,
+    ) {
+        use crate::kv_router::{EncoderRouter, LlmDispatch, RouterLoadSource, RoutingLoadContext};
+
+        let endpoint = distributed
+            .namespace(namespace)
+            .unwrap()
+            .component("workers")
+            .unwrap()
+            .endpoint("prefill");
+        let client = endpoint.client().await.unwrap();
+        endpoint.register_endpoint_instance().await.unwrap();
+        client.wait_for_instances().await.unwrap();
+        let load_context = RoutingLoadContext::start(
+            client.clone(),
+            RouterLoadSource::Prefill,
+            crate::discovery::LoadThresholdHandle::new(Default::default()),
+            &distributed.child_token(),
+            None,
+        )
+        .await
+        .unwrap();
+        let host = Arc::new(
+            RoutingHost::builder(client, RouterMode::RoundRobin)
+                .load_context(load_context)
+                .dispatch(Arc::new(KillOnPrefillHandoff { caller }) as LlmDispatch)
+                .build()
+                .await
+                .unwrap(),
+        );
+        let router =
+            PrefillRouter::disabled(Arc::new(ModelManager::new()), RouterMode::RoundRobin, None);
+        router.binding.store(Some(Arc::new(PrefillBinding {
+            target_id: WorkerSetTargetId::Legacy(endpoint.id()),
+            endpoint_id: endpoint.id(),
+            router: host,
+            prefill_router_mode: RouterMode::RoundRobin,
+        })));
+        router.lifecycle.store(
+            PrefillLifecycleState::Active as u8,
+            std::sync::atomic::Ordering::Release,
+        );
+        let decode = Arc::new(CleanupDecode::default());
+        let routing = crate::entrypoint::input::PreprocessedRouting::new(
+            decode.clone(),
+            router,
+            EncoderRouter::disabled(),
+        );
+        (routing, decode)
+    }
+
+    /// Drain whatever the pipeline returns, within a bound.
+    async fn drain<T: Send + 'static>(
+        response: impl std::future::Future<Output = Result<ManyOut<T>, Error>>,
+    ) {
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
+            .await
+            .expect("the call ends");
+        if let Ok(mut response) = response {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while response.next().await.is_some() {}
+            })
+            .await
+            .expect("the stream ends");
+        }
+    }
+
+    /// A caller killed while PrefillRouter hands off from prefill must still get the decode
+    /// leg that releases the staged KV, on gdl as on Dynamo's chain, through the routed chat
+    /// pipeline (B) and the preprocessed pipeline (C). gdl drops a call whose `Cx` is
+    /// cancelled, so a kill must not cancel a pipeline of Dynamo operators.
+    #[tokio::test]
+    async fn routed_pipelines_send_decode_cleanup_after_a_kill_at_prefill_handoff() {
+        use crate::entrypoint::input::LocalPipeline;
+        use crate::http::service::metrics::Metrics;
+        use crate::model_card::ModelDeploymentCard;
+        use crate::preprocessor::{OpenAIPreprocessor, prompt::prompt_formatter_from_mdc};
+        use crate::protocols::openai::chat_completions::{
+            NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse,
+        };
+        use dynamo_runtime::{DistributedRuntime, Runtime, distributed::DistributedConfig};
+
+        let runtime = Runtime::from_current().unwrap();
+        let distributed =
+            DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+                .await
+                .unwrap();
+        let card =
+            ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
+                .unwrap();
+        let tokenizer = card.tokenizer().unwrap();
+        let mut seen = Vec::new();
+        for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+            let name = local_pipeline.as_str();
+
+            let request = Context::new(inference_request());
+            let caller = request.context();
+            let (routing, decode) =
+                prefill_handoff_routing(&distributed, &format!("cleanup-c-{name}"), caller.clone())
+                    .await;
+            let pipeline = routing
+                .with_local_pipeline(local_pipeline)
+                .build_preprocessed_pipeline(&card, 0, None, Arc::new(Metrics::new()))
+                .unwrap();
+            drain(pipeline.generate(request)).await;
+            assert!(caller.is_killed(), "the prefill handoff kills the caller");
+            seen.push(("c", name, decode.requests.lock().clone()));
+
+            let chat: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "TinyLlama_v1.1",
+                "messages": [{"role": "user", "content": "Write one sentence about a fox."}],
+                "max_tokens": 8,
+            }))
+            .unwrap();
+            let request = Context::new(chat);
+            let caller = request.context();
+            let (routing, decode) =
+                prefill_handoff_routing(&distributed, &format!("cleanup-b-{name}"), caller.clone())
+                    .await;
+            let dynamo_renderer::PromptFormatter::OAI(formatter) =
+                prompt_formatter_from_mdc(&card).unwrap();
+            let preprocessor =
+                OpenAIPreprocessor::new_with_parts(card.clone(), formatter, tokenizer.clone())
+                    .unwrap();
+            let pipeline = routing
+                .with_local_pipeline(local_pipeline)
+                .build_pipeline::<NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse>(
+                    &card,
+                    preprocessor,
+                    tokenizer.clone(),
+                    0,
+                    None,
+                    Arc::new(Metrics::new()),
+                )
+                .unwrap();
+            drain(pipeline.generate(request)).await;
+            assert!(caller.is_killed(), "the prefill handoff kills the caller");
+            seen.push(("b", name, decode.requests.lock().clone()));
+        }
+        runtime.shutdown();
+
+        let cleanup = vec![(true, true)];
+        assert_eq!(
+            seen,
+            [
+                ("c", "dynamo", cleanup.clone()),
+                ("b", "dynamo", cleanup.clone()),
+                ("c", "gdl", cleanup.clone()),
+                ("b", "gdl", cleanup),
+            ]
+        );
+    }
 }

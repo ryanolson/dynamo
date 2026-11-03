@@ -11,7 +11,9 @@ use std::time::Duration;
 
 use dynamo_gdl_adapters::{DynOperatorStage, EngineSink, PipelineEngine, REQUEST_ID};
 use dynamo_llm::discovery::ModelManager;
-use dynamo_llm::entrypoint::input::{LocalPipeline, PreprocessedRouting};
+use dynamo_llm::entrypoint::input::{
+    LocalPipeline, PreprocessedRouting, build_embeddings_pipeline, build_pipeline,
+};
 use dynamo_llm::http::service::axum::http::HeaderMap;
 use dynamo_llm::http::service::error::HttpError;
 use dynamo_llm::http::service::metrics::Metrics;
@@ -19,15 +21,21 @@ use dynamo_llm::http::service::service_v2::HttpService;
 use dynamo_llm::kv_router::{EncoderRouter, PrefillRouter};
 use dynamo_llm::migration::Migration;
 use dynamo_llm::model_card::ModelDeploymentCard;
-use dynamo_llm::preprocessor::OpenAIPreprocessor;
+use dynamo_llm::model_type::ModelType;
 use dynamo_llm::preprocessor::prompt::prompt_formatter_from_mdc;
+use dynamo_llm::preprocessor::{OpenAIPreprocessor, PreprocessedEmbeddingRequest};
 use dynamo_llm::protocols::common::extensions::{
     SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId, session_affinity_from_headers,
 };
-use dynamo_llm::protocols::common::llm_backend::{LLMEngineOutput, PreprocessedRequest};
+use dynamo_llm::protocols::common::llm_backend::{
+    EmbeddingsEngineOutput, LLMEngineOutput, PreprocessedRequest,
+};
 use dynamo_llm::protocols::common::{OutputOptions, SamplingOptions, StopConditions};
 use dynamo_llm::protocols::openai::chat_completions::{
     NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse,
+};
+use dynamo_llm::protocols::openai::embeddings::{
+    NvCreateEmbeddingRequest, NvCreateEmbeddingResponse,
 };
 use dynamo_renderer::PromptFormatter;
 use dynamo_runtime::CancellationToken;
@@ -148,7 +156,9 @@ fn migration() -> Arc<Migration> {
     Migration::new(3, None, MODEL.to_string(), Arc::new(Metrics::new()))
 }
 
-/// Migration above `engine`, composed with gdl through the adapters.
+/// Migration above `engine`, composed with gdl through the adapters, under a
+/// `PipelineEngine::new`, as for gdl-native nodes: a kill cancels the pipeline.
+/// The compositions in `dynamo-llm` use `PipelineEngine::for_dynamo_stages`.
 fn gdl_migration(engine: Engine) -> Engine {
     let sink = Hop::new((), SinkStage::new(Arc::new(EngineSink::new(engine))), ());
     let stage =
@@ -292,9 +302,12 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, Out, Error> for Hanging {
 }
 
 /// A kill while an attempt is still dispatching. Dynamo's `link` chain lets
-/// Migration see the kill and end with its own outcome; with gdl, the kill
-/// cancels the hop, which drops Migration's future and fails the call as
-/// `Cancelled`. This test pins both outcomes, so a change to either shows.
+/// Migration see the kill and end with its own outcome; under a
+/// `PipelineEngine::new`, the kill cancels the hop, which drops Migration's
+/// future and fails the call as `Cancelled`. This is why compositions of
+/// Dynamo operators use `PipelineEngine::for_dynamo_stages` (see
+/// `kill_during_dispatch`). This test pins both outcomes, so a change to
+/// either shows.
 #[tokio::test]
 async fn a_kill_during_dispatch_ends_the_request_on_both_paths() {
     let mut outcomes = Vec::new();
@@ -589,30 +602,677 @@ async fn a_stop_and_a_kill_reach_the_terminal_through_pipeline_b_on_gdl() {
     assert!(rest.iter().all(|item| !item.is_error()), "{rest:?}");
 }
 
-/// A kill while the terminal is still dispatching, through all of pipeline B.
-/// The outcomes differ as in `a_kill_during_dispatch_ends_the_request_on_both_paths`,
-/// so this also shows which composition `with_local_pipeline` built.
+/// A kill while the terminal is still dispatching, through all of pipeline B, ends the call
+/// the same way on both local pipelines (see `kill_during_dispatch`).
 #[tokio::test]
 async fn a_kill_during_dispatch_ends_pipeline_b_on_both_local_pipelines() {
     let mut outcomes = Vec::new();
     for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
         let pipeline = pipeline_b(local_pipeline, Arc::new(Hanging), 3);
-        let request = chat_request();
-        let context = request.context();
-        let call = tokio::spawn(async move { pipeline.generate(request).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        context.kill();
-        let outcome = tokio::time::timeout(Duration::from_secs(5), call)
-            .await
-            .expect("the call ends after the kill")
-            .unwrap();
-        outcomes.push(match outcome {
-            Ok(stream) => format!("ok, {} items", stream.collect::<Vec<_>>().await.len()),
-            Err(error) => match error.downcast_ref::<DynamoError>() {
-                Some(error) => format!("error {:?}", error.class()),
-                None => format!("error {error:#}"),
-            },
-        });
+        outcomes.push(kill_during_dispatch(pipeline, chat_request()).await);
     }
-    assert_eq!(outcomes, ["ok, 0 items", "error Cancelled"]);
+    assert_eq!(outcomes, ["ok, 0 items", "ok, 0 items"]);
+}
+
+/// What a kill while the terminal is still dispatching does to `pipeline`'s call. The operators
+/// see the kill through their own context and end the request themselves, on Dynamo's `link`
+/// chain and on gdl's compositions alike: a kill does not cancel a gdl pipeline of Dynamo
+/// operators (see `CxBridge`), so gdl does not drop the call.
+async fn kill_during_dispatch<Req: Data, T: Data>(
+    pipeline: Arc<dyn AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, Error>>,
+    request: SingleIn<Req>,
+) -> String {
+    let context = request.context();
+    let call = tokio::spawn(async move { pipeline.generate(request).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    context.kill();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), call)
+        .await
+        .expect("the call ends after the kill")
+        .unwrap();
+    match outcome {
+        Ok(stream) => format!("ok, {} items", stream.collect::<Vec<_>>().await.len()),
+        Err(error) => match error.downcast_ref::<DynamoError>() {
+            Some(error) => format!("error {:?}", error.class()),
+            None => format!("error {error:#}"),
+        },
+    }
+}
+
+/// The routed pipeline for callers that bring their own pre- and post-processing (the Generate
+/// engine and the Python `chat_engine_factory`), over `engine`, on the given local pipeline.
+fn pipeline_c(local_pipeline: LocalPipeline, engine: Engine, migration_limit: u32) -> Engine {
+    let card = ModelDeploymentCard::load_from_disk(SAMPLE_MODEL, None).unwrap();
+    PreprocessedRouting::new(
+        engine,
+        PrefillRouter::disabled(Arc::new(ModelManager::new()), RouterMode::KV, None),
+        EncoderRouter::disabled(),
+    )
+    .with_local_pipeline(local_pipeline)
+    .build_preprocessed_pipeline(&card, migration_limit, None, Arc::new(Metrics::new()))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn pipeline_c_streams_the_same_tokens_on_both_local_pipelines() {
+    let mut runs = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        let engine = Flaky::new(0, false);
+        let items: Vec<_> = pipeline_c(local_pipeline, engine.clone(), 0)
+            .generate(request())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(
+            items.iter().all(|item| !item.is_error()),
+            "{local_pipeline:?}: {items:?}"
+        );
+        runs.push((tokens(&items), calls(&engine)));
+    }
+    assert_eq!(runs[0], runs[1]);
+    assert_eq!(runs[1].0, [vec![10], vec![11]]);
+    assert_eq!(
+        runs[1].1,
+        [("req-1".to_string(), Some("session-123".to_string()))]
+    );
+}
+
+/// The terminal's eager error crosses the prefill and encoder routers, two adapter round
+/// trips, before Migration sees it.
+#[tokio::test]
+async fn pipeline_c_retries_an_eager_worker_unavailable_from_its_terminal() {
+    let mut runs = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        let engine = Flaky::new(1, false);
+        let items: Vec<_> = pipeline_c(local_pipeline, engine.clone(), 3)
+            .generate(request())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(
+            items.iter().all(|item| !item.is_error()),
+            "{local_pipeline:?}: {items:?}"
+        );
+        let calls = calls(&engine);
+        assert_eq!(calls.len(), 2, "{local_pipeline:?}: retried once");
+        runs.push((tokens(&items), calls));
+    }
+    assert_eq!(runs[0], runs[1]);
+}
+
+/// A stop and a kill of the caller's context reach the terminal engine's context through the
+/// three adapted stages.
+#[tokio::test]
+async fn a_stop_and_a_kill_reach_the_terminal_through_pipeline_c_on_gdl() {
+    let engine = Flaky::new(0, true);
+    let pipeline = pipeline_c(LocalPipeline::Gdl, engine.clone(), 0);
+    let request = request();
+    let context = request.context();
+    let mut stream = pipeline.generate(request).await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("the first item arrives")
+        .unwrap();
+    assert_eq!(tokens(&[first]), [vec![10]]);
+
+    let terminal = engine.calls.lock().unwrap()[0].context.clone();
+    context.stop_generating();
+    assert!(terminal.is_stopped());
+    assert!(!terminal.is_killed());
+    context.kill();
+    assert!(terminal.is_killed());
+    let rest: Vec<_> = tokio::time::timeout(Duration::from_secs(5), stream.collect())
+        .await
+        .expect("the stream ends after the kill");
+    assert!(rest.iter().all(|item| !item.is_error()), "{rest:?}");
+}
+
+#[tokio::test]
+async fn a_kill_during_dispatch_ends_pipeline_c_on_both_local_pipelines() {
+    let mut outcomes = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        let pipeline = pipeline_c(local_pipeline, Arc::new(Hanging), 3);
+        outcomes.push(kill_during_dispatch(pipeline, request()).await);
+    }
+    assert_eq!(outcomes, ["ok, 0 items", "ok, 0 items"]);
+}
+
+type EmbedOut = ManyOut<Annotated<EmbeddingsEngineOutput>>;
+type EmbedEngine = Arc<dyn AsyncEngine<SingleIn<PreprocessedEmbeddingRequest>, EmbedOut, Error>>;
+
+/// What one call of [`FlakyEmbeddings`] saw.
+struct EmbedCall {
+    id: String,
+    token_ids: Vec<Vec<u32>>,
+    context: Arc<dyn AsyncEngineContext>,
+}
+
+/// An embeddings worker that fails its first `failures` calls with `worker_unavailable()`,
+/// then answers with one vector per input. With `hold`, the answer waits for a kill.
+struct FlakyEmbeddings {
+    failures: usize,
+    hold: bool,
+    calls: Mutex<Vec<EmbedCall>>,
+}
+
+impl FlakyEmbeddings {
+    fn new(failures: usize, hold: bool) -> Arc<Self> {
+        Arc::new(Self {
+            failures,
+            hold,
+            calls: Mutex::default(),
+        })
+    }
+
+    fn calls(&self) -> Vec<(String, Vec<Vec<u32>>)> {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| (call.id.clone(), call.token_ids.clone()))
+            .collect()
+    }
+}
+
+#[async_trait]
+impl AsyncEngine<SingleIn<PreprocessedEmbeddingRequest>, EmbedOut, Error> for FlakyEmbeddings {
+    async fn generate(
+        &self,
+        request: SingleIn<PreprocessedEmbeddingRequest>,
+    ) -> Result<EmbedOut, Error> {
+        let context = request.context();
+        let call = {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(EmbedCall {
+                id: request.id().to_string(),
+                token_ids: request.token_ids.clone(),
+                context: context.clone(),
+            });
+            calls.len()
+        };
+        if call <= self.failures {
+            return Err(worker_unavailable());
+        }
+        let tokens: usize = request.token_ids.iter().map(Vec::len).sum();
+        let output = EmbeddingsEngineOutput {
+            // Two little-endian f32s per input, base64 as the worker sends them.
+            embeddings: vec!["AACAPwAAAEA=".to_string(); request.token_ids.len()],
+            prompt_tokens: tokens as u32,
+            total_tokens: tokens as u32,
+        };
+        let hold = self.hold;
+        let watched = context.clone();
+        let answer = stream::once(async move {
+            if hold {
+                watched.killed().await;
+            }
+            Annotated::from_data(output)
+        });
+        Ok(ResponseStream::new(Box::pin(answer), context))
+    }
+}
+
+/// The embeddings pipeline the model watcher builds for a token-input embeddings worker, over
+/// `engine` in place of its `PushRouter`, on the given local pipeline.
+fn pipeline_embeddings(
+    local_pipeline: LocalPipeline,
+    engine: EmbedEngine,
+) -> Arc<
+    dyn AsyncEngine<
+            SingleIn<NvCreateEmbeddingRequest>,
+            ManyOut<Annotated<NvCreateEmbeddingResponse>>,
+            Error,
+        >,
+> {
+    let mut card = ModelDeploymentCard::load_from_disk(SAMPLE_MODEL, None).unwrap();
+    card.model_type = ModelType::Embedding;
+    let preprocessor = OpenAIPreprocessor::new_for_embeddings(card.clone()).unwrap();
+    build_embeddings_pipeline(&card, preprocessor, engine, local_pipeline).unwrap()
+}
+
+fn embedding_request() -> SingleIn<NvCreateEmbeddingRequest> {
+    let embedding: NvCreateEmbeddingRequest = serde_json::from_value(serde_json::json!({
+        "model": "TinyLlama_v1.1",
+        "input": ["A fox crossed the river.", "It was cold."],
+    }))
+    .unwrap();
+    Context::with_id_and_metadata(embedding, "req-1".to_string(), BTreeMap::new())
+}
+
+#[tokio::test]
+async fn pipeline_embeddings_answers_the_same_on_both_local_pipelines() {
+    let mut runs = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        let engine = FlakyEmbeddings::new(0, false);
+        let items: Vec<_> = pipeline_embeddings(local_pipeline, engine.clone())
+            .generate(embedding_request())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(
+            items.iter().all(|item| !item.is_error()),
+            "{local_pipeline:?}: {items:?}"
+        );
+        let answers: Vec<_> = items
+            .iter()
+            .map(|item| serde_json::to_value(&item.data).unwrap())
+            .collect();
+        runs.push((answers, engine.calls()));
+    }
+    assert_eq!(runs[0], runs[1]);
+    let (answers, calls) = &runs[1];
+    assert_eq!(answers.len(), 1);
+    assert_eq!(
+        answers[0]["data"].as_array().unwrap().len(),
+        2,
+        "{answers:?}"
+    );
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "req-1");
+    assert_eq!(calls[0].1.len(), 2);
+}
+
+/// The embeddings pipeline has no Migration: the worker's eager error reaches the caller as
+/// it left the router, through the backend and the preprocessor.
+#[tokio::test]
+async fn pipeline_embeddings_returns_its_terminals_eager_error_on_both_local_pipelines() {
+    let mut errors = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        let engine = FlakyEmbeddings::new(1, false);
+        let error = match pipeline_embeddings(local_pipeline, engine.clone())
+            .generate(embedding_request())
+            .await
+        {
+            Ok(_) => panic!("{local_pipeline:?}: the eager error was lost"),
+            Err(error) => error,
+        };
+        let error_type = error
+            .downcast_ref::<DynamoError>()
+            .map(DynamoError::error_type)
+            .unwrap_or_else(|| panic!("{local_pipeline:?}: {error:#}"));
+        errors.push((error_type, error.to_string(), engine.calls().len()));
+    }
+    assert_eq!(errors[0], errors[1]);
+    assert_eq!(errors[1].0, ErrorClass::WorkerUnavailable);
+    assert_eq!(errors[1].2, 1);
+}
+
+/// A stop and a kill of the HTTP handler's context reach the worker's context through both
+/// adapted stages, while the worker holds its answer.
+#[tokio::test]
+async fn a_stop_and_a_kill_reach_the_terminal_through_pipeline_embeddings_on_gdl() {
+    let engine = FlakyEmbeddings::new(0, true);
+    let pipeline = pipeline_embeddings(LocalPipeline::Gdl, engine.clone());
+    let request = embedding_request();
+    let context = request.context();
+    let stream = pipeline.generate(request).await.unwrap();
+
+    let terminal = engine.calls.lock().unwrap()[0].context.clone();
+    context.stop_generating();
+    assert!(terminal.is_stopped());
+    assert!(!terminal.is_killed());
+    context.kill();
+    assert!(terminal.is_killed());
+    let rest: Vec<_> = tokio::time::timeout(Duration::from_secs(5), stream.collect())
+        .await
+        .expect("the stream ends after the kill");
+    assert!(rest.iter().all(|item| !item.is_error()), "{rest:?}");
+}
+
+/// An embeddings worker that waits in its eager phase until the request is killed.
+struct HangingEmbeddings;
+
+#[async_trait]
+impl AsyncEngine<SingleIn<PreprocessedEmbeddingRequest>, EmbedOut, Error> for HangingEmbeddings {
+    async fn generate(
+        &self,
+        request: SingleIn<PreprocessedEmbeddingRequest>,
+    ) -> Result<EmbedOut, Error> {
+        let context = request.context();
+        context.killed().await;
+        Ok(ResponseStream::new(Box::pin(stream::empty()), context))
+    }
+}
+
+#[tokio::test]
+async fn a_kill_during_dispatch_ends_pipeline_embeddings_on_both_local_pipelines() {
+    let mut outcomes = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        let pipeline = pipeline_embeddings(local_pipeline, Arc::new(HangingEmbeddings));
+        outcomes.push(kill_during_dispatch(pipeline, embedding_request()).await);
+    }
+    assert_eq!(outcomes, ["ok, 0 items", "ok, 0 items"]);
+}
+
+/// The in-process pipeline the HTTP and gRPC inputs build over a token engine, over `engine`,
+/// on the given local pipeline.
+async fn pipeline_a(
+    local_pipeline: LocalPipeline,
+    engine: Engine,
+) -> Arc<
+    dyn AsyncEngine<
+            SingleIn<NvCreateChatCompletionRequest>,
+            ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>,
+            Error,
+        >,
+> {
+    let card = ModelDeploymentCard::load_from_disk(SAMPLE_MODEL, None).unwrap();
+    let tokenizer = card.tokenizer().unwrap();
+    build_pipeline::<NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse>(
+        &card,
+        engine,
+        tokenizer,
+        local_pipeline,
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn pipeline_a_streams_the_same_chat_on_both_local_pipelines() {
+    let mut runs = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        let engine = Flaky::new(0, false);
+        let items: Vec<_> = pipeline_a(local_pipeline, engine.clone())
+            .await
+            .generate(chat_request())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        let (text, errored) = content(&items);
+        assert!(
+            !text.is_empty(),
+            "{local_pipeline:?}: no content in {items:?}"
+        );
+        assert!(!errored, "{local_pipeline:?}: {items:?}");
+        runs.push((text, items.len(), calls(&engine)));
+    }
+    assert_eq!(runs[0], runs[1]);
+    assert_eq!(runs[1].2.len(), 1);
+}
+
+/// Pipeline A has no Migration: the terminal's eager error reaches the caller as it left the
+/// engine, through the backend and the preprocessor.
+#[tokio::test]
+async fn pipeline_a_returns_its_terminals_eager_error_on_both_local_pipelines() {
+    let mut errors = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        let engine = Flaky::new(1, false);
+        let error = match pipeline_a(local_pipeline, engine.clone())
+            .await
+            .generate(chat_request())
+            .await
+        {
+            Ok(_) => panic!("{local_pipeline:?}: the eager error was lost"),
+            Err(error) => error,
+        };
+        let error_type = error
+            .downcast_ref::<DynamoError>()
+            .map(DynamoError::error_type)
+            .unwrap_or_else(|| panic!("{local_pipeline:?}: {error:#}"));
+        errors.push((error_type, error.to_string(), calls(&engine).len()));
+    }
+    assert_eq!(errors[0], errors[1]);
+    assert_eq!(errors[1].0, ErrorClass::WorkerUnavailable);
+    assert_eq!(errors[1].2, 1);
+}
+
+/// A stop and a kill of the HTTP handler's context reach the terminal engine's context through
+/// both adapted stages.
+#[tokio::test]
+async fn a_stop_and_a_kill_reach_the_terminal_through_pipeline_a_on_gdl() {
+    let engine = Flaky::new(0, true);
+    let pipeline = pipeline_a(LocalPipeline::Gdl, engine.clone()).await;
+    let request = chat_request();
+    let context = request.context();
+    let mut stream = pipeline.generate(request).await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("the first item arrives")
+        .unwrap();
+    assert!(!first.is_error(), "{first:?}");
+
+    let terminal = engine.calls.lock().unwrap()[0].context.clone();
+    context.stop_generating();
+    assert!(terminal.is_stopped());
+    assert!(!terminal.is_killed());
+    context.kill();
+    assert!(terminal.is_killed());
+    let rest: Vec<_> = tokio::time::timeout(Duration::from_secs(5), stream.collect())
+        .await
+        .expect("the stream ends after the kill");
+    assert!(rest.iter().all(|item| !item.is_error()), "{rest:?}");
+}
+
+#[tokio::test]
+async fn a_kill_during_dispatch_ends_pipeline_a_on_both_local_pipelines() {
+    let mut outcomes = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        let pipeline = pipeline_a(local_pipeline, Arc::new(Hanging)).await;
+        outcomes.push(kill_during_dispatch(pipeline, chat_request()).await);
+    }
+    assert_eq!(outcomes, ["ok, 0 items", "ok, 0 items"]);
+}
+
+/// Pipeline A behind the HTTP service, as the in-process HTTP input serves it: one model per
+/// local pipeline over the same kind of engine, the same chat, streamed and not.
+#[tokio::test]
+async fn pipeline_a_serves_the_same_chat_over_http_on_both_local_pipelines() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let service = HttpService::builder()
+        .port(port)
+        .host("127.0.0.1")
+        .enable_chat_endpoints(true)
+        .build()
+        .unwrap();
+    let mut engines = Vec::new();
+    for (model, local_pipeline) in [
+        ("dynamo", LocalPipeline::Dynamo),
+        ("gdl", LocalPipeline::Gdl),
+    ] {
+        let engine = Flaky::new(0, false);
+        let card = ModelDeploymentCard::with_name_only(model);
+        service
+            .model_manager()
+            .add_chat_completions_model(
+                model,
+                card.mdcsum(),
+                pipeline_a(local_pipeline, engine.clone()).await,
+            )
+            .unwrap();
+        engines.push(engine);
+    }
+    let cancel = CancellationToken::new();
+    let join = service.spawn_with_listener(cancel.clone(), listener).await;
+
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while client.get(format!("{base}/health")).send().await.is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the service is up");
+
+    for stream in [false, true] {
+        let mut texts = Vec::new();
+        for model in ["dynamo", "gdl"] {
+            let response = client
+                .post(format!("{base}/v1/chat/completions"))
+                .json(&serde_json::json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "Write one sentence about a fox."}],
+                    "max_tokens": 8,
+                    "stream": stream,
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK, "{model}");
+            let body = response.text().await.unwrap();
+            let text = if stream {
+                body.lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter(|data| *data != "[DONE]")
+                    .map(|data| serde_json::from_str::<serde_json::Value>(data).unwrap())
+                    .filter_map(|chunk| {
+                        chunk["choices"][0]["delta"]["content"]
+                            .as_str()
+                            .map(str::to_string)
+                    })
+                    .collect::<String>()
+            } else {
+                let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+                body["choices"][0]["message"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            assert!(!text.is_empty(), "{model}, stream {stream}: {body}");
+            texts.push(text);
+        }
+        assert_eq!(texts[0], texts[1], "stream {stream}");
+    }
+    for engine in &engines {
+        assert_eq!(engine.calls.lock().unwrap().len(), 2);
+    }
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
+}
+
+/// Signals each time a request reaches it, then waits for the request's kill.
+struct DispatchProbe {
+    entered: tokio::sync::mpsc::UnboundedSender<()>,
+}
+
+impl DispatchProbe {
+    fn new() -> (Arc<Self>, tokio::sync::mpsc::UnboundedReceiver<()>) {
+        let (entered, started) = tokio::sync::mpsc::unbounded_channel();
+        (Arc::new(Self { entered }), started)
+    }
+
+    async fn hold<Req: Data, T: Data>(&self, request: SingleIn<Req>) -> Result<ManyOut<T>, Error> {
+        self.entered.send(()).unwrap();
+        let context = request.context();
+        context.killed().await;
+        Ok(ResponseStream::new(Box::pin(stream::empty()), context))
+    }
+}
+
+#[async_trait]
+impl AsyncEngine<SingleIn<PreprocessedRequest>, Out, Error> for DispatchProbe {
+    async fn generate(&self, request: SingleIn<PreprocessedRequest>) -> Result<Out, Error> {
+        self.hold(request).await
+    }
+}
+
+#[async_trait]
+impl AsyncEngine<SingleIn<PreprocessedEmbeddingRequest>, EmbedOut, Error> for DispatchProbe {
+    async fn generate(
+        &self,
+        request: SingleIn<PreprocessedEmbeddingRequest>,
+    ) -> Result<EmbedOut, Error> {
+        self.hold(request).await
+    }
+}
+
+/// What a second request with the id of one still dispatching does. Dynamo's `link` chain
+/// keeps a response map per stage keyed by request id, and refuses the second; a gdl
+/// composition has no map and dispatches it. Frontend request ids are generated by the server,
+/// so two in-flight requests never share one there, and a worker's ingress still refuses a
+/// duplicate. The outcome tells the compositions apart, so each builder's choice is checked.
+async fn duplicate_id<Req: Data, T: Data>(
+    pipeline: Arc<dyn AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, Error>>,
+    mut started: tokio::sync::mpsc::UnboundedReceiver<()>,
+    request: impl Fn() -> SingleIn<Req>,
+) -> String {
+    let first = request();
+    let first_context = first.context();
+    let first_call = tokio::spawn({
+        let pipeline = pipeline.clone();
+        async move { pipeline.generate(first).await.map(|_| ()) }
+    });
+    tokio::time::timeout(Duration::from_secs(5), started.recv())
+        .await
+        .expect("the first request reaches the terminal")
+        .unwrap();
+
+    let second = request();
+    let second_context = second.context();
+    let mut second_call = tokio::spawn(async move { pipeline.generate(second).await.map(|_| ()) });
+    let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            result = &mut second_call => match result.unwrap() {
+                Err(error) => format!("refused: {error}"),
+                Ok(()) => "returned a stream".to_string(),
+            },
+            _ = started.recv() => "dispatched".to_string(),
+        }
+    })
+    .await
+    .expect("the second request is refused or dispatched");
+
+    first_context.kill();
+    second_context.kill();
+    for call in [first_call, second_call] {
+        if !call.is_finished() {
+            let _ = tokio::time::timeout(Duration::from_secs(5), call)
+                .await
+                .expect("the call ends after the kill");
+        }
+    }
+    outcome
+}
+
+const REFUSED: &str = "refused: Duplicate in-flight request id: req-1";
+
+#[tokio::test]
+async fn a_duplicate_request_id_tells_the_compositions_of_pipeline_a_apart() {
+    let mut outcomes = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        let (engine, started) = DispatchProbe::new();
+        let pipeline = pipeline_a(local_pipeline, engine).await;
+        outcomes.push(duplicate_id(pipeline, started, chat_request).await);
+    }
+    assert_eq!(outcomes, [REFUSED, "dispatched"]);
+}
+
+#[tokio::test]
+async fn a_duplicate_request_id_tells_the_compositions_of_pipeline_b_apart() {
+    let mut outcomes = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        let (engine, started) = DispatchProbe::new();
+        let pipeline = pipeline_b(local_pipeline, engine, 0);
+        outcomes.push(duplicate_id(pipeline, started, chat_request).await);
+    }
+    assert_eq!(outcomes, [REFUSED, "dispatched"]);
+}
+
+#[tokio::test]
+async fn a_duplicate_request_id_tells_the_compositions_of_pipeline_c_apart() {
+    let mut outcomes = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        let (engine, started) = DispatchProbe::new();
+        let pipeline = pipeline_c(local_pipeline, engine, 0);
+        outcomes.push(duplicate_id(pipeline, started, request).await);
+    }
+    assert_eq!(outcomes, [REFUSED, "dispatched"]);
+}
+
+#[tokio::test]
+async fn a_duplicate_request_id_tells_the_compositions_of_pipeline_embeddings_apart() {
+    let mut outcomes = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        let (engine, started) = DispatchProbe::new();
+        let pipeline = pipeline_embeddings(local_pipeline, engine);
+        outcomes.push(duplicate_id(pipeline, started, embedding_request).await);
+    }
+    assert_eq!(outcomes, [REFUSED, "dispatched"]);
 }

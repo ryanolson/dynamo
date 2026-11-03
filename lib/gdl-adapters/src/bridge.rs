@@ -23,6 +23,16 @@ pub const REQUEST_ID: &str = "dynamo.request_id";
 /// Stop maps to [`Cx::request_stop`] and kill to [`Cx::cancel`]. A `Cx` never
 /// leaves the cancelled state, so a kill stays a kill whatever comes after it,
 /// on either side.
+///
+/// Except below Dynamo operators. gdl's `Hop` races each inner call against
+/// the attempt's cancel and drops the call when the cancel wins, and refuses
+/// to start a call for a cancelled `Cx`. A Dynamo operator handles a kill
+/// itself and may still have work to do after it: PrefillRouter sends the
+/// decode leg that releases staged KV after the caller is killed at the
+/// prefill handoff. So a pipeline of Dynamo operators derives its `Cx` with
+/// [`cx_for_dynamo_stages`](Self::cx_for_dynamo_stages), which a kill does
+/// not cancel; the operators see the kill through their own context, as on
+/// Dynamo's `link` chain. [`cx`](Self::cx) is for gdl-native nodes.
 pub struct CxBridge;
 
 impl CxBridge {
@@ -35,10 +45,22 @@ impl CxBridge {
     /// `Cx` reaches `context`, because gdl cancels every attempt when it ends,
     /// also when it ends normally.
     pub fn cx(context: &dyn AsyncEngineContext) -> Cx {
+        Self::linked(context, true)
+    }
+
+    /// A fresh root `Cx` that follows `context`'s stop but not its kill, for a
+    /// pipeline whose stages are Dynamo operators and engines (see
+    /// [`CxBridge`]). Otherwise as [`cx`](Self::cx).
+    pub fn cx_for_dynamo_stages(context: &dyn AsyncEngineContext) -> Cx {
+        Self::linked(context, false)
+    }
+
+    fn linked(context: &dyn AsyncEngineContext, cancel_on_kill: bool) -> Cx {
         let mut cx = Cx::new();
         cx.insert_meta(REQUEST_ID, context.id());
         context.link_child(Arc::new(CxLink {
             cx: cx.clone(),
+            cancel_on_kill,
             children: Mutex::default(),
         }));
         // `link_child` does not replay what already happened to `context`.
@@ -47,7 +69,9 @@ impl CxBridge {
         // way is seen too: Dynamo's controller publishes its state before it
         // tells its children (`tests/races.rs`).
         if context.is_killed() {
-            cx.cancel();
+            if cancel_on_kill {
+                cx.cancel();
+            }
         } else if context.is_stopped() {
             cx.request_stop();
         }
@@ -167,6 +191,8 @@ impl AsyncEngineContext for KillLatch {
 /// is stopped or killed.
 struct CxLink {
     cx: Cx,
+    /// Whether a kill cancels `cx` (see [`CxBridge`]).
+    cancel_on_kill: bool,
     children: Mutex<Vec<Arc<dyn AsyncEngineContext>>>,
 }
 
@@ -231,7 +257,9 @@ impl AsyncEngineContext for CxLink {
         for child in self.children() {
             child.kill();
         }
-        self.cx.cancel();
+        if self.cancel_on_kill {
+            self.cx.cancel();
+        }
     }
 
     fn link_child(&self, child: Arc<dyn AsyncEngineContext>) {
