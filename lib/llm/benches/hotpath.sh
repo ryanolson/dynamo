@@ -7,7 +7,8 @@
 # (`DYN_LOCAL_PIPELINE=gdl`). It runs callgrind.sh for every row at 1 and 16 items.
 #
 # Usage: lib/llm/benches/hotpath.sh [--base FILE]
-#   FILE is an earlier output of this script. With it, each row also shows its change, and the
+#   FILE is an earlier output of this script; a file with no rows in that format fails before
+#   any run. With it, each row also shows its change, and the
 #   script marks
 #     RISE   a default-path row (form dynamo, or a stand-in engine) that got worse,
 #     WORSE  a gdl row that got worse,
@@ -52,6 +53,13 @@ while (( $# > 0 )); do
 done
 if [[ -n $base && ! -r $base ]]; then
     echo "hotpath.sh: cannot read the base table $base" >&2
+    exit 1
+fi
+# A base with no rows in this script's format would make every row "new" and pass any rise.
+# Check it before the runs, which take minutes.
+if [[ -n $base ]] && ! awk 'NF >= 9 && $3 ~ /^[0-9]+$/ && $7 ~ /^[0-9]+$/ { found = 1 }
+        END { exit !found }' "$base"; then
+    echo "hotpath.sh: $base has no rows in this script's table format" >&2
     exit 1
 fi
 
