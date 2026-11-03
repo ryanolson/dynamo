@@ -7,7 +7,7 @@
 # (`DYN_LOCAL_PIPELINE=gdl`). It runs callgrind.sh for every row at 1 and 16 items.
 #
 # Usage: lib/llm/benches/hotpath.sh [--base FILE]
-#   FILE is an earlier output of this script; a file with no rows in that format fails before
+#   FILE is an earlier output of this script; a file that lacks a row of the table fails before
 #   any run. With it, each row also shows its change, and the
 #   script marks
 #     RISE   a default-path row (form dynamo, or a stand-in engine) that got worse,
@@ -55,13 +55,6 @@ if [[ -n $base && ! -r $base ]]; then
     echo "hotpath.sh: cannot read the base table $base" >&2
     exit 1
 fi
-# A base with no rows in this script's format would make every row "new" and pass any rise.
-# Check it before the runs, which take minutes.
-if [[ -n $base ]] && ! awk 'NF >= 9 && $3 ~ /^[0-9]+$/ && $7 ~ /^[0-9]+$/ { found = 1 }
-        END { exit !found }' "$base"; then
-    echo "hotpath.sh: $base has no rows in this script's table format" >&2
-    exit 1
-fi
 
 # pipeline form row, and the tolerance in percent per request and per item, in table order.
 # The embeddings rows' batch encode runs on rayon, whose idle threads spin a varying number of
@@ -79,6 +72,24 @@ embeddings gdl embeddings-gdl 3 6
 ingress dynamo ingress 1 2"
 
 runs=${HOTPATH_RUNS:-1}
+
+# The base must hold every row of the table in this script's format: a row it lacks could not
+# be compared, so a rise there would pass. Check it before the runs, which take minutes.
+if [[ -n $base ]]; then
+    missing_rows=$(awk -v table_rows="$table_rows" '
+        NF >= 9 && $3 ~ /^[0-9]+$/ && $7 ~ /^[0-9]+$/ { have[$1 " " $2] = 1 }
+        END {
+            n = split(table_rows, lines, "\n")
+            for (i = 1; i <= n; i++) {
+                split(lines[i], f, " ")
+                if (!((f[1] " " f[2]) in have)) printf "%s%s %s", (out++ ? ", " : ""), f[1], f[2]
+            }
+        }' "$base")
+    if [[ -n $missing_rows ]]; then
+        echo "hotpath.sh: $base has no row in this script's table format for: $missing_rows" >&2
+        exit 1
+    fi
+fi
 args=()
 for ((run = 0; run < runs; run++)); do
     while read -r _ _ row _; do
@@ -92,7 +103,8 @@ trap 'rm -f "$counts"' EXIT
 
 awk -v base="$base" -v table_rows="$table_rows" \
     -v floor="${HOTPATH_FLOOR:-300}" -v item_floor="${HOTPATH_ITEM_FLOOR:-50}" '
-function tolerance(b, pct, least) { t = b * pct / 100; return t > least ? t : least }
+# 100 times the tolerance of a base count b, so the comparison stays in whole numbers.
+function tolerance100(b, pct, least) { t = b * pct; return t > least * 100 ? t : least * 100 }
 function change(now, was) { d = now - was; return (d > 0 ? "+" : "") d }
 function lo(range) { split(range, p, "[.][.]"); return p[1] + 0 }
 function hi(range) { split(range, p, "[.][.]"); return p[2] + 0 }
@@ -148,15 +160,13 @@ END {
             print line
             continue
         }
-        if (!(key in b_allocs)) {
-            print line sprintf("  %6s %9s %8s %10s  %s", "-", "-", "-", "-", "new")
-            continue
-        }
-        # Compare raw counts: a per-item figure is rounded for display.
-        ri = (r16 - r) / 15; b_ri = (b_instr16[key] - b_instr[key]) / 15
+        # Compare raw counts in whole numbers: a per-item figure is rounded for display, and
+        # its fifteenths are scaled up rather than divided.
+        d = r16 - r; b_d = b_instr16[key] - b_instr[key]
+        ri = d / 15; b_ri = b_d / 15
         worse = a > b_allocs[key] || a16 > b_allocs16[key] \
-            || r - b_instr[key] > tolerance(b_instr[key], pct, floor) \
-            || ri - b_ri > tolerance(b_ri, item_pct, item_floor)
+            || (r - b_instr[key]) * 100 > tolerance100(b_instr[key], pct, floor) \
+            || (d - b_d) * 100 > tolerance100(b_d, item_pct, item_floor * 15)
         mark = ""
         if (worse) { mark = form == "gdl" ? "WORSE" : "RISE"; marked++ }
         print line sprintf("  %6s %9s %8s %10s  %s", change(a, b_allocs[key]),

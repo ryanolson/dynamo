@@ -139,8 +139,8 @@ so the typical count moves between runs. `range` shows how far.
 With `--base`, the script marks a row `RISE` when the default path got worse and `WORSE` when a
 gdl row did, and exits 1 if it marked any row. A row gets worse when its allocations at 1 or at
 16 items rise at all, or when its instructions rise by more than the tolerance (see below). It
-compares the raw counts, not the rounded per-item figures. A base file with no rows in the
-table's format fails before any run.
+compares the raw counts, not the rounded per-item figures. A base file that lacks any row
+of the table fails before any run.
 
 `callgrind.sh` measures single rows, one run each, and prints raw counts:
 
