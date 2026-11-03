@@ -57,10 +57,12 @@ where
     async fn generate(&self, request: SingleIn<Req>) -> anyhow::Result<ManyOut<Annotated<T>>> {
         let context = request.context();
         let cx = CxBridge::cx(request.controller());
+        let root = cx.clone();
         match self.next.generate(cx, request).await {
             Ok(items) => Ok(ResponseStream::new(
                 Box::pin(Exit {
                     items: Some(items),
+                    root,
                     context: Arc::clone(&context),
                 }),
                 context,
@@ -73,6 +75,9 @@ where
 /// gdl items leaving as Dynamo items.
 struct Exit<T> {
     items: Option<Items<Annotated<T>>>,
+    /// The `Cx` derived from `context`. Only a kill of `context` cancels it,
+    /// and it stays cancelled after a later stop, where `context` does not.
+    root: gdl::Cx,
     context: Arc<dyn AsyncEngineContext>,
 }
 
@@ -87,7 +92,8 @@ impl<T: Data> Stream for Exit<T> {
             Poll::Ready(Some(Ok(item))) => Poll::Ready(Some(item)),
             Poll::Ready(Some(Err(error))) => {
                 self.items = None;
-                let killed = error.kind() == gdl::ErrorKind::Cancelled && self.context.is_killed();
+                let killed = error.kind() == gdl::ErrorKind::Cancelled
+                    && (self.root.is_cancelled() || self.context.is_killed());
                 Poll::Ready((!killed).then(|| exit_item(error)))
             }
             Poll::Ready(None) => {
