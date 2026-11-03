@@ -53,18 +53,16 @@
 //! | `a` | 349 | 100,958 | 862 | 122,446 |
 //! | `a-gdl` | 333 | 81,407 | 846 | 102,895 |
 //! | `b` | 402 | 227,025 | 915 | 248,513 |
-//! | `b-gdl` | 362 | 180,214 | 875 | 201,702 |
+//! | `b-gdl` | 360 | 182,726 | 873 | 204,214 |
 //! | `c` | 71 | 144,683 | 86 | 144,743 |
-//! | `c-gdl` | 47 | 114,736 | 62 | 114,796 |
+//! | `c-gdl` | 47 | 117,376 | 62 | 117,436 |
 //! | `embed-engine` | 8 | 6,548 | 23 | 88,868 |
 //! | `embed` | 199 | 44,406 | 2,283 | 529,854 |
 //! | `embeddings-gdl` | 184 | 44,439 | 2,268 | 529,887 |
 //!
 //! Each gdl row differs from its dynamo row by the same number of allocations at both item
-//! counts, so nothing per item: `a-gdl` −14, `b-gdl` −40, `c-gdl` −24, `embeddings-gdl` −13
-//! (−12 at 16 items). `a-gdl` and `embeddings-gdl` vary by up to two allocations between runs,
-//! and their records hold the higher count; `b-gdl` and `c-gdl` gave the same count in every
-//! run. `lib/gdl-adapters/tests/allocations.rs` measures the parts in isolation: 14 allocations
+//! counts, so nothing per item: `a-gdl` −16, `b-gdl` −42, `c-gdl` −24, `embeddings-gdl` −15.
+//! `lib/gdl-adapters/tests/allocations.rs` measures the parts in isolation: 14 allocations
 //! for a `link` stage, 5 for a native gdl operator, and 21 against 19 at the boundary
 //! (`PipelineEngine` above, `EngineSink` below). Every operator in the gdl rows is native; the
 //! test engine at the terminal enters through `EngineSink`, where the frontend's `RoutingHost`
@@ -137,13 +135,13 @@ const BASELINE: &[Row] = &[
     // Transition: remove when the gdl pipeline is the only local pipeline.
     row("b", 1, 402, 227025),
     row("b", 16, 915, 248513),
-    row("b-gdl", 1, 362, 180214),
-    row("b-gdl", 16, 875, 201702),
+    row("b-gdl", 1, 360, 182726),
+    row("b-gdl", 16, 873, 204214),
     // Transition: remove when the gdl pipeline is the only local pipeline.
     row("c", 1, 71, 144683),
     row("c", 16, 86, 144743),
-    row("c-gdl", 1, 47, 114736),
-    row("c-gdl", 16, 62, 114796),
+    row("c-gdl", 1, 47, 117376),
+    row("c-gdl", 16, 62, 117436),
     row("embed-engine", 1, 8, 6548),
     row("embed-engine", 16, 23, 88868),
     // Transition: remove when the gdl pipeline is the only local pipeline.
