@@ -76,8 +76,11 @@
 //! make it.
 //!
 //! Run: `cargo test -p dynamo-llm --test allocations`. For instructions per request, see
-//! `lib/llm/benches/callgrind.sh`, which runs this binary as
-//! `allocations row <row> <items> <requests>`.
+//! `lib/llm/benches/callgrind.sh` and `hotpath.sh`, which run this binary under callgrind as
+//! `allocations row <row> <items> <requests>`. Callgrind counts only the measured requests: the
+//! binary asks it for one dump after warm-up and one after the last measured request (see
+//! `lib/runtime/tests/common/callgrind.rs`). Callgrind does not count the system allocator,
+//! whose cost follows its heap state, nor this thread while it waits at the end of a window.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -110,6 +113,9 @@ use dynamo_llm::types::openai::chat_completions::{
 use dynamo_llm::types::openai::embeddings::NvCreateEmbeddingRequest;
 use dynamo_runtime::engine::{AsyncEngine, AsyncEngineContextProvider, ResponseStream};
 use dynamo_runtime::pipeline::{Context, Error, ManyOut, RouterMode, ServiceEngine, SingleIn};
+
+#[path = "../../runtime/tests/common/callgrind.rs"]
+mod callgrind;
 
 const MODEL_PATH: &str = "tests/data/sample-models/TinyLlama_v1.1";
 const WARMUP: usize = 50;
@@ -180,23 +186,27 @@ impl Counting {
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         Self::record(layout.size());
+        let _pause = callgrind::pause();
         // SAFETY: forwarded unchanged to the system allocator.
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         Self::record(layout.size());
+        let _pause = callgrind::pause();
         // SAFETY: forwarded unchanged to the system allocator.
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         Self::record(new_size);
+        let _pause = callgrind::pause();
         // SAFETY: forwarded unchanged to the system allocator.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let _pause = callgrind::pause();
         // SAFETY: forwarded unchanged to the system allocator.
         unsafe { System.dealloc(ptr, layout) }
     }
@@ -264,8 +274,10 @@ async fn window<F: std::future::Future>(body: F) -> (Counts, F::Output) {
     MEASURING.with(|m| m.set(true));
     OPEN.store(true, Ordering::SeqCst);
     let out = body.await;
-    let settle_start = std::time::Instant::now();
-    let settled = || settle_start.elapsed() < std::time::Duration::from_secs(5);
+    // The window reads no clock and sets no timer unless a request leaves tasks running: under
+    // callgrind, the time driver's work follows wall-clock time, which made a row's
+    // instructions per request differ by about 1% between runs of one binary.
+    let mut settle_start = None;
     let total =
         || ON_THREAD_ALLOCS.load(Ordering::SeqCst) + OFF_THREAD_ALLOCS.load(Ordering::SeqCst);
     // Settle in rounds until one round allocates nothing. Work that spawns more work allocates
@@ -279,8 +291,9 @@ async fn window<F: std::future::Future>(body: F) -> (Counts, F::Output) {
             if alive <= tasks_before {
                 break;
             }
+            let start = *settle_start.get_or_insert_with(std::time::Instant::now);
             assert!(
-                settled(),
+                start.elapsed() < std::time::Duration::from_secs(5),
                 "a request left {} tasks running",
                 alive - tasks_before
             );
@@ -288,14 +301,17 @@ async fn window<F: std::future::Future>(body: F) -> (Counts, F::Output) {
         // `num_alive_tasks` does not see blocking jobs. The runtime has one blocking thread, so
         // a no-op job finishes only after every job queued before it. Spawning it allocates on
         // this thread; that is the harness's cost, not the request's.
-        // Await it rather than poll it, so the wait costs the same instructions every time.
+        // There is no timeout on it, for the reason above: a request that leaves blocking work
+        // running for ever hangs here, so run this binary under `timeout`.
+        // Callgrind does not count this thread while it waits: no request task is left on it,
+        // and how often it parks and wakes depends on when the blocking thread runs. The
+        // blocking thread is still counted.
+        let pause = callgrind::pause();
         HARNESS.with(|h| h.set(true));
         let barrier = tokio::task::spawn_blocking(|| ());
         HARNESS.with(|h| h.set(false));
-        tokio::time::timeout(std::time::Duration::from_secs(5), barrier)
-            .await
-            .expect("a request left blocking work running")
-            .expect("barrier");
+        barrier.await.expect("barrier");
+        drop(pause);
         if total() == before {
             break;
         }
@@ -521,6 +537,9 @@ where
 {
     let mut counts = Vec::with_capacity(requests);
     for i in 0..WARMUP + requests {
+        if i == WARMUP {
+            callgrind::dump_stats_at(c"setup and warm-up");
+        }
         let fut = make();
         let (c, drained) = window(fut).await;
         assert!(drained > 0, "{name}: empty stream");
@@ -528,6 +547,7 @@ where
             counts.push(c);
         }
     }
+    callgrind::dump_stats_at(c"measured requests");
     Measured {
         name,
         items,
@@ -818,10 +838,12 @@ fn main() {
     let fixture = Fixture::load();
     // One blocking thread, so a window can wait for the blocking work a request leaves. It must
     // not exit when idle: starting a new one allocates.
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let mut builder = tokio::runtime::Builder::new_current_thread();
+    builder
         .enable_all()
         .max_blocking_threads(1)
-        .thread_keep_alive(std::time::Duration::from_secs(24 * 3600))
+        .thread_keep_alive(std::time::Duration::from_secs(24 * 3600));
+    let rt = callgrind::uncount_parked(&mut builder)
         .build()
         .expect("runtime");
     rt.block_on(run(&fixture, &args));
