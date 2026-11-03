@@ -402,6 +402,22 @@ else
     echo "ok hotpath.sh large-integer-counts-rejected"
 fi
 
+# Architecture suffixes must not disappear when the provenance fields are split.
+for arch_suffix in '=other' $'\tother'; do
+    awk -v suffix="$arch_suffix" '
+        NR == 1 { sub(/arch=[^ ]+/, "&" suffix) }
+        { print }
+    ' "$work/base" >"$work/suffixed-arch-base"
+    run "$here/hotpath.sh" --base "$work/suffixed-arch-base"
+    if [[ $status -eq 0 ]]; then
+        fail base-suffixed-arch "accepted arch=$(uname -m)$arch_suffix as the host architecture"
+    elif grep -q 'callgrind output:' "$work/stderr"; then
+        fail base-suffixed-arch "ran callgrind before rejecting a different architecture"
+    else
+        echo "ok hotpath.sh base-suffixed-arch"
+    fi
+done
+
 if ((failures > 0)); then
     echo "$failures failed" >&2
     exit 1
