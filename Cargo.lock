@@ -2492,10 +2492,16 @@ dependencies = [
 name = "dynamo-gdl-adapters"
 version = "1.7.0"
 dependencies = [
+ "anyhow",
  "async-trait",
+ "dynamo-llm",
  "dynamo-runtime",
+ "futures",
  "gdl",
+ "reqwest 0.12.28",
+ "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
