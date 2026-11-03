@@ -51,19 +51,18 @@
 //! |---|---:|---:|---:|---:|
 //! | `engine` | 7 | 2,752 | 22 | 2,812 |
 //! | `a` | 349 | 100,958 | 862 | 122,446 |
-//! | `a-gdl` | 359 | 96,809 | 872 | 118,297 |
+//! | `a-gdl` | 357 | 96,841 | 870 | 118,329 |
 //! | `b` | 402 | 227,025 | 915 | 248,513 |
-//! | `b-gdl` | 421 | 221,367 | 934 | 242,855 |
+//! | `b-gdl` | 419 | 221,687 | 932 | 243,175 |
 //! | `c` | 71 | 144,683 | 86 | 144,743 |
-//! | `c-gdl` | 82 | 140,607 | 97 | 140,667 |
+//! | `c-gdl` | 82 | 140,991 | 97 | 141,051 |
 //! | `embed-engine` | 8 | 6,548 | 23 | 88,868 |
 //! | `embed` | 199 | 44,406 | 2,283 | 529,854 |
-//! | `embeddings-gdl` | 209 | 48,569 | 2,294 | 534,017 |
+//! | `embeddings-gdl` | 207 | 48,601 | 2,291 | 534,049 |
 //!
 //! Each gdl row costs the same number of allocations more than its dynamo row at both item
-//! counts, so nothing per item: `a-gdl` +10, `b-gdl` +19, `c-gdl` +11, `embeddings-gdl` +10 (+11
-//! at 16 items). The gdl rows other than `c-gdl` vary by up to two allocations between runs, and
-//! their records hold the higher count. That is the Phase 1 adapters' cost.
+//! counts, so nothing per item: `a-gdl` +8, `b-gdl` +17, `c-gdl` +11, `embeddings-gdl` +8. That
+//! is the Phase 1 adapters' cost.
 //! `lib/gdl-adapters/tests/allocations.rs` measures it in isolation: 17 allocations per adapted
 //! operator against 14 for a `link` stage, and 21 against 19 at the boundary (`PipelineEngine`
 //! above, `EngineSink` below). Native gdl operators remove the adapted stages.
@@ -128,22 +127,22 @@ const BASELINE: &[Row] = &[
     row("engine", 16, 22, 2812),
     row("a", 1, 349, 100958),
     row("a", 16, 862, 122446),
-    row("a-gdl", 1, 359, 96809),
-    row("a-gdl", 16, 872, 118297),
+    row("a-gdl", 1, 357, 96841),
+    row("a-gdl", 16, 870, 118329),
     row("b", 1, 402, 227025),
     row("b", 16, 915, 248513),
-    row("b-gdl", 1, 421, 221367),
-    row("b-gdl", 16, 934, 242855),
+    row("b-gdl", 1, 419, 221687),
+    row("b-gdl", 16, 932, 243175),
     row("c", 1, 71, 144683),
     row("c", 16, 86, 144743),
-    row("c-gdl", 1, 82, 140607),
-    row("c-gdl", 16, 97, 140667),
+    row("c-gdl", 1, 82, 140991),
+    row("c-gdl", 16, 97, 141051),
     row("embed-engine", 1, 8, 6548),
     row("embed-engine", 16, 23, 88868),
     row("embed", 1, 199, 44406),
     row("embed", 16, 2283, 529854),
-    row("embeddings-gdl", 1, 209, 48569),
-    row("embeddings-gdl", 16, 2294, 534017),
+    row("embeddings-gdl", 1, 207, 48601),
+    row("embeddings-gdl", 16, 2291, 534049),
 ];
 
 #[global_allocator]
