@@ -7,14 +7,21 @@
 # (`DYN_LOCAL_PIPELINE=gdl`). It runs callgrind.sh for every row at 1 and 16 items.
 #
 # Usage: lib/llm/benches/hotpath.sh [--base FILE]
-#   FILE is an earlier output of this script; a file that lacks a row of the table fails before
-#   any run. With it, each row also shows its change, and the
-#   script marks
+#   FILE is an earlier output of this script, with or without its change columns. With it, each
+#   row also shows its change, and the script marks
 #     RISE   a default-path row (form dynamo, or a stand-in engine) that got worse,
 #     WORSE  a gdl row that got worse,
 #   and exits 1 if it marked any row. "Worse" means any rise in allocations, or a rise in
 #   instructions above the row's tolerance (below).
 #   The environment variables of callgrind.sh apply, and HOTPATH_RUNS (below).
+#
+# The table's first line is its provenance: "# hotpath format=N arch=A gdl=REV commit=REV".
+# One strict parser reads the base and the new table. Each line must be the provenance, the
+# header, a blank line or a row that matches the row pattern in full; each row's pipeline and
+# form must be one of the table's, once each, with none missing. The base must have the same
+# format and arch as this run. The script checks the base before the runs and fails on any
+# difference: a base it cannot compare would let a rise pass. Commit and gdl rev are printed,
+# not checked.
 #
 # Columns, per request:
 #   allocs, instr            at 1 item
@@ -73,106 +80,197 @@ ingress dynamo ingress 1 2"
 
 runs=${HOTPATH_RUNS:-1}
 
-# The base must hold every row of the table in this script's format: a row it lacks could not
-# be compared, so a rise there would pass. Check it before the runs, which take minutes.
-if [[ -n $base ]]; then
-    missing_rows=$(awk -v table_rows="$table_rows" '
-        NF >= 9 && $3 ~ /^[0-9]+$/ && $7 ~ /^[0-9]+$/ { have[$1 " " $2] = 1 }
-        END {
-            n = split(table_rows, lines, "\n")
-            for (i = 1; i <= n; i++) {
-                split(lines[i], f, " ")
-                if (!((f[1] " " f[2]) in have)) printf "%s%s %s", (out++ ? ", " : ""), f[1], f[2]
+# Provenance of this run. Bump `format` whenever a column changes.
+format=2
+repo=$(cd "$(dirname "$0")/../../.." && pwd)
+arch=$(uname -m)
+commit=$(git -C "$repo" rev-parse --short=12 HEAD 2>/dev/null) || commit=unknown
+if [[ $commit != unknown && -n $(git -C "$repo" status --porcelain --untracked-files=no 2>/dev/null) ]]; then
+    commit=$commit-dirty
+fi
+gdl=$(awk '/^\[\[package\]\]$/ { in_gdl = 0 }
+    $0 == "name = \"gdl\"" { in_gdl = 1 }
+    in_gdl && /^source = "git\+.*#[0-9a-f]+"$/ { sub(/.*#/, ""); sub(/"$/, ""); print substr($0, 1, 12); exit }' \
+    "$repo/Cargo.lock" 2>/dev/null) || true
+[[ -n $gdl ]] || gdl=unknown
+provenance="# hotpath format=$format arch=$arch gdl=$gdl commit=$commit"
+
+work=$(mktemp -d "${TMPDIR:-/tmp}/hotpath.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+
+# Reads one table strictly. Prints "prov FORMAT ARCH GDL COMMIT", then one
+# "row PIPELINE FORM ALLOCS ALLOCS@16 INSTR INSTR@16" per row. Fails, naming the file and line,
+# on anything else. Every count it prints matched a whole-number pattern, so no count comes from
+# awk's reading of a number at the start of a field.
+parse_table() {
+    awk -v file="$1" -v table_rows="$table_rows" '
+    function bad(msg) {
+        printf "hotpath.sh: %s:%d: %s\n", file, FNR, msg > "/dev/stderr"
+        failed = 1
+        exit 1
+    }
+    BEGIN {
+        n = split(table_rows, lines, "\n")
+        for (i = 1; i <= n; i++) {
+            split(lines[i], f, " ")
+            want[f[1] " " f[2]] = 1
+        }
+        num = "[0-9]+"; dec = "-?[0-9]+[.][0-9][0-9]"; whole = "-?[0-9]+"; chg = "[+-]?[0-9]+"
+        range = num "[.][.]" num "," num "[.][.]" num
+        row = "^[^ ]+ +[^ ]+ +" num " +" dec " +" num " +" whole " +" num " +" num " +" range
+        row = row "( +" chg " +" chg " +" chg " +" chg "( +(RISE|WORSE))?)? *$"
+        prov_re = "^# hotpath format=[0-9]+ arch=[^ ]+ gdl=[^ ]+ commit=[^ ]+$"
+        base_re = "^# base format=[0-9]+ arch=[^ ]+ gdl=[^ ]+ commit=[^ ]+$"
+        header_re = "^pipeline +form +allocs +allocs/item +instr +instr/item +allocs@16 +instr@16 +range"
+        header_re = header_re "( +change +allocs@16 +instr +instr/item +mark)? *$"
+    }
+    /^$/ { next }
+    $0 ~ prov_re {
+        if (prov || header) bad("the provenance line must come once, first")
+        prov = 1
+        split($0, p, /[ =]/)
+        print "prov", p[4], p[6], p[8], p[10]
+        next
+    }
+    $0 ~ base_re {
+        if (!prov || header || base_line) bad("the base line must come once, after the provenance")
+        base_line = 1
+        next
+    }
+    $0 ~ header_re {
+        if (!prov || header) bad("the header must come once, after the provenance")
+        header = 1
+        next
+    }
+    $0 ~ row {
+        if (!header) bad("a row before the header")
+        key = $1 " " $2
+        if (!(key in want)) bad("no such row in the table: " key)
+        if (key in seen) bad("a second row for " key)
+        seen[key] = 1
+        print "row", $1, $2, $3, $7, $5, $8
+        next
+    }
+    { bad("not a line of the table: " $0) }
+    END {
+        if (failed) exit 1
+        if (!prov) { printf "hotpath.sh: %s: no provenance line\n", file > "/dev/stderr"; exit 1 }
+        if (!header) { printf "hotpath.sh: %s: no header\n", file > "/dev/stderr"; exit 1 }
+        for (key in want)
+            if (!(key in seen)) {
+                printf "hotpath.sh: %s: no row for %s\n", file, key > "/dev/stderr"
+                missing = 1
             }
-        }' "$base")
-    if [[ -n $missing_rows ]]; then
-        echo "hotpath.sh: $base has no row in this script's table format for: $missing_rows" >&2
+        if (missing) exit 1
+    }' "$1"
+}
+
+# Checks the base before the runs, which take minutes.
+if [[ -n $base ]]; then
+    parse_table "$base" >"$work/base.parsed" || exit 1
+    read -r _ base_format base_arch base_gdl base_commit < <(grep '^prov ' "$work/base.parsed")
+    if [[ $base_format != "$format" ]]; then
+        echo "hotpath.sh: $base is table format $base_format; this script writes format $format" >&2
+        exit 1
+    fi
+    if [[ $base_arch != "$arch" ]]; then
+        echo "hotpath.sh: $base was measured on $base_arch; this host is $arch" >&2
         exit 1
     fi
 fi
+
 args=()
 for ((run = 0; run < runs; run++)); do
     while read -r _ _ row _; do
         args+=("$row" 1 "$row" 16)
     done <<<"$table_rows"
 done
+"$(dirname "$0")/callgrind.sh" "${args[@]}" >"$work/counts"
 
-counts=$(mktemp "${TMPDIR:-/tmp}/hotpath.XXXXXX")
-trap 'rm -f "$counts"' EXIT
-"$(dirname "$0")/callgrind.sh" "${args[@]}" >"$counts"
+# The new table, from callgrind.sh's counts.
+{
+    echo "$provenance"
+    awk -v table_rows="$table_rows" '
+    function bad(msg) { print "hotpath.sh: callgrind.sh output: " msg > "/dev/stderr"; failed = 1; exit 1 }
+    function lo(r) { split(r, p, "[.][.]"); return p[1] + 0 }
+    function hi(r) { split(r, p, "[.][.]"); return p[2] + 0 }
+    NR == 1 { next }
+    # Over repeated runs: the highest typical allocations, the lowest and highest single
+    # request, and the lowest instructions.
+    {
+        if ($0 !~ /^[^ ]+ +(1|16) +[0-9]+ +[0-9]+ +[0-9]+[.][.][0-9]+$/) bad("not a count line: " $0)
+        k = $1 SUBSEP $2
+        if (!(k in instr) || $4 + 0 < instr[k]) instr[k] = $4 + 0
+        if (!(k in allocs) || $3 + 0 > allocs[k]) allocs[k] = $3 + 0
+        if (!(k in low) || lo($5) < low[k]) low[k] = lo($5)
+        if (!(k in high) || hi($5) > high[k]) high[k] = hi($5)
+    }
+    END {
+        if (failed) exit 1
+        printf "%-12s %-6s %7s %11s %9s %10s %9s %10s  %-19s\n", "pipeline", "form", "allocs", "allocs/item", "instr", "instr/item", "allocs@16", "instr@16", "range"
+        nrows = split(table_rows, lines, "\n")
+        for (i = 1; i <= nrows; i++) {
+            split(lines[i], f, " ")
+            pipeline = f[1]; form = f[2]; row = f[3]
+            if (!((row, 1) in allocs) || !((row, 16) in allocs)) {
+                print "hotpath.sh: no counts for row " row > "/dev/stderr"
+                missing = 1
+                continue
+            }
+            # A gdl row can lose an allocation or two from some windows, so it reports its
+            # highest request. The dynamo rows report their typical request.
+            if (form == "gdl") {
+                a = high[row, 1]; a16 = high[row, 16]
+            } else {
+                a = allocs[row, 1]; a16 = allocs[row, 16]
+            }
+            r = instr[row, 1]; r16 = instr[row, 16]
+            printf "%-12s %-6s %7d %11.2f %9d %10.0f %9d %10d  %-19s\n", pipeline, form,
+                a, (a16 - a) / 15, r, (r16 - r) / 15, a16, r16,
+                low[row, 1] ".." high[row, 1] "," low[row, 16] ".." high[row, 16]
+        }
+        if (missing) exit 2
+    }' "$work/counts"
+} >"$work/head"
+# The new table goes through the same parser as the base.
+parse_table "$work/head" >"$work/head.parsed" || exit 1
 
-awk -v base="$base" -v table_rows="$table_rows" \
+if [[ -z $base ]]; then
+    cat "$work/head"
+    exit 0
+fi
+
+# Compare the parsed tables in whole numbers, and print the new table with its changes.
+awk -v table_rows="$table_rows" -v base_prov="# base format=$base_format arch=$base_arch gdl=$base_gdl commit=$base_commit" \
     -v floor="${HOTPATH_FLOOR:-300}" -v item_floor="${HOTPATH_ITEM_FLOOR:-50}" '
 # 100 times the tolerance of a base count b, so the comparison stays in whole numbers.
 function tolerance100(b, pct, least) { t = b * pct; return t > least * 100 ? t : least * 100 }
 function change(now, was) { d = now - was; return (d > 0 ? "+" : "") d }
-function lo(range) { split(range, p, "[.][.]"); return p[1] + 0 }
-function hi(range) { split(range, p, "[.][.]"); return p[2] + 0 }
 BEGIN {
-    if (base != "") {
-        while ((getline line < base) > 0) {
-            n = split(line, f)
-            if (n >= 9 && f[3] ~ /^[0-9]+$/ && f[7] ~ /^[0-9]+$/) {
-                key = f[1] " " f[2]
-                b_allocs[key] = f[3]; b_instr[key] = f[5]
-                b_allocs16[key] = f[7]; b_instr16[key] = f[8]
-            }
-        }
-    }
-}
-# Over repeated runs: the highest typical allocations, the lowest and highest single request,
-# and the lowest instructions.
-NR > 1 {
-    k = $1 SUBSEP $2
-    if (!(k in instr) || $4 < instr[k]) instr[k] = $4
-    if (!(k in allocs) || $3 > allocs[k]) allocs[k] = $3
-    if (!(k in low) || lo($5) < low[k]) low[k] = lo($5)
-    if (!(k in high) || hi($5) > high[k]) high[k] = hi($5)
-}
-END {
-    header = sprintf("%-12s %-6s %7s %11s %9s %10s %9s %10s  %-19s", "pipeline", "form", "allocs", "allocs/item", "instr", "instr/item", "allocs@16", "instr@16", "range")
-    if (base != "")
-        header = header sprintf("  %6s %9s %8s %10s  %s", "change", "allocs@16", "instr", "instr/item", "mark")
-    print header
-    nrows = split(table_rows, lines, "\n")
-    marked = 0
-    for (i = 1; i <= nrows; i++) {
+    n = split(table_rows, lines, "\n")
+    for (i = 1; i <= n; i++) {
         split(lines[i], f, " ")
-        pipeline = f[1]; form = f[2]; row = f[3]; key = pipeline " " form
-        pct = f[4]; item_pct = f[5]
-        if (!((row, 1) in allocs) || !((row, 16) in allocs)) {
-            print "hotpath.sh: no counts for row " row > "/dev/stderr"
-            missing = 1
-            continue
-        }
-        # A gdl row can lose an allocation or two from some windows, so it reports its highest
-        # request. The dynamo rows report their typical request.
-        if (form == "gdl") {
-            a = high[row, 1]; a16 = high[row, 16]
-        } else {
-            a = allocs[row, 1]; a16 = allocs[row, 16]
-        }
-        r = instr[row, 1]; r16 = instr[row, 16]
-        range = low[row, 1] ".." high[row, 1] "," low[row, 16] ".." high[row, 16]
-        line = sprintf("%-12s %-6s %7d %11.2f %9d %10.0f %9d %10d  %-19s", pipeline, form,
-            a, (a16 - a) / 15, r, (r16 - r) / 15, a16, r16, range)
-        if (base == "") {
-            print line
-            continue
-        }
-        # Compare raw counts in whole numbers: a per-item figure is rounded for display, and
-        # its fifteenths are scaled up rather than divided.
-        d = r16 - r; b_d = b_instr16[key] - b_instr[key]
-        ri = d / 15; b_ri = b_d / 15
-        worse = a > b_allocs[key] || a16 > b_allocs16[key] \
-            || (r - b_instr[key]) * 100 > tolerance100(b_instr[key], pct, floor) \
-            || (d - b_d) * 100 > tolerance100(b_d, item_pct, item_floor * 15)
-        mark = ""
-        if (worse) { mark = form == "gdl" ? "WORSE" : "RISE"; marked++ }
-        print line sprintf("  %6s %9s %8s %10s  %s", change(a, b_allocs[key]),
-            change(a16, b_allocs16[key]), change(r, b_instr[key]),
-            sprintf("%+.0f", ri - b_ri), mark)
+        pct[f[1] " " f[2]] = f[4]; item_pct[f[1] " " f[2]] = f[5]
     }
-    if (missing) exit 2
-    if (marked) exit 1
-}' "$counts"
+}
+FILENAME == ARGV[1] && $1 == "row" { key = $2 " " $3; ba[key] = $4; ba16[key] = $5; br[key] = $6; br16[key] = $7; next }
+FILENAME == ARGV[1] { next }
+FILENAME == ARGV[2] && $1 == "row" { key = $2 " " $3; ha[key] = $4; ha16[key] = $5; hr[key] = $6; hr16[key] = $7; next }
+FILENAME == ARGV[2] { next }
+/^# hotpath / { print; print base_prov; next }
+/^pipeline / { printf "%s  %6s %9s %8s %10s  %s\n", $0, "change", "allocs@16", "instr", "instr/item", "mark"; next }
+/^$/ { next }
+{
+    key = $1 " " $2
+    a = ha[key]; a16 = ha16[key]; r = hr[key]; r16 = hr16[key]
+    # Per item in fifteenths: the per-item column is rounded for display.
+    d = r16 - r; b_d = br16[key] - br[key]
+    worse = a > ba[key] || a16 > ba16[key] \
+        || (r - br[key]) * 100 > tolerance100(br[key], pct[key], floor) \
+        || (d - b_d) * 100 > tolerance100(b_d, item_pct[key], item_floor * 15)
+    mark = ""
+    if (worse) { mark = $2 == "gdl" ? "WORSE" : "RISE"; marked++ }
+    printf "%s  %6s %9s %8s %10s  %s\n", $0, change(a, ba[key]), change(a16, ba16[key]),
+        change(r, br[key]), sprintf("%+.0f", (d - b_d) / 15), mark
+}
+END { if (marked) exit 1 }' "$work/base.parsed" "$work/head.parsed" "$work/head"

@@ -139,8 +139,14 @@ so the typical count moves between runs. `range` shows how far.
 With `--base`, the script marks a row `RISE` when the default path got worse and `WORSE` when a
 gdl row did, and exits 1 if it marked any row. A row gets worse when its allocations at 1 or at
 16 items rise at all, or when its instructions rise by more than the tolerance (see below). It
-compares the raw counts, not the rounded per-item figures. A base file that lacks any row
-of the table fails before any run.
+compares the raw counts, not the rounded per-item figures.
+
+The table's first line is its provenance: `# hotpath format=2 arch=x86_64 gdl=<rev>
+commit=<rev>`. One strict parser reads the base and the new table, and fails the run before
+any valgrind run on any line it cannot read in full: a stray line, a non-number in a count, a
+missing, extra or repeated row, or a base with another table format or arch. A base it could
+not read in full could let a rise pass. A table written with `--base` is a valid base. The
+commit and gdl rev are printed, not checked.
 
 `callgrind.sh` measures single rows, one run each, and prints raw counts:
 
