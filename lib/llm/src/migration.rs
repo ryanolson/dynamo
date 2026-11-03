@@ -61,7 +61,7 @@ impl HasTokenIds for BackendOutput {
         &self.token_ids
     }
     fn worker_trace_link(&self) -> Option<&crate::protocols::common::preprocessor::TraceLink> {
-        self.worker_trace_link.as_ref()
+        self.worker_trace_link.as_deref()
     }
     fn decoder_checkpoint(&self) -> Option<&DecoderCheckpoint> {
         self.jailed_text.as_ref()
@@ -76,7 +76,7 @@ impl HasTokenIds for LLMEngineOutput {
         &self.token_ids
     }
     fn worker_trace_link(&self) -> Option<&crate::protocols::common::preprocessor::TraceLink> {
-        self.worker_trace_link.as_ref()
+        self.worker_trace_link.as_deref()
     }
     fn decoder_checkpoint(&self) -> Option<&DecoderCheckpoint> {
         self.jailed_text.as_ref()
@@ -3735,7 +3735,7 @@ mod tests {
                         if i == start
                             && let (Some(link), Some(data)) = (&link, out.data.as_mut())
                         {
-                            data.worker_trace_link = Some(link.clone());
+                            data.worker_trace_link = Some(Box::new(link.clone()));
                         }
                         if tx.send(out).await.is_err() {
                             return;

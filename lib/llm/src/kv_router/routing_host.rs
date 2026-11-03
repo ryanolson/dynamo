@@ -838,11 +838,11 @@ impl RoutingHost {
             );
 
             let output = LLMEngineOutput {
-                routing_data: Some(RoutingData {
+                routing_data: Some(Box::new(RoutingData {
                     worker_id: worker_id_info,
                     token_ids: Some(request.token_ids.as_ref().clone()),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             };
             let response = Annotated::from_data(output);
