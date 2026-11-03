@@ -9,11 +9,12 @@
 //! the frontend composes it: `PipelineEngine` above, native stages, `EngineSink` below.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine as _;
-use dynamo_gdl_adapters::{EngineSink, PipelineEngine};
+use dynamo_gdl_adapters::{DynOperatorStage, EngineSink, PipelineEngine};
 use dynamo_llm::backend::Backend;
 use dynamo_llm::http::service::error::HttpError;
 use dynamo_llm::model_card::ModelDeploymentCard;
@@ -717,5 +718,89 @@ async fn embeddings_are_the_same_both_ways() {
         assert_eq!(g.len(), 1, "{format}: {g:?}");
         assert!(!g[0].is_error(), "{format}: {g:?}");
         assert_eq!(normalized(&d), normalized(&g), "{format}");
+    }
+}
+
+/// A Dynamo operator that, as the prefill router does during its handoff, holds its eager
+/// future until it sees the request's kill through its own context, and then cleans up.
+#[derive(Default)]
+struct Handoff {
+    entered: AtomicBool,
+    cleaned_up: AtomicBool,
+}
+
+#[async_trait]
+impl
+    Operator<
+        SingleIn<PreprocessedRequest>,
+        ManyOut<Annotated<LLMEngineOutput>>,
+        SingleIn<PreprocessedRequest>,
+        ManyOut<Annotated<LLMEngineOutput>>,
+    > for Handoff
+{
+    async fn generate(
+        &self,
+        request: SingleIn<PreprocessedRequest>,
+        _next: Engine<PreprocessedRequest, LLMEngineOutput>,
+    ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+        let context = request.context();
+        self.entered.store(true, Ordering::Release);
+        context.killed().await;
+        self.cleaned_up.store(true, Ordering::Release);
+        anyhow::bail!("killed during the handoff")
+    }
+}
+
+/// A kill of the caller's context while a Dynamo operator below the native preprocessor and
+/// Backend is in its handoff: the operator must still see the kill through its context and
+/// clean up. Its eager future must not be dropped by a gdl cancel first.
+#[tokio::test]
+#[ignore = "kill during a handoff below native stages: PipelineEngine maps the kill to a gdl cancel, and the hop drops the operator's future before its cleanup runs; fixed by the stop-only Cx for compositions of Dynamo operators"]
+async fn a_kill_during_a_handoff_below_the_native_stages_lets_it_clean_up() {
+    let fixture = Fixture::load();
+    for (way, at) in [("dynamo", 0), ("gdl", 1)] {
+        let handoff = Arc::new(Handoff::default());
+        let terminal: Engine<PreprocessedRequest, LLMEngineOutput> =
+            Script::new(Reply::Items(fixture.tokens("unused")));
+        let (preprocessor, backend) = (fixture.chat_preprocessor(), fixture.backend());
+        let engine: Engine<NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse> =
+            if at == 0 {
+                linked(
+                    preprocessor,
+                    linked::<_, _, BackendOutput, _, _>(
+                        backend,
+                        linked::<_, _, LLMEngineOutput, _, _>(handoff.clone(), terminal),
+                    ),
+                )
+            } else {
+                type Pre = PreprocessedRequest;
+                type Out = LLMEngineOutput;
+                let handoff_stage =
+                    DynOperatorStage::<_, Pre, Out, Pre, Out>::new(handoff.clone(), sink(terminal));
+                pipeline(native::<_, NvCreateChatCompletionRequest, _>(
+                    preprocessor,
+                    native::<_, PreprocessedRequest, _>(backend, Hop::new((), handoff_stage, ())),
+                ))
+            };
+        let request = request(chat(serde_json::json!({})));
+        let context = request.context();
+        let call = tokio::spawn(async move { engine.generate(request).await.map(|_| ()) });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !handoff.entered.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{way}: the handoff starts"));
+        context.kill();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .unwrap_or_else(|_| panic!("{way}: the call ends after the kill"))
+            .unwrap();
+        assert!(outcome.is_err(), "{way}: {outcome:?}");
+        assert!(
+            handoff.cleaned_up.load(Ordering::Acquire),
+            "{way}: the handoff's cleanup did not run"
+        );
     }
 }
