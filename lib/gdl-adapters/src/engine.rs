@@ -23,9 +23,9 @@ use crate::error::{exit, exit_item};
 ///
 /// Each call derives a fresh `Cx` from the request's context and passes the
 /// request on as it is: the gdl request type is Dynamo's `SingleIn<Req>`. The
-/// `Cx` follows the context's stop and, unless the pipeline's stages are
-/// Dynamo operators ([`for_dynamo_stages`](Self::for_dynamo_stages)), its
-/// kill (see [`CxBridge`]). The response stream carries the request's
+/// `Cx` follows the context's stop and, unless a Dynamo engine runs in the
+/// pipeline ([`for_dynamo_stages`](Self::for_dynamo_stages)), its kill (see
+/// [`CxBridge`]). The response stream carries the request's
 /// context, so a kill through the stream reaches the request.
 ///
 /// An eager error that entered gdl through an adapter leaves as the
@@ -53,9 +53,9 @@ impl<N, Req, T> PipelineEngine<N, Req, T> {
         }
     }
 
-    /// Wrap a gdl pipeline whose stages are Dynamo operators and engines: a
-    /// kill reaches them through the request's context only, so gdl does not
-    /// drop a call an operator is still finishing
+    /// Wrap a gdl pipeline with a Dynamo engine in it: a kill reaches the
+    /// engine through the request's context only, so gdl does not drop its
+    /// call, and the request ends as the engine ends it
     /// ([`CxBridge::cx_for_dynamo_stages`]).
     ///
     /// Transition: remove when no Dynamo stage runs inside a gdl pipeline.
@@ -99,7 +99,8 @@ where
 /// item, or with no item when it is a cancel of a request that was killed.
 ///
 /// A native gdl operator over Dynamo items reads its downstream through it,
-/// so it sees what a Dynamo operator sees from the same stages.
+/// so it sees what a Dynamo operator on Dynamo's `link` chain sees from the
+/// same stages.
 pub struct AnnotatedItems<T> {
     items: Option<Items<Annotated<T>>>,
     root: gdl::Cx,

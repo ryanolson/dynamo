@@ -940,7 +940,7 @@ mod tests {
     use super::*;
 
     /// Pipelines B and C on gdl are native gdl stages from the source to the terminal: no
-    /// Dynamo operator in an adapter, and no Dynamo engine at a boundary inside them.
+    /// Dynamo engine at a boundary inside them. The test's engine sits behind the terminal.
     #[test]
     fn routed_gdl_pipelines_are_native_from_source_to_terminal() {
         use crate::protocols::openai::chat_completions::NvCreateChatCompletionStreamResponse;
@@ -989,7 +989,7 @@ mod tests {
             ("b", std::any::type_name_of_val(&b)),
             ("c", std::any::type_name_of_val(&c)),
         ] {
-            for adapter in ["DynOperatorStage", "EngineSink", "PipelineEngine"] {
+            for adapter in ["EngineSink", "PipelineEngine"] {
                 assert!(
                     !pipeline.contains(adapter),
                     "{name} holds {adapter}: {pipeline}"

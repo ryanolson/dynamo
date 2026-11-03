@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use dynamo_gdl_adapters::{CxBridge, DynOperatorStage, EngineSink, PipelineEngine, REQUEST_ID};
+use dynamo_gdl_adapters::{CxBridge, EngineSink, PipelineEngine, REQUEST_ID};
 use dynamo_llm::discovery::ModelManager;
 use dynamo_llm::entrypoint::input::{
     LocalPipeline, PreprocessedRouting, build_embeddings_pipeline, build_pipeline,
@@ -391,23 +391,6 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, Out, Error> for Forbidden {
     }
 }
 
-/// An operator that calls `next` with the request it gets.
-struct Forward;
-
-#[async_trait]
-impl<Req: Data, T: Data>
-    Operator<SingleIn<Req>, ManyOut<Annotated<T>>, SingleIn<Req>, ManyOut<Annotated<T>>>
-    for Forward
-{
-    async fn generate(
-        &self,
-        request: SingleIn<Req>,
-        next: Arc<dyn AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, Error>>,
-    ) -> Result<ManyOut<Annotated<T>>, Error> {
-        next.generate(request).await
-    }
-}
-
 #[tokio::test]
 async fn an_engines_http_error_keeps_its_status_through_the_adapters() {
     type Req = NvCreateChatCompletionRequest;
@@ -422,11 +405,6 @@ async fn an_engines_http_error_keeps_its_status_through_the_adapters() {
         )
     };
     let direct = PipelineEngine::<_, Req, Resp>::new(Source::new(sink()));
-    let staged = PipelineEngine::<_, Req, Resp>::new(Source::new(Hop::new(
-        (),
-        DynOperatorStage::<_, Req, Resp, Req, Resp>::new(Arc::new(Forward), sink()),
-        (),
-    )));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -440,11 +418,6 @@ async fn an_engines_http_error_keeps_its_status_through_the_adapters() {
     service
         .model_manager()
         .add_chat_completions_model("direct", card.mdcsum(), Arc::new(direct))
-        .unwrap();
-    let card = ModelDeploymentCard::with_name_only("staged");
-    service
-        .model_manager()
-        .add_chat_completions_model("staged", card.mdcsum(), Arc::new(staged))
         .unwrap();
     // The whole routed pipeline on gdl, whose native Migration may retry: it must not keep the
     // terminal's eager error past its retry decision (see `tests/retained.rs`).
@@ -470,7 +443,7 @@ async fn an_engines_http_error_keeps_its_status_through_the_adapters() {
     .await
     .expect("the service is up");
 
-    for model in ["direct", "staged", "routed"] {
+    for model in ["direct", "routed"] {
         for stream in [true, false] {
             let response = client
                 .post(format!("{base}/v1/chat/completions"))
