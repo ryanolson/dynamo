@@ -1087,6 +1087,18 @@ mod tests {
                 EncodePushRouter::from_client_with_options(client, RouterMode::RoundRobin, options)
                     .await
                     .unwrap();
+            // The router's view of the instances can lag the client's: wait until it can
+            // select the worker, or the encode hop falls back without encoding.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while push
+                    .selectable_worker_ids()
+                    .map_or(true, |ids| ids.is_empty())
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the encode router sees its worker");
             let encoder = EncoderRouter::disabled();
             encoder.binding.store(Some(Arc::new(EncoderBinding {
                 target_id: WorkerSetTargetId::Legacy(endpoint.id()),
@@ -1227,6 +1239,17 @@ mod tests {
             EncodePushRouter::from_client_with_options(client, RouterMode::RoundRobin, options)
                 .await
                 .unwrap();
+        // As in the test above: without the wait, a missed view would make this pass unchecked.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while push
+                .selectable_worker_ids()
+                .map_or(true, |ids| ids.is_empty())
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the encode router sees its worker");
         let encoder = EncoderRouter::disabled();
         encoder.binding.store(Some(Arc::new(EncoderBinding {
             target_id: WorkerSetTargetId::Legacy(endpoint.id()),
