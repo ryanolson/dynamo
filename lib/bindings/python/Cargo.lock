@@ -3314,7 +3314,7 @@ dependencies = [
 [[package]]
 name = "gdl"
 version = "0.1.0"
-source = "git+https://github.com/ryanolson/gdl?rev=37864fbb59ceb3da04db3d2965dab3633430c283#37864fbb59ceb3da04db3d2965dab3633430c283"
+source = "git+https://github.com/ryanolson/gdl?rev=e91e40ae3888985b77b7026c5749ca5f075fee8e#e91e40ae3888985b77b7026c5749ca5f075fee8e"
 dependencies = [
  "arc-swap",
  "futures",
@@ -3330,13 +3330,12 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
- "tokio-util",
 ]
 
 [[package]]
 name = "gdl-macros"
 version = "0.1.0"
-source = "git+https://github.com/ryanolson/gdl?rev=37864fbb59ceb3da04db3d2965dab3633430c283#37864fbb59ceb3da04db3d2965dab3633430c283"
+source = "git+https://github.com/ryanolson/gdl?rev=e91e40ae3888985b77b7026c5749ca5f075fee8e#e91e40ae3888985b77b7026c5749ca5f075fee8e"
 dependencies = [
  "gdl-model",
  "gdl-syntax",
@@ -3348,7 +3347,7 @@ dependencies = [
 [[package]]
 name = "gdl-message"
 version = "0.1.0"
-source = "git+https://github.com/ryanolson/gdl?rev=37864fbb59ceb3da04db3d2965dab3633430c283#37864fbb59ceb3da04db3d2965dab3633430c283"
+source = "git+https://github.com/ryanolson/gdl?rev=e91e40ae3888985b77b7026c5749ca5f075fee8e#e91e40ae3888985b77b7026c5749ca5f075fee8e"
 dependencies = [
  "gdl-macros",
  "gdl-model",
@@ -3360,7 +3359,7 @@ dependencies = [
 [[package]]
 name = "gdl-model"
 version = "0.1.0"
-source = "git+https://github.com/ryanolson/gdl?rev=37864fbb59ceb3da04db3d2965dab3633430c283#37864fbb59ceb3da04db3d2965dab3633430c283"
+source = "git+https://github.com/ryanolson/gdl?rev=e91e40ae3888985b77b7026c5749ca5f075fee8e#e91e40ae3888985b77b7026c5749ca5f075fee8e"
 dependencies = [
  "serde",
  "serde_json",
@@ -3371,7 +3370,7 @@ dependencies = [
 [[package]]
 name = "gdl-pools"
 version = "0.1.0"
-source = "git+https://github.com/ryanolson/gdl?rev=37864fbb59ceb3da04db3d2965dab3633430c283#37864fbb59ceb3da04db3d2965dab3633430c283"
+source = "git+https://github.com/ryanolson/gdl?rev=e91e40ae3888985b77b7026c5749ca5f075fee8e#e91e40ae3888985b77b7026c5749ca5f075fee8e"
 dependencies = [
  "futures",
  "gdl-model",
@@ -3384,7 +3383,7 @@ dependencies = [
 [[package]]
 name = "gdl-syntax"
 version = "0.1.0"
-source = "git+https://github.com/ryanolson/gdl?rev=37864fbb59ceb3da04db3d2965dab3633430c283#37864fbb59ceb3da04db3d2965dab3633430c283"
+source = "git+https://github.com/ryanolson/gdl?rev=e91e40ae3888985b77b7026c5749ca5f075fee8e#e91e40ae3888985b77b7026c5749ca5f075fee8e"
 dependencies = [
  "gdl-model",
  "proc-macro2",

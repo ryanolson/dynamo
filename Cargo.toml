@@ -103,7 +103,7 @@ velo = { version = "=0.21.0", default-features = false }
 
 # gdl's node traits, without its runtime, which takes velo from git rather
 # than the crates.io release above.
-gdl = { git = "https://github.com/ryanolson/gdl", rev = "37864fbb59ceb3da04db3d2965dab3633430c283" }
+gdl = { git = "https://github.com/ryanolson/gdl", rev = "e91e40ae3888985b77b7026c5749ca5f075fee8e" }
 
 # External dependencies
 anyhow = { version = "1" }
