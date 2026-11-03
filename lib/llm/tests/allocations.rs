@@ -606,7 +606,10 @@ async fn measure_embed_engine(fixture: &Fixture, inputs: usize, requests: usize)
 async fn measure_embed(fixture: &Fixture, inputs: usize, requests: usize) -> Measured {
     let mut card = fixture.card.clone();
     card.model_type = ModelType::Embedding;
-    let pipeline = build_embeddings_pipeline(&card, embeddings_engine()).expect("pipeline embed");
+    let preprocessor =
+        OpenAIPreprocessor::new_for_embeddings(card.clone()).expect("embeddings preprocessor");
+    let pipeline = build_embeddings_pipeline(&card, preprocessor, embeddings_engine())
+        .expect("pipeline embed");
     measure("embed", inputs, requests, || {
         let pipeline = pipeline.clone();
         let request = embedding_request(inputs);
