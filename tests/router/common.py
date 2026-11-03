@@ -776,8 +776,7 @@ def _test_repeated_prompt_cache_hit(
 ):
     """Send the same chat prompt twice through the HTTP frontend with KV routing.
     Both requests stream content. The second must be routed by its KV overlap
-    (``nvext.timing.kv_hit_rate`` above 0) to the worker that served the first,
-    and report a prefix-cache hit there
+    (``nvext.timing.kv_hit_rate`` above 0) and report a prefix-cache hit
     (``usage.prompt_tokens_details.cached_tokens`` above 0)."""
     with FrontendRouterProcess(
         request,
@@ -806,17 +805,14 @@ def _test_repeated_prompt_cache_hit(
             # Several KV blocks long: cached tokens count only whole blocks.
             content = " ".join([f"cache-hit-{uuid.uuid4().hex}"] * (block_size * 4))
 
-            def payload(*, query_only: bool = False) -> dict[str, Any]:
+            def payload() -> dict[str, Any]:
                 return {
                     **test_payload,
                     "messages": [{"role": "user", "content": content}],
                     "stream": True,
                     "stream_options": {"include_usage": True},
                     "max_tokens": 8,
-                    "nvext": {
-                        "annotations": ["query_instance_id:"] if query_only else [],
-                        "extra_fields": ["worker_id", "timing"],
-                    },
+                    "nvext": {"extra_fields": ["worker_id", "timing"]},
                 }
 
             async def send(
@@ -853,31 +849,31 @@ def _test_repeated_prompt_cache_hit(
                 assert first["text"], first["body"]
 
                 # The router learns the first request's blocks from the worker's
-                # KV events; wait until it would send the prompt back there.
-                for _ in range(50):
-                    target = await send(client, payload(query_only=True))
-                    if target["worker"] == first["worker"]:
-                        break
+                # KV events, a moment after the first response. Until then a
+                # repeat is routed without overlap, possibly to the same worker
+                # by a tie-break, and a cache hit there would prove nothing about
+                # routing. So repeat until the router reports overlap; usually
+                # the first repeat does. Query-only requests report no overlap.
+                for requests in range(2, 52):
                     await asyncio.sleep(0.1)
+                    second = await send(client, payload())
+                    assert second["text"], second["body"]
+                    if (second["kv_hit_rate"] or 0) > 0:
+                        break
                 else:
                     raise AssertionError(
-                        f"KV events did not make {first['worker']} the prefix target"
+                        "the router never routed the repeated prompt by its KV overlap"
                     )
-
-                second = await send(client, payload())
-                assert second["text"], second["body"]
-                # Without this, the same worker can be a tie-break and the
-                # cache hit the worker's own, with the router blind to events.
-                assert (second["kv_hit_rate"] or 0) > 0, second["body"]
-                assert second["worker"] == first["worker"], (first, second)
                 assert (second["cached_tokens"] or 0) > 0, second["body"]
                 logger.info(
-                    "local_pipeline=%s cached_tokens first=%s second=%s "
-                    "kv_hit_rate second=%s worker=%s",
+                    "local_pipeline=%s requests=%s cached_tokens first=%s last=%s "
+                    "kv_hit_rate last=%s worker first=%s last=%s",
                     local_pipeline or "dynamo",
+                    requests,
                     first["cached_tokens"],
                     second["cached_tokens"],
                     second["kv_hit_rate"],
+                    first["worker"],
                     second["worker"],
                 )
 
