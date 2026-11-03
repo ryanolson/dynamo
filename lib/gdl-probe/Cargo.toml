@@ -1,0 +1,14 @@
+[package]
+name = "gdl-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Scratch probe: allocations and instructions per request through N pass-through stages, dynamo's link chain against gdl's local composition. Not for merge."
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+dynamo-runtime = { path = "../runtime" }
+futures = { workspace = true }
+gdl = { workspace = true }
+tokio = { workspace = true }

@@ -4039,6 +4039,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gdl-probe"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "dynamo-runtime",
+ "futures",
+ "gdl",
+ "tokio",
+]
+
+[[package]]
 name = "gdl-syntax"
 version = "0.1.0"
 source = "git+https://github.com/ryanolson/gdl?rev=37864fbb59ceb3da04db3d2965dab3633430c283#37864fbb59ceb3da04db3d2965dab3633430c283"

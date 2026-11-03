@@ -48,6 +48,7 @@ members = [
     "lib/bindings/python/codegen",
     "deploy/inference-gateway/ext-proc",
     "deploy/inference-gateway/sidecar",
+    "lib/gdl-probe",
 ]
 resolver = "3"
 
