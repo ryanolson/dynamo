@@ -16,6 +16,17 @@
 # Record counts from the `profiling` profile (release with symbols); debug counts mean little.
 # Callgrind runs all threads on one, so the totals include tokio's blocking pool, where the
 # preprocessor tokenizes.
+#
+# The script fails, naming the row and the valgrind log, when valgrind exits non-zero or its
+# log says the program died by a signal. A run that dies still writes a total, so a count
+# from such a run would be wrong.
+#
+# The gdl rows (b-gdl) died with SIGSEGV under valgrind, likely in rustix's auxv lookup.
+# Building with `--cfg rustix_use_libc` likely fixes it. RUSTFLAGS replaces the flags in
+# .cargo/config.toml, so copy your target's list from there and add the cfg. On x86_64:
+#   RUSTFLAGS="-C target-cpu=x86-64-v3 -C force-frame-pointers=yes --cfg tokio_unstable \
+#     --cfg rustix_use_libc" CARGO_TARGET_DIR=$PWD/target/valgrind lib/llm/benches/callgrind.sh
+# Changing RUSTFLAGS rebuilds every dependency, so give it its own CARGO_TARGET_DIR.
 
 set -euo pipefail
 
