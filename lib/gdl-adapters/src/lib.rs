@@ -10,6 +10,8 @@
 //! - [`EngineSink`]: a Dynamo engine as a gdl `Sink`.
 //! - [`PipelineEngine`]: a gdl `Next` as a Dynamo `AsyncEngine`.
 //! - [`DynOperatorStage`]: a Dynamo `Operator` as the inner end of a gdl `Hop`.
+//! - [`metrics`]: a gdl node's metrics on a Dynamo endpoint.
+//! - [`config`]: how a gdl node in Dynamo gets its configuration.
 //!
 //! A pipeline of Dynamo operators composed with gdl:
 //!
@@ -29,6 +31,9 @@
 //! This is the only Dynamo crate that depends on gdl, and it takes the `gdl`
 //! crate alone: gdl's runtime and code generator link velo from git, which
 //! Dynamo already takes from crates.io. `tests/dependencies.rs` keeps them out.
+
+pub mod config;
+pub mod metrics;
 
 mod bridge;
 mod engine;

@@ -25,7 +25,10 @@ tokio = { workspace = true }
 # this crate to compose its pipelines, and integration tests link this crate's
 # library as `dynamo-llm` does, so the dev-dependency cycle stays harmless.
 [dev-dependencies]
+dynamo-kv-router = { workspace = true }
 dynamo-llm = { workspace = true }
+dynamo-mocker = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
+temp-env = { version = "0.3.6", features = ["async_closure"] }
 uuid = { workspace = true }
