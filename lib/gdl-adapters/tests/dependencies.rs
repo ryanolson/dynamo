@@ -29,8 +29,11 @@ fn forbidden(line: &str) -> bool {
     is_velo && fields.any(|field| field.contains("://"))
 }
 
-/// Normal and build edges, on every target: a generator enters through
-/// `[build-dependencies]` and a transport may sit behind a `cfg`.
+/// Normal and build edges, on every target and with every feature: a
+/// generator enters through `[build-dependencies]`, and a transport may sit
+/// behind a `cfg` or an optional dependency. Not `--offline`: a cache filled
+/// by a host build lacks the packages only other targets use, and cargo tree
+/// must fetch them.
 #[test]
 fn links_no_git_velo_and_no_gdl_runtime() {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
@@ -43,10 +46,10 @@ fn links_no_git_velo_and_no_gdl_runtime() {
             "no-dev",
             "--target",
             "all",
+            "--all-features",
             "--prefix",
             "none",
             "--locked",
-            "--offline",
         ])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
