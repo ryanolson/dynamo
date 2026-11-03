@@ -17,6 +17,14 @@
 # Record counts from the `profiling` profile (release with symbols); debug counts mean little.
 # Callgrind runs all threads on one, so the totals include tokio's blocking pool, where the
 # preprocessor tokenizes.
+#
+# The gdl rows fault under valgrind in a default build: gdl's `Cx` reads the clock through
+# rustix's vDSO path, and valgrind does not map the vDSO. Build them with rustix's libc backend,
+# in a target dir of their own so the shared one keeps its flags, for example on aarch64:
+#   CARGO_TARGET_DIR=<scratch> RUSTFLAGS="-C target-cpu=neoverse-n1 -C force-frame-pointers=yes \
+#     --cfg tokio_unstable --cfg rustix_use_libc" lib/llm/benches/callgrind.sh
+# (RUSTFLAGS replaces the flags in .cargo/config.toml, so repeat them.) A run that dies under
+# valgrind fails the script instead of printing a count.
 
 set -euo pipefail
 
@@ -52,8 +60,14 @@ fi
 instructions() {
     local row=$1 items=$2 n=$3
     local out="$out_dir/$row-$items-$n.out"
-    valgrind --tool=callgrind --callgrind-out-file="$out" \
-        "$bin" row "$row" "$items" "$n" >/dev/null 2>"$out.log"
+    # A run that dies still writes its totals, and the difference of two dead runs looks like
+    # a count near zero.
+    if ! valgrind --tool=callgrind --callgrind-out-file="$out" \
+        "$bin" row "$row" "$items" "$n" >/dev/null 2>"$out.log" ||
+        grep -q 'Process terminating' "$out.log"; then
+        echo "callgrind.sh: $row $items failed under valgrind; see $out.log" >&2
+        return 1
+    fi
     awk '/^(summary|totals):/ { print $2; exit }' "$out"
 }
 
