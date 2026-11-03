@@ -18,15 +18,25 @@ use crate::{
     migration::Migration,
     model_card::ModelDeploymentCard,
     namespace::NamespaceFilter,
-    preprocessor::{OpenAIPreprocessor, prompt::prompt_formatter_from_mdc},
-    protocols::common::llm_backend::{BackendOutput, LLMEngineOutput, PreprocessedRequest},
+    preprocessor::{
+        OpenAIPreprocessor, PreprocessedEmbeddingRequest, prompt::prompt_formatter_from_mdc,
+    },
+    protocols::common::llm_backend::{
+        BackendOutput, EmbeddingsEngineOutput, LLMEngineOutput, PreprocessedRequest,
+    },
     request_template::RequestTemplate,
     session_affinity::{SessionAffinityMode, create_affinity_coordinator},
     types::{
         Annotated,
-        openai::chat_completions::{
-            NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse,
-            OpenAIChatCompletionsStreamingEngine,
+        openai::{
+            chat_completions::{
+                NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse,
+                OpenAIChatCompletionsStreamingEngine,
+            },
+            embeddings::{
+                NvCreateEmbeddingRequest, NvCreateEmbeddingResponse,
+                OpenAIEmbeddingsStreamingEngine,
+            },
         },
     },
 };
@@ -255,12 +265,11 @@ pub(crate) async fn build_preprocessed_routing_with_session_affinity_mode(
             .set_decode_routing_host(routing_host.clone())
             .context("install conditional-disagg decode RoutingHost")?;
     }
-    let backend_engine: ServiceEngine<_, _> = routing_host;
-    Ok(PreprocessedRouting {
-        backend_engine,
+    Ok(PreprocessedRouting::new(
+        routing_host,
         prefill_router,
         encoder_router,
-    })
+    ))
 }
 
 /// Turns an EngineConfig into an OpenAI chat-completions and completions supported StreamingEngine.
@@ -413,7 +422,51 @@ where
         .link_terminal(frontend)?)
 }
 
+/// Build the embeddings pipeline: preprocessor, then backend, then `engine`.
+pub fn build_embeddings_pipeline(
+    card: &ModelDeploymentCard,
+    engine: ServiceEngine<
+        SingleIn<PreprocessedEmbeddingRequest>,
+        ManyOut<Annotated<EmbeddingsEngineOutput>>,
+    >,
+) -> anyhow::Result<OpenAIEmbeddingsStreamingEngine> {
+    let frontend = SegmentSource::<
+        SingleIn<NvCreateEmbeddingRequest>,
+        ManyOut<Annotated<NvCreateEmbeddingResponse>>,
+    >::new();
+    let preprocessor = OpenAIPreprocessor::new_for_embeddings(card.clone())?.into_operator();
+    let backend = Backend::from_mdc(card).into_operator();
+    let service_backend = ServiceBackend::from_engine(engine);
+
+    Ok(frontend
+        .link(preprocessor.forward_edge())?
+        .link(backend.forward_edge())?
+        .link(service_backend)?
+        .link(backend.backward_edge())?
+        .link(preprocessor.backward_edge())?
+        .link_terminal(frontend)?)
+}
+
 impl PreprocessedRouting {
+    /// Route through `backend_engine` behind the given prefill and encoder routers.
+    ///
+    /// [`build_preprocessed_routing`] builds the backend engine (a `RoutingHost`) from a
+    /// discovery client; this takes any engine, so a test can stand in for the workers.
+    pub fn new(
+        backend_engine: ServiceEngine<
+            SingleIn<PreprocessedRequest>,
+            ManyOut<Annotated<LLMEngineOutput>>,
+        >,
+        prefill_router: Arc<PrefillRouter>,
+        encoder_router: Arc<EncoderRouter>,
+    ) -> Self {
+        Self {
+            backend_engine,
+            prefill_router,
+            encoder_router,
+        }
+    }
+
     /// The normal way to build an inference pipeline. Connect this directly to HTTP layer.
     pub fn build_pipeline<Req, Resp>(
         &self,
