@@ -46,6 +46,13 @@ transform, through the stream layers between the stages.
   1,008 and `Annotated<NvCreateChatCompletionStreamResponse>` 768. gdl's own boundaries copy no
   item; the copies are the stages' own transforms, and both forms pay them.
 
+- **After the in-place stages** (aarch64, `hotpath.sh --base` with `HOTPATH_RUNS=3`, 2026-11-03):
+  `memcpy` calls per extra item fell from 70.2 to 42.2 on `a`, 79.2 to 54.2 on `a-gdl`, 79.2 to
+  51.2 on `b` and 100.2 to 75.2 on `b-gdl`; instructions per extra item from 24,100 to 20,702 on
+  `a` (-14%). The copies left on `a` are Backend's decoder stream (7 per item), the
+  preprocessor's transform (5), the in-place edits (3), and string copies inside the tokenizer's
+  decode.
+
 - **Not covered:** the window starts where the HTTP handler calls the engine. HTTP parsing, the
   handler's request metrics and SSE encoding are outside it, and the reasoning and tool-call
   parsers are not on these rows.
