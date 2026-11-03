@@ -241,6 +241,19 @@ else
     fi
 fi
 
+# A base without readable counts must fail rather than pass an allocation rise.
+: >"$work/empty-base"
+awk '{ print $1, $2, $3, $4, $5, $6 }' "$work/base" >"$work/six-column-base"
+for base_case in empty six-column; do
+    FAKE_RISE_ROW=b FAKE_RISE_ALLOCS=1 \
+        run "$here/hotpath.sh" --base "$work/$base_case-base"
+    if [[ $status -eq 0 ]]; then
+        fail "base-$base_case" "accepted a base without comparable rows despite B dynamo gaining an allocation"
+    else
+        echo "ok hotpath.sh base-$base_case"
+    fi
+done
+
 if ((failures > 0)); then
     echo "$failures failed" >&2
     exit 1
