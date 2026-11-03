@@ -42,6 +42,11 @@
 //! for one name fail the whole `/metrics` render. An exposition-text callback
 //! reaches `/metrics` but not OTLP.
 //!
+//! A refused registration is not undone in full: Prometheus records the
+//! help and labels of each name it checked before the clash, for the life
+//! of the registry, so a later metric with one of those names on that
+//! endpoint must keep them. Treat a refusal as a startup error.
+//!
 //! What registration cannot see is a clash with a metric on another
 //! endpoint or another level of the hierarchy: a scrape merges them all, and
 //! one name with two help texts fails it. Dynamo's own metrics share that

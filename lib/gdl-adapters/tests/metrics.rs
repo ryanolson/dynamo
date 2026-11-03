@@ -414,3 +414,61 @@ async fn a_node_without_metrics_registers_on_any_endpoint() {
     metrics::register::<()>(&endpoint).expect("second");
     drt.shutdown();
 }
+
+/// A refused registration still fixes the help and labels of the type's
+/// earlier names on that endpoint. Prometheus checks a collector's
+/// descriptors one at a time and records each name's help and labels before
+/// it checks the next; it keeps them for the life of the registry, even
+/// through `unregister`, and has no way to check a descriptor without
+/// recording it. So nothing here can roll the record back. A refused
+/// registration is a startup error, so this matters only to a process that
+/// goes on after one: a later metric with an earlier field's name must
+/// keep that field's help and labels.
+#[tokio::test]
+async fn a_refused_registration_keeps_earlier_field_names() {
+    use dynamo_runtime::pipeline::network::ingress::push_handler::WorkHandlerMetrics;
+
+    #[derive(gdl::Metrics)]
+    struct PartlyClashingMetrics {
+        /// Batches waiting inside the node.
+        pending_batches: gdl::prometheus::IntGauge,
+        /// Bytes handled inside the node.
+        request_bytes_total: gdl::prometheus::IntCounter,
+    }
+
+    let drt = runtime().await;
+    let component = drt
+        .namespace("failed-registration")
+        .and_then(|ns| ns.component("worker"))
+        .expect("component");
+    let control = component.endpoint("control");
+    let healthy = metrics::register::<PartlyClashingMetrics>(&control).expect("no clash");
+    healthy.pending_batches.set(2);
+    healthy.request_bytes_total.inc();
+    component
+        .endpoint("native-control")
+        .metrics()
+        .create_intgauge("pending_batches", "Number of pending batches", &[])
+        .expect("the native descriptor is valid on a fresh endpoint")
+        .set(3);
+
+    let endpoint = component.endpoint("generate");
+    let handler = WorkHandlerMetrics::from_endpoint(&endpoint, None).expect("handler metrics");
+    handler.request_bytes.inc_by(17);
+    assert!(metrics::register::<PartlyClashingMetrics>(&endpoint).is_err());
+    let text = endpoint
+        .get_metrics_registry()
+        .prometheus_expfmt_combined()
+        .expect("text after refused registration");
+    assert!(samples(&text, "dynamo_component_pending_batches").is_empty());
+    let native = samples(&text, "dynamo_component_request_bytes_total");
+    assert_eq!(native.len(), 1, "{text}");
+    assert!(native[0].ends_with(" 17"), "{}", native[0]);
+
+    let registration =
+        endpoint
+            .metrics()
+            .create_intgauge("pending_batches", "Number of pending batches", &[]);
+    drt.shutdown();
+    assert!(registration.is_err(), "Prometheus no longer keeps the name");
+}
