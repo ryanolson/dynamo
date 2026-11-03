@@ -32,9 +32,10 @@
 //! Migration rebuilds the context of every attempt. Items stay `Annotated<T>`,
 //! so a Dynamo error item does not end a stream, while a gdl `Err` does.
 //!
-//! This is the only Dynamo crate that depends on gdl, and it takes the `gdl`
-//! crate alone: gdl's runtime and code generator link velo from git, which
-//! Dynamo already takes from crates.io. `tests/dependencies.rs` keeps them out.
+//! gdl enters Dynamo only here and in `dynamo-llm`'s gdl compositions and
+//! native operators, and both take the `gdl` crate alone: gdl's runtime and
+//! code generator link velo from git, which Dynamo already takes from
+//! crates.io. `tests/dependencies.rs` keeps them out of this crate.
 
 pub mod config;
 pub mod metrics;
