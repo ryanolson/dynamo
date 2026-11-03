@@ -20,7 +20,8 @@
 #
 # Counts: a row of name length L at I items makes L + I allocations, 1000 * L + 10 * I
 # instructions and 2 * L + I memcpy calls per request, plus FAKE_RISE_ALLOCS, FAKE_RISE_INSTR and
-# FAKE_RISE_MEMCPY for the row named FAKE_RISE_ROW. The window spreads the memcpy calls over
+# FAKE_RISE_MEMCPY for the row named FAKE_RISE_ROW. FAKE_RISE_WINDOW_MEMCPY adds calls once to
+# that row's measured window. The window spreads the memcpy calls over
 # glibc's aarch64 and x86_64 names, through `__memcpy_chk`, whose own call to memcpy is not
 # another move, and next to a call to a function whose name only contains "mem". The window of N requests holds N times the per-request instructions; the whole
 # run holds more, so reading it gives a wrong count. With FAKE_JITTER, a run after the first of
@@ -57,11 +58,13 @@ row=${args[$# - 3]} items=${args[$# - 2]}
 allocs=$((${#row} + items))
 per=$((1000 * ${#row} + 10 * items))
 moves=$((items))
+extra_moves=0
 if [[ $row == "${FAKE_RISE_ROW:-}" ]] \
     && [[ -z ${FAKE_RISE_ITEMS:-} || $items == "$FAKE_RISE_ITEMS" ]]; then
     allocs=$((allocs + ${FAKE_RISE_ALLOCS:-0}))
     per=$((per + ${FAKE_RISE_INSTR:-0}))
     moves=$((moves + ${FAKE_RISE_MEMCPY:-0}))
+    extra_moves=${FAKE_RISE_WINDOW_MEMCPY:-0}
 fi
 index=$(basename "$out")
 index=${index%%.*}
@@ -94,7 +97,7 @@ if [[ $mode != nowindow ]]; then
         echo "calls=$((${#row} * n)) 0"
         echo "0 10"
         echo "cfn=(5) __memmove_avx_unaligned_erms"
-        echo "calls=$((moves * n)) 0"
+        echo "calls=$((moves * n + extra_moves)) 0"
         echo "0 10"
     } >"$out.2"
 fi
@@ -224,6 +227,15 @@ for memcpy_case in "b B dynamo RISE" "a-gdl A gdl WORSE"; do
         echo "ok hotpath.sh memcpy-$rise_row"
     fi
 done
+
+# A single extra copy in the measured window must survive request-count normalization.
+FAKE_RISE_ROW=b FAKE_RISE_ITEMS=16 FAKE_RISE_WINDOW_MEMCPY=1 \
+    run "$here/hotpath.sh" --base "$work/base"
+if [[ $status -eq 0 ]]; then
+    fail memcpy-window-rise "the window gained one memcpy call across four requests (72 to 73), want non-zero exit; got exit 0"
+else
+    echo "ok hotpath.sh memcpy-window-rise"
+fi
 
 # A gdl row with more instructions than the tolerance: WORSE, exit 1.
 FAKE_RISE_ROW=c-gdl FAKE_RISE_INSTR=2000 run "$here/hotpath.sh" --base "$work/base"
