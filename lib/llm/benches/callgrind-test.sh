@@ -254,6 +254,16 @@ for base_case in empty six-column; do
     fi
 done
 
+# A truncated base cannot establish whether the missing row regressed.
+head -n 11 "$work/base" >"$work/truncated-base"
+FAKE_RISE_ROW=ingress FAKE_RISE_ALLOCS=1 \
+    run "$here/hotpath.sh" --base "$work/truncated-base"
+if [[ $status -eq 0 ]]; then
+    fail base-truncated "accepted a base missing ingress despite ingress gaining an allocation"
+else
+    echo "ok hotpath.sh base-truncated"
+fi
+
 # A rise equal to the instruction tolerance must pass, including fractional per-item counts.
 for boundary_case in "floor 62 750" "percent 37450 752"; do
     read -r boundary_name base_rise allowed_rise <<<"$boundary_case"
