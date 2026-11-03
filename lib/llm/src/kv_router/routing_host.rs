@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use dynamo_gdl_adapters::enter;
 use dynamo_kv_router::{
     protocols::{TokensWithHashes, WorkerConfigLike, WorkerWithDpRank},
     scheduling::{AbortCause, KvSchedulerError},
@@ -25,6 +26,7 @@ use dynamo_runtime::{
     },
     protocols::annotated::Annotated,
 };
+use futures::FutureExt;
 use futures::stream::{self, StreamExt};
 use tracing::Instrument;
 
@@ -721,7 +723,39 @@ impl RoutingHost {
 impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>, Error>
     for RoutingHost
 {
-    /// Generate a request through the selected routing plane.
+    /// Route and dispatch `request`, as [`RoutingHost::route`] describes.
+    async fn generate(
+        &self,
+        request: SingleIn<PreprocessedRequest>,
+    ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+        self.route(request).await
+    }
+}
+
+/// The host as the sink of a gdl local pipeline, over the same body as its Dynamo engine.
+///
+/// The request's Dynamo context carries its stop and kill to the dispatch, as it does for the
+/// engine. The sink's `cx` does not: gdl cancels it whenever its attempt ends, also when the
+/// response ends normally. An eager error enters gdl with the host's error as its source.
+impl gdl::Sink for RoutingHost {
+    type Req = SingleIn<PreprocessedRequest>;
+    type Item = Annotated<LLMEngineOutput>;
+
+    fn generate(
+        &self,
+        _cx: gdl::Cx,
+        request: SingleIn<PreprocessedRequest>,
+    ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<LLMEngineOutput>>>> + Send {
+        self.route(request).map(|result| match result {
+            Ok(stream) => Ok(gdl::items(stream.map(Ok))),
+            Err(error) => Err(enter(error)),
+        })
+    }
+}
+
+impl RoutingHost {
+    /// Route a request through the selected routing plane and dispatch it: the body of the
+    /// host's Dynamo engine and gdl sink.
     ///
     /// On the KV plane, `query_instance_id` performs an advisory selection:
     ///    - Returns the best matching worker ID without routing the request
@@ -744,7 +778,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
     ///
     /// The router state updates include tracking active sequences and managing
     /// prefill/completion lifecycle for proper KV cache management.
-    async fn generate(
+    async fn route(
         &self,
         request: SingleIn<PreprocessedRequest>,
     ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {

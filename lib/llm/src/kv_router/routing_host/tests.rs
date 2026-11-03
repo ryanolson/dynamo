@@ -5049,3 +5049,62 @@ async fn committed_session_lease_lives_as_long_as_the_response_stream() {
     drop(router);
     runtime.shutdown();
 }
+
+/// The host as the sink of a gdl local pipeline routes and dispatches as the host as a Dynamo
+/// engine does, and an eager error enters gdl with the host's error as its source.
+#[tokio::test]
+#[serial_test::serial]
+async fn the_host_as_a_gdl_sink_routes_as_the_dynamo_engine_does() {
+    use gdl::{Hop, SinkStage, Source};
+
+    let (router, dispatch, worker_id, runtime) =
+        router_with_recorded_dispatch("kv-gdl-sink-parity").await;
+    let router = Arc::new(router);
+    let pipeline = Source::new(Hop::new((), SinkStage::new(router.clone()), ()));
+
+    let engine: Vec<_> = AsyncEngine::generate(router.as_ref(), Context::new(request()))
+        .await
+        .unwrap()
+        .collect()
+        .await;
+    let sink: Vec<_> = pipeline
+        .call(gdl::Cx::new(), Context::new(request()))
+        .await
+        .unwrap()
+        .map(|item| item.expect("an Annotated item"))
+        .collect()
+        .await;
+    assert_eq!(
+        serde_json::to_value(&engine).unwrap(),
+        serde_json::to_value(&sink).unwrap()
+    );
+    assert_eq!(*dispatch.worker_ids.lock().unwrap(), [worker_id, worker_id]);
+
+    let pinned = || {
+        let mut request = request();
+        request.routing_mut().backend_instance_id = Some(worker_id + 1);
+        Context::new(request)
+    };
+    let engine = AsyncEngine::generate(router.as_ref(), pinned())
+        .await
+        .err()
+        .expect("an unknown pinned worker is refused");
+    let sink = pipeline
+        .call(gdl::Cx::new(), pinned())
+        .await
+        .err()
+        .expect("an unknown pinned worker is refused");
+    let mut chain =
+        std::iter::successors(Some(&sink as &(dyn std::error::Error + 'static)), |error| {
+            error.source()
+        });
+    assert!(
+        chain.any(|error| error.to_string() == engine.to_string()),
+        "{sink:?} does not carry {engine:#}"
+    );
+    assert_eq!(dispatch.worker_ids.lock().unwrap().len(), 2);
+
+    drop(pipeline);
+    drop(router);
+    runtime.shutdown();
+}
