@@ -751,6 +751,8 @@ impl gdl::Sink for RoutingHost {
         // inline, the route's future is moved through each stage above it, and in a debug
         // build every poll frame on the way keeps room for it: a routed pipeline then
         // overflows a tokio worker's 2 MiB stack (`routed_gdl_pipelines_reach_a_kv_routing_host`).
+        // Erased, it also ends the type the compiler walks to prove a routed pipeline `Send`,
+        // which is deeper than the default recursion limit with the route inside it.
         let route: Pin<Box<dyn Future<Output = Result<RouteResponse, Error>> + Send + '_>> =
             Box::pin(self.route(request));
         route.map(|result| match result {
