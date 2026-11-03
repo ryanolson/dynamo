@@ -15,6 +15,7 @@
 
 use std::future::Future;
 use std::marker::PhantomData;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use dynamo_gdl_adapters::{AnnotatedItems, CxBridge, PipelineEngine, enter};
@@ -273,10 +274,13 @@ impl<O, K> GdlOperator<O, K> {
 /// drops the operator's future. A panic in `work` resumes in the caller.
 ///
 /// Not an `async fn`: the task starts here, so the future the caller holds is the task's
-/// handle alone, not `work` as well.
+/// handle alone, not `work` as well. `work` is boxed, one allocation per call: a router's work
+/// holds the stages below it, and the task's future type would otherwise nest all of them
+/// inside tokio's task wrappers, deeper than the compiler's recursion limit.
 pub(crate) fn detached<T: Send + 'static>(
     work: impl Future<Output = anyhow::Result<T>> + Send + 'static,
 ) -> impl Future<Output = anyhow::Result<T>> + Send {
+    let work: Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send>> = Box::pin(work);
     let task = tokio::spawn(work.instrument(tracing::Span::current()));
     async move {
         match task.await {

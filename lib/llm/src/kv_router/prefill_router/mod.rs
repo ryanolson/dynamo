@@ -228,6 +228,20 @@ fn strip_terminal_disaggregated_params(
 /// a DECODE-mode worker to run prefill+decode locally.
 pub(crate) const BYPASS_REMOTE_PREFILL_ANNOTATION: &str = "x-bypass-remote-prefill";
 
+/// Remove a client-supplied bypass marker, and say whether there was one.
+///
+/// Conditional-disagg bypass is a router-owned decision. Drop any client-supplied marker before
+/// the policy runs so normal disagg requests cannot accidentally or maliciously skip remote
+/// prefill. A client that lists the marker in `nvext.annotations` is only asking to be told
+/// when the bypass happens (like `request_id`), so the caller remembers that.
+fn remove_bypass_marker(request: &mut PreprocessedRequest) -> bool {
+    let annotations_before = request.annotations.len();
+    request
+        .annotations
+        .retain(|annotation| annotation != BYPASS_REMOTE_PREFILL_ANNOTATION);
+    request.annotations.len() != annotations_before
+}
+
 /// PrefillRouter is a forward-only operator that sits between Migration and the decode router.
 /// It optionally calls a prefill worker before routing to decode, extracting disaggregated_params
 /// from the prefill response and injecting them into the decode request.
@@ -433,21 +447,41 @@ impl gdl::Operator for GdlOperator<PrefillRouter, PreprocessedRequest> {
         let next = GdlDownstream::new(cx, next);
         async move {
             let query_only = request.get_annotation_value("query_instance_id").is_some();
-            let gate = router.gate(query_only);
-            if gate != PrefillGate::Prefill {
-                return router.route(request, next, Some(gate)).await;
+            // Only the remote-prefill path runs the route, in a task of its own: a request
+            // that passes through goes on here, so this future does not hold the route.
+            match router.gate(query_only) {
+                PrefillGate::PassThrough => {
+                    let (mut req, context) = request.into_parts();
+                    remove_bypass_marker(&mut req);
+                    next.forward(context.map(|_| req)).await
+                }
+                PrefillGate::Pending => Err(router.reject_while_activating(request.id())),
+                // Remote prefill stages KV on the prefill worker that only the decode leg
+                // releases, and gdl drops this future when a kill cancels the request's `cx`.
+                // So the route runs as a task that the drop detaches, and its decode leg runs
+                // under a cleanup `Cx` that the kill does not cancel (`send_cleanup`).
+                gate @ PrefillGate::Prefill => {
+                    detached(async move { router.route(request, next, Some(gate)).await }).await
+                }
             }
-            // Remote prefill stages KV on the prefill worker that only the decode leg
-            // releases, and gdl drops this future when a kill cancels the request's `cx`.
-            // So the route runs as a task that the drop detaches, and its decode leg runs
-            // under a cleanup `Cx` that the kill does not cancel (`send_cleanup`).
-            detached(async move { router.route(request, next, Some(gate)).await }).await
         }
         .map(native)
     }
 }
 
 impl PrefillRouter {
+    /// The error for a request that arrives while the prefill target is still activating.
+    fn reject_while_activating(&self, request_id: &str) -> anyhow::Error {
+        tracing::debug!(
+            request_id = %request_id,
+            model_name = %self.model_name,
+            namespace = %self.namespace,
+            "Prefill router target is still activating; rejecting request instead of \
+             forwarding it to decode without a prefill hop"
+        );
+        prefill_activation_pending_error(&self.model_name, &self.namespace)
+    }
+
     /// What the router does with a request, read once from its activation state.
     fn gate(&self, query_only: bool) -> PrefillGate {
         // Hot path: an active router with a published binding never takes the
@@ -503,16 +537,7 @@ impl PrefillRouter {
         let request_id = context.id().to_string();
         let engine_ctx = context.context();
 
-        // Conditional-disagg bypass is a router-owned decision. Drop any
-        // client-supplied marker before the policy runs so normal disagg
-        // requests cannot accidentally or maliciously skip remote prefill.
-        // A client that lists the marker in `nvext.annotations` is only asking
-        // to be told when the bypass happens (like `request_id`), so remember
-        // that before the marker is removed.
-        let annotations_before = req.annotations.len();
-        req.annotations
-            .retain(|annotation| annotation != BYPASS_REMOTE_PREFILL_ANNOTATION);
-        let client_requested_bypass_marker = req.annotations.len() != annotations_before;
+        let client_requested_bypass_marker = remove_bypass_marker(&mut req);
 
         // Save original max_tokens for decode
         let original_max_tokens = req.stop_conditions.max_tokens;
@@ -524,19 +549,7 @@ impl PrefillRouter {
         });
         match gate {
             PrefillGate::Prefill => {}
-            PrefillGate::Pending => {
-                tracing::debug!(
-                    request_id = %request_id,
-                    model_name = %self.model_name,
-                    namespace = %self.namespace,
-                    "Prefill router target is still activating; rejecting request instead of \
-                     forwarding it to decode without a prefill hop"
-                );
-                return Err(prefill_activation_pending_error(
-                    &self.model_name,
-                    &self.namespace,
-                ));
-            }
+            PrefillGate::Pending => return Err(self.reject_while_activating(&request_id)),
             PrefillGate::PassThrough => return next.forward(context.map(|_| req)).await,
         }
 
