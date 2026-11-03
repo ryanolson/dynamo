@@ -15,7 +15,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use dynamo_gdl_adapters::{AnnotatedItems, CxBridge, DynOperatorStage, EngineSink, PipelineEngine};
+use dynamo_gdl_adapters::{AnnotatedItems, CxBridge, EngineSink, PipelineEngine};
 use dynamo_runtime::engine::{AsyncEngine, ResponseStream};
 use dynamo_runtime::pipeline::{
     AsyncEngineContextProvider, Context, Error, ManyOut, Operator, ServiceBackend, ServiceFrontend,
@@ -161,31 +161,6 @@ fn link(stages: usize, engine: Engine) -> Engine {
     backward.link_terminal(frontend).unwrap()
 }
 
-/// `stages` adapted operators above an adapted engine. Each stage is a type
-/// of its own, so the composition is built by recursion on a const.
-///
-/// Transition: remove when Migration and the encoder and prefill routers run as native gdl stages.
-fn adapted(stages: usize, engine: Engine) -> Engine {
-    fn wrap<N: gdl::Next<SingleIn<u32>, Annotated<u32>>>(next: N) -> Engine {
-        Arc::new(PipelineEngine::<_, u32, u32>::new(next))
-    }
-    fn stage<H: gdl::Next<SingleIn<u32>, Annotated<u32>>>(
-        hop: H,
-    ) -> Hop<(), DynOperatorStage<Identity, u32, u32, u32, u32>, ()> {
-        Hop::new((), DynOperatorStage::new(Arc::new(Identity), hop), ())
-    }
-    let sink = Hop::new((), SinkStage::new(Arc::new(EngineSink::new(engine))), ());
-    match stages {
-        0 => wrap(Source::new(sink)),
-        1 => wrap(Source::new(stage(sink))),
-        2 => wrap(Source::new(stage(stage(sink)))),
-        3 => wrap(Source::new(stage(stage(stage(sink))))),
-        4 => wrap(Source::new(stage(stage(stage(stage(sink)))))),
-        5 => wrap(Source::new(stage(stage(stage(stage(stage(sink))))))),
-        _ => unreachable!("up to {MAX_STAGES} stages"),
-    }
-}
-
 /// `stages` native gdl operators above an adapted engine.
 fn native(stages: usize, engine: Engine) -> Engine {
     fn wrap<N: gdl::Next<SingleIn<u32>, Annotated<u32>>>(next: N) -> Engine {
@@ -251,37 +226,27 @@ fn allocations_per_request() {
         .build()
         .unwrap();
 
-    println!(
-        "items stages | engine | link: allocs reallocs bytes | adapted: allocs reallocs bytes | native: allocs reallocs bytes"
-    );
-    let mut adapted_by_items = Vec::new();
+    println!("items stages | engine | link: allocs reallocs bytes | native: allocs reallocs bytes");
     let mut native_by_items = Vec::new();
     for items in [1, 16] {
         let engine: Engine = Arc::new(Repeat(items));
         let alone = measure(&runtime, &engine);
-        let mut row = Vec::new();
         let mut native_row = Vec::new();
         for stages in 0..=MAX_STAGES {
             let linked = measure(&runtime, &link(stages, engine.clone()));
-            let composed = measure(&runtime, &adapted(stages, engine.clone()));
             let natively = measure(&runtime, &native(stages, engine.clone()));
             println!(
-                "{items:>5} {stages:>6} | {:>6.1} | {:>6.1} {:>4.1} {:>7.0} | {:>6.1} {:>4.1} {:>7.0} | {:>6.1} {:>4.1} {:>7.0}",
+                "{items:>5} {stages:>6} | {:>6.1} | {:>6.1} {:>4.1} {:>7.0} | {:>6.1} {:>4.1} {:>7.0}",
                 alone.allocations,
                 linked.allocations,
                 linked.reallocations,
                 linked.bytes,
-                composed.allocations,
-                composed.reallocations,
-                composed.bytes,
                 natively.allocations,
                 natively.reallocations,
                 natively.bytes,
             );
-            row.push(composed);
             native_row.push(natively);
         }
-        adapted_by_items.push(row);
         native_by_items.push(native_row);
     }
 
@@ -303,9 +268,7 @@ fn allocations_per_request() {
 
     // Nothing in the adapters or a native stage allocates per item: 16 items cost what 1 does
     // on top of what the engine's own items cost, which `Repeat` keeps at none.
-    let ones = adapted_by_items[0].iter().chain(&native_by_items[0]);
-    let sixteens = adapted_by_items[1].iter().chain(&native_by_items[1]);
-    for (one, sixteen) in ones.zip(sixteens) {
+    for (one, sixteen) in native_by_items[0].iter().zip(&native_by_items[1]) {
         assert!(
             (one.allocations - sixteen.allocations).abs() < 0.5,
             "per-item allocation: {one:?} against {sixteen:?}"

@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Backend and the preprocessor as Dynamo operators and as native gdl operators.
+//! Dynamo's operators as Dynamo operators and as native gdl operators: Backend, the
+//! preprocessor, Migration, and the encoder and prefill routers.
 //!
 //! Each operator has one body, generic over [`Downstream`]: how it calls the stage below it.
 //! Its Dynamo `Operator` impl passes the `Arc<dyn AsyncEngine>` it is given, and its gdl
@@ -14,13 +15,15 @@
 
 use std::future::Future;
 use std::marker::PhantomData;
+use std::pin::Pin;
 use std::sync::Arc;
 
-use dynamo_gdl_adapters::{AnnotatedItems, PipelineEngine, enter};
+use dynamo_gdl_adapters::{AnnotatedItems, CxBridge, PipelineEngine, enter};
 use dynamo_runtime::engine::{AsyncEngine, AsyncEngineContext, Data, ResponseStream};
 use dynamo_runtime::pipeline::{AsyncEngineContextProvider, Error, ManyOut, SingleIn};
 use dynamo_runtime::protocols::annotated::Annotated;
 use futures::{FutureExt, Stream, StreamExt};
+use tracing::Instrument;
 
 /// The stage below an operator, as the operator's body calls it.
 ///
@@ -35,6 +38,24 @@ pub(crate) trait Downstream<Req: Data, T: Data>: Send + Sync {
     /// Not named `generate`: on an `Arc<dyn AsyncEngine>` that name would shadow the engine's
     /// own wherever this trait is in scope.
     fn send(
+        &self,
+        request: SingleIn<Req>,
+    ) -> impl Future<Output = anyhow::Result<Self::Stream>> + Send;
+
+    /// Send `request` on and answer with the response of the stage below as it is, for an
+    /// operator that adds nothing to it. On gdl this reads no item, where [`send`](Self::send)
+    /// and [`respond`](Self::respond) would add a layer.
+    fn forward(
+        &self,
+        request: SingleIn<Req>,
+    ) -> impl Future<Output = anyhow::Result<Self::Response<T>>> + Send;
+
+    /// Send `request` on in a call that a kill of the request does not end: the leg that
+    /// releases what a worker below holds for the request, such as the prefill router's decode
+    /// leg after a KV handoff. The stage below still sees the kill through the request's
+    /// context. On gdl the call runs under a root `Cx` of its own, since a cancel of the
+    /// request's `cx` would refuse it.
+    fn send_cleanup(
         &self,
         request: SingleIn<Req>,
     ) -> impl Future<Output = anyhow::Result<Self::Stream>> + Send;
@@ -55,6 +76,17 @@ pub(crate) trait Downstream<Req: Data, T: Data>: Send + Sync {
     where
         U: Data,
         S: Stream<Item = Annotated<U>> + Send + 'static;
+
+    /// A stream from [`send`](Self::send) as the operator's response, unchanged.
+    ///
+    /// Transition: remove when the gdl pipeline is the only local pipeline.
+    fn pass(stream: Self::Stream) -> Self::Response<T>;
+
+    /// The response stream of a Dynamo engine that the operator calls itself, not through the
+    /// stage below, as the operator's response.
+    ///
+    /// Transition: remove when the gdl pipeline is the only local pipeline.
+    fn adopt<U: Data>(stream: ManyOut<Annotated<U>>) -> Self::Response<U>;
 }
 
 /// Dynamo's `next`, as a Dynamo operator's body calls it.
@@ -80,6 +112,20 @@ impl<Req: Data, T: Data> Downstream<Req, T> for DynamoDownstream<Req, T> {
         self.0.generate(request)
     }
 
+    fn forward(
+        &self,
+        request: SingleIn<Req>,
+    ) -> impl Future<Output = anyhow::Result<Self::Response<T>>> + Send {
+        self.0.generate(request)
+    }
+
+    fn send_cleanup(
+        &self,
+        request: SingleIn<Req>,
+    ) -> impl Future<Output = anyhow::Result<Self::Stream>> + Send {
+        self.0.generate(request)
+    }
+
     fn engine(&self) -> Arc<dyn AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, Error>> {
         Arc::clone(&self.0)
     }
@@ -92,6 +138,14 @@ impl<Req: Data, T: Data> Downstream<Req, T> for DynamoDownstream<Req, T> {
         S: Stream<Item = Annotated<U>> + Send + 'static,
     {
         ResponseStream::new(Box::pin(stream), context)
+    }
+
+    fn pass(stream: ManyOut<Annotated<T>>) -> ManyOut<Annotated<T>> {
+        stream
+    }
+
+    fn adopt<U: Data>(stream: ManyOut<Annotated<U>>) -> ManyOut<Annotated<U>> {
+        stream
     }
 }
 
@@ -119,25 +173,33 @@ where
         &self,
         request: SingleIn<Req>,
     ) -> impl Future<Output = anyhow::Result<Self::Stream>> + Send {
-        // The stream gives the request's own context: the stages below are Dynamo's, or keep
-        // its stop and kill, so a stop sent to it reaches them, where a stop of `cx` would not.
-        let context = request.context();
-        let root = self.cx.clone();
-        self.next
-            .generate(self.cx.clone(), request)
-            .map(move |result| match result {
-                Ok(items) => Ok(AnnotatedItems::new(items, root, context)),
-                // Carried as itself, so `native` gives back the same `gdl::Error`.
-                Err(error) => Err(anyhow::Error::new(error)),
-            })
+        self.send_under(self.cx.clone(), request)
     }
 
-    /// Transition: root with `PipelineEngine::new` when Migration and the encoder and prefill
-    /// routers run as native gdl stages.
+    fn forward(
+        &self,
+        request: SingleIn<Req>,
+    ) -> impl Future<Output = anyhow::Result<Self::Response<T>>> + Send {
+        // Carried as itself, so `native` gives back the same `gdl::Error`.
+        self.next
+            .generate(self.cx.clone(), request)
+            .map(|result| result.map_err(anyhow::Error::new))
+    }
+
+    fn send_cleanup(
+        &self,
+        request: SingleIn<Req>,
+    ) -> impl Future<Output = anyhow::Result<Self::Stream>> + Send {
+        let cx = CxBridge::cx_for_cleanup(request.context().as_ref());
+        self.send_under(cx, request)
+    }
+
+    /// Transition: root with `PipelineEngine::new` when no Dynamo engine runs inside a gdl
+    /// pipeline.
     fn engine(&self) -> Arc<dyn AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, Error>> {
         // Each call derives a fresh root `Cx`: the request's `cx` is cancelled once its
-        // response ends. The stages below are Dynamo's, so a kill reaches them through the
-        // request's context, not a cancel that would drop a call one is still finishing.
+        // response ends. Below the preprocessor of pipeline A is a Dynamo engine, so a kill
+        // reaches it through the request's context, not a cancel that would drop its call.
         Arc::new(PipelineEngine::for_dynamo_stages(self.next.clone()))
     }
 
@@ -150,24 +212,81 @@ where
     {
         gdl::items(stream.map(Ok))
     }
+
+    fn pass(stream: AnnotatedItems<T>) -> gdl::Items<Annotated<T>> {
+        gdl::items(stream.map(Ok))
+    }
+
+    fn adopt<U: Data>(stream: ManyOut<Annotated<U>>) -> gdl::Items<Annotated<U>> {
+        gdl::items(stream.map(Ok))
+    }
 }
 
-/// A Dynamo operator `O` as a native gdl `Operator` for requests of type `Req`.
+impl<N> GdlDownstream<N> {
+    /// Send `request` on under `cx` and read the response as a Dynamo stream.
+    fn send_under<Req, T>(
+        &self,
+        cx: gdl::Cx,
+        request: SingleIn<Req>,
+    ) -> impl Future<Output = anyhow::Result<AnnotatedItems<T>>> + Send
+    where
+        N: gdl::Next<SingleIn<Req>, Annotated<T>>,
+        Req: Data,
+        T: Data,
+    {
+        // The stream gives the request's own context: the stages below are Dynamo's, or keep
+        // its stop and kill, so a stop sent to it reaches them, where a stop of `cx` would not.
+        let context = request.context();
+        let root = cx.clone();
+        self.next
+            .generate(cx, request)
+            .map(move |result| match result {
+                Ok(items) => Ok(AnnotatedItems::new(items, root, context)),
+                // Carried as itself, so `native` gives back the same `gdl::Error`.
+                Err(error) => Err(anyhow::Error::new(error)),
+            })
+    }
+}
+
+/// A Dynamo operator `O` as a native gdl `Operator`, keyed by `K`.
 ///
-/// gdl's `Operator` names its request and item types, so an operator that serves several
-/// request types, as Backend and the preprocessor do, is one gdl operator per type. Build it
-/// once, at composition.
-pub struct GdlOperator<O, Req> {
+/// gdl's `Operator` names its request and item types, so an operator that serves several of
+/// them is one gdl operator per type, and `K` names the type that tells them apart: the
+/// request for Backend and the preprocessor, the item for Migration. An operator with one impl
+/// takes its request type. Build it once, at composition.
+pub struct GdlOperator<O, K> {
     pub(crate) op: Arc<O>,
-    req: PhantomData<fn(Req)>,
+    key: PhantomData<fn(K)>,
 }
 
-impl<O, Req> GdlOperator<O, Req> {
-    /// `op` as a gdl operator for `Req`, for an `OperatorStage`.
+impl<O, K> GdlOperator<O, K> {
+    /// `op` as a gdl operator for `K`, for an `OperatorStage`.
     pub fn new(op: Arc<O>) -> Self {
         Self {
             op,
-            req: PhantomData,
+            key: PhantomData,
+        }
+    }
+}
+
+/// Run `work` as a task that a drop of the caller's future detaches rather than cancels, and
+/// wait for its result: for a native operator whose work must outlive a gdl cancel, which
+/// drops the operator's future. A panic in `work` resumes in the caller.
+///
+/// Not an `async fn`: the task starts here, so the future the caller holds is the task's
+/// handle alone, not `work` as well. `work` is boxed, one allocation per call: a router's work
+/// holds the stages below it, and the task's future type would otherwise nest all of them
+/// inside tokio's task wrappers, deeper than the compiler's recursion limit.
+pub(crate) fn detached<T: Send + 'static>(
+    work: impl Future<Output = anyhow::Result<T>> + Send + 'static,
+) -> impl Future<Output = anyhow::Result<T>> + Send {
+    let work: Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send>> = Box::pin(work);
+    let task = tokio::spawn(work.instrument(tracing::Span::current()));
+    async move {
+        match task.await {
+            Ok(result) => result,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => Err(anyhow::Error::new(error).context("detached operator task ended")),
         }
     }
 }
