@@ -414,10 +414,13 @@ impl gdl::Operator for GdlOperator<EncoderRouter, PreprocessedRequest> {
         let router = Arc::clone(&self.op);
         let next = GdlDownstream::new(cx, next);
         async move {
+            // Decided once: a request this does not send to encode goes on at once, and not
+            // through the body, which would read the lifecycle again and could encode inline
+            // if the router turned active in between.
             if router.lifecycle_state() != EncoderLifecycleState::Active
                 || !EncoderRouter::should_encode(&request)
             {
-                return router.encode(request, next).await;
+                return next.forward(request).await;
             }
             // The encode worker's transfer handle must reach the stage below, and gdl drops
             // this future when a kill cancels the request's `cx`. So the encode runs as a task
@@ -1126,5 +1129,166 @@ mod tests {
 
         let handed_on = vec![Some(json!({"handle": "staged-embeddings"}))];
         assert_eq!(seen, [("dynamo", handed_on.clone()), ("gdl", handed_on)]);
+    }
+
+    /// Discovery may activate the encoder between the native shim and its body. An encode
+    /// started in that interval must still hand its transfer handle on after a kill.
+    /// The bounded race probe can pass if the scheduler never produces that interleaving.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activation_during_native_entry_preserves_the_encode_handoff() {
+        use dynamo_gdl_adapters::{CxBridge, EngineSink};
+        use dynamo_runtime::pipeline::PushRouterOptions;
+        use gdl::{Hop, Next, OperatorStage, SinkStage};
+        use std::sync::atomic::AtomicBool;
+
+        struct KillInlineEncode {
+            caller: Arc<Mutex<Option<Arc<dyn dynamo_runtime::pipeline::AsyncEngineContext>>>>,
+            caller_task: Option<tokio::task::Id>,
+            inline: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl
+            dynamo_runtime::pipeline::StreamingDispatch<
+                PreprocessedRequest,
+                Annotated<LLMEngineOutput>,
+            > for KillInlineEncode
+        {
+            async fn generate(
+                &self,
+                request: SingleIn<dynamo_runtime::pipeline::AddressedRequest<PreprocessedRequest>>,
+            ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+                let caller = (tokio::task::try_id() == self.caller_task).then(|| {
+                    self.inline.store(true, Ordering::Release);
+                    self.caller.lock().unwrap().as_ref().unwrap().clone()
+                });
+                let terminal = stream::once(async move {
+                    let output = Annotated::from_data(LLMEngineOutput::encode_terminal(
+                        json!({"handle": "activated-embeddings"})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ));
+                    if let Some(caller) = caller {
+                        caller.kill();
+                        tokio::task::yield_now().await;
+                    }
+                    output
+                });
+                Ok(ResponseStream::new(Box::pin(terminal), request.context()))
+            }
+
+            async fn generate_bidirectional(
+                &self,
+                _: dynamo_runtime::component::Instance,
+                _: String,
+                _: dynamo_runtime::pipeline::ManyIn<PreprocessedRequest>,
+            ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+                unreachable!("the encode hop dispatches a single request")
+            }
+        }
+
+        struct Flipper {
+            running: Arc<AtomicBool>,
+            thread: Option<std::thread::JoinHandle<()>>,
+        }
+        impl Drop for Flipper {
+            fn drop(&mut self) {
+                self.running.store(false, Ordering::Release);
+                self.thread.take().unwrap().join().unwrap();
+            }
+        }
+
+        let runtime = Runtime::from_current().unwrap();
+        let distributed =
+            DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+                .await
+                .unwrap();
+        let endpoint = distributed
+            .namespace("encoder-activation-entry")
+            .unwrap()
+            .component("workers")
+            .unwrap()
+            .endpoint("encode");
+        let client = endpoint.client().await.unwrap();
+        endpoint.register_endpoint_instance().await.unwrap();
+        client.wait_for_instances().await.unwrap();
+        let caller = Arc::new(Mutex::new(None));
+        let inline = Arc::new(AtomicBool::new(false));
+        let options = PushRouterOptions {
+            dispatch: Some(Arc::new(KillInlineEncode {
+                caller: caller.clone(),
+                caller_task: tokio::task::try_id(),
+                inline: inline.clone(),
+            }) as Arc<_>),
+            ..Default::default()
+        };
+        let push =
+            EncodePushRouter::from_client_with_options(client, RouterMode::RoundRobin, options)
+                .await
+                .unwrap();
+        let encoder = EncoderRouter::disabled();
+        encoder.binding.store(Some(Arc::new(EncoderBinding {
+            target_id: WorkerSetTargetId::Legacy(endpoint.id()),
+            router: Arc::new(push),
+        })));
+        let target = WorkerSetTarget::Legacy(endpoint);
+        encoder.set_target(Some(target.clone()));
+        let receiver = Arc::new(HandleReceiver::default());
+        let next = Hop::new(
+            (),
+            SinkStage::new(Arc::new(EngineSink::new(receiver.clone()))),
+            (),
+        );
+        let pipeline = Hop::new(
+            (),
+            OperatorStage::new(
+                Arc::new(GdlOperator::<_, PreprocessedRequest>::new(encoder.clone())),
+                next,
+            ),
+            (),
+        );
+        let running = Arc::new(AtomicBool::new(true));
+        let flipper = Flipper {
+            running: running.clone(),
+            thread: Some(std::thread::spawn(move || {
+                while running.load(Ordering::Acquire) {
+                    encoder.set_target(None);
+                    for _ in 0..16 {
+                        std::hint::spin_loop();
+                    }
+                    encoder.set_target(Some(target.clone()));
+                    for _ in 0..16 {
+                        std::hint::spin_loop();
+                    }
+                }
+            })),
+        };
+
+        let mut raced_at = None;
+        // Without the fix the interleaving came within the first few hundred attempts.
+        for attempt in 0..2_000 {
+            receiver.results.lock().unwrap().clear();
+            let request = Context::new(multimodal_request());
+            *caller.lock().unwrap() = Some(request.context());
+            let cx = CxBridge::cx(request.controller());
+            if let Ok(items) = pipeline.generate(cx, request).await {
+                let _: Vec<_> = items.collect().await;
+            }
+            if inline.load(Ordering::Acquire) {
+                raced_at = Some(attempt);
+                break;
+            }
+        }
+        drop(flipper);
+        let handed_on = receiver.results.lock().unwrap().clone();
+        runtime.shutdown();
+        if let Some(attempt) = raced_at {
+            assert_eq!(
+                handed_on,
+                [Some(json!({"handle": "activated-embeddings"}))],
+                "activation started encode inline on attempt {attempt}; the kill lost its handoff"
+            );
+        }
     }
 }
