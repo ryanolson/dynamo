@@ -518,9 +518,9 @@ where
         preprocessor,
         Hop::new((), backend, ()),
     );
-    Arc::new(PipelineEngine::<_, Req, Resp>::new(gdl::Source::new(
-        Hop::new((), preprocessor, ()),
-    )))
+    Arc::new(PipelineEngine::<_, Req, Resp>::for_dynamo_stages(
+        gdl::Source::new(Hop::new((), preprocessor, ())),
+    ))
 }
 
 /// Build the embeddings pipeline: preprocessor, then backend, then `engine`, composed on
@@ -583,9 +583,9 @@ fn compose_gdl_embeddings_pipeline(
     let backend = DynOperatorStage::<_, Pre, Out, Pre, Out>::new(backend, Hop::new((), router, ()));
     let preprocessor =
         DynOperatorStage::<_, Req, Resp, Pre, Out>::new(preprocessor, Hop::new((), backend, ()));
-    Arc::new(PipelineEngine::<_, Req, Resp>::new(gdl::Source::new(
-        Hop::new((), preprocessor, ()),
-    )))
+    Arc::new(PipelineEngine::<_, Req, Resp>::for_dynamo_stages(
+        gdl::Source::new(Hop::new((), preprocessor, ())),
+    ))
 }
 
 impl PreprocessedRouting {
@@ -714,9 +714,9 @@ impl PreprocessedRouting {
             preprocessor,
             Hop::new((), migration, ()),
         );
-        Arc::new(PipelineEngine::<_, Req, Resp>::new(gdl::Source::new(
-            Hop::new((), preprocessor, ()),
-        )))
+        Arc::new(PipelineEngine::<_, Req, Resp>::for_dynamo_stages(
+            gdl::Source::new(Hop::new((), preprocessor, ())),
+        ))
     }
 
     /// The encoder router, the prefill router and the backend engine as gdl stages: the tail
@@ -796,9 +796,9 @@ impl PreprocessedRouting {
             migration,
             Hop::new((), self.gdl_routers(), ()),
         );
-        Arc::new(PipelineEngine::<_, Pre, Out>::new(gdl::Source::new(
-            Hop::new((), migration, ()),
-        )))
+        Arc::new(PipelineEngine::<_, Pre, Out>::for_dynamo_stages(
+            gdl::Source::new(Hop::new((), migration, ())),
+        ))
     }
 }
 

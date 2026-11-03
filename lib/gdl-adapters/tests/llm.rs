@@ -156,7 +156,9 @@ fn migration() -> Arc<Migration> {
     Migration::new(3, None, MODEL.to_string(), Arc::new(Metrics::new()))
 }
 
-/// Migration above `engine`, composed with gdl through the adapters.
+/// Migration above `engine`, composed with gdl through the adapters, under a
+/// `PipelineEngine::new`, as for gdl-native nodes: a kill cancels the pipeline.
+/// The compositions in `dynamo-llm` use `PipelineEngine::for_dynamo_stages`.
 fn gdl_migration(engine: Engine) -> Engine {
     let sink = Hop::new((), SinkStage::new(Arc::new(EngineSink::new(engine))), ());
     let stage =
@@ -300,9 +302,12 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, Out, Error> for Hanging {
 }
 
 /// A kill while an attempt is still dispatching. Dynamo's `link` chain lets
-/// Migration see the kill and end with its own outcome; with gdl, the kill
-/// cancels the hop, which drops Migration's future and fails the call as
-/// `Cancelled`. This test pins both outcomes, so a change to either shows.
+/// Migration see the kill and end with its own outcome; under a
+/// `PipelineEngine::new`, the kill cancels the hop, which drops Migration's
+/// future and fails the call as `Cancelled`. This is why compositions of
+/// Dynamo operators use `PipelineEngine::for_dynamo_stages` (see
+/// `kill_during_dispatch`). This test pins both outcomes, so a change to
+/// either shows.
 #[tokio::test]
 async fn a_kill_during_dispatch_ends_the_request_on_both_paths() {
     let mut outcomes = Vec::new();
@@ -597,38 +602,22 @@ async fn a_stop_and_a_kill_reach_the_terminal_through_pipeline_b_on_gdl() {
     assert!(rest.iter().all(|item| !item.is_error()), "{rest:?}");
 }
 
-/// A kill while the terminal is still dispatching, through all of pipeline B.
-/// The outcomes differ as in `a_kill_during_dispatch_ends_the_request_on_both_paths`,
-/// so this also shows which composition `with_local_pipeline` built.
+/// A kill while the terminal is still dispatching, through all of pipeline B, ends the call
+/// the same way on both local pipelines (see `kill_during_dispatch`).
 #[tokio::test]
 async fn a_kill_during_dispatch_ends_pipeline_b_on_both_local_pipelines() {
     let mut outcomes = Vec::new();
     for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
         let pipeline = pipeline_b(local_pipeline, Arc::new(Hanging), 3);
-        let request = chat_request();
-        let context = request.context();
-        let call = tokio::spawn(async move { pipeline.generate(request).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        context.kill();
-        let outcome = tokio::time::timeout(Duration::from_secs(5), call)
-            .await
-            .expect("the call ends after the kill")
-            .unwrap();
-        outcomes.push(match outcome {
-            Ok(stream) => format!("ok, {} items", stream.collect::<Vec<_>>().await.len()),
-            Err(error) => match error.downcast_ref::<DynamoError>() {
-                Some(error) => format!("error {:?}", error.class()),
-                None => format!("error {error:#}"),
-            },
-        });
+        outcomes.push(kill_during_dispatch(pipeline, chat_request()).await);
     }
-    assert_eq!(outcomes, ["ok, 0 items", "error Cancelled"]);
+    assert_eq!(outcomes, ["ok, 0 items", "ok, 0 items"]);
 }
 
-/// What a kill while the terminal is still dispatching does to `pipeline`'s call. Dynamo's
-/// `link` chain lets the operators see the kill and end with their own outcome; with gdl, the
-/// kill cancels the hop and fails the call as `Cancelled`. So the outcome also shows which
-/// composition a builder chose.
+/// What a kill while the terminal is still dispatching does to `pipeline`'s call. The operators
+/// see the kill through their own context and end the request themselves, on Dynamo's `link`
+/// chain and on gdl's compositions alike: a kill does not cancel a gdl pipeline of Dynamo
+/// operators (see `CxBridge`), so gdl does not drop the call.
 async fn kill_during_dispatch<Req: Data, T: Data>(
     pipeline: Arc<dyn AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, Error>>,
     request: SingleIn<Req>,
@@ -747,7 +736,7 @@ async fn a_kill_during_dispatch_ends_pipeline_c_on_both_local_pipelines() {
         let pipeline = pipeline_c(local_pipeline, Arc::new(Hanging), 3);
         outcomes.push(kill_during_dispatch(pipeline, request()).await);
     }
-    assert_eq!(outcomes, ["ok, 0 items", "error Cancelled"]);
+    assert_eq!(outcomes, ["ok, 0 items", "ok, 0 items"]);
 }
 
 type EmbedOut = ManyOut<Annotated<EmbeddingsEngineOutput>>;
@@ -955,7 +944,7 @@ async fn a_kill_during_dispatch_ends_pipeline_embeddings_on_both_local_pipelines
         let pipeline = pipeline_embeddings(local_pipeline, Arc::new(HangingEmbeddings));
         outcomes.push(kill_during_dispatch(pipeline, embedding_request()).await);
     }
-    assert_eq!(outcomes, ["ok, 0 items", "error Cancelled"]);
+    assert_eq!(outcomes, ["ok, 0 items", "ok, 0 items"]);
 }
 
 /// The in-process pipeline the HTTP and gRPC inputs build over a token engine, over `engine`,
@@ -1066,7 +1055,7 @@ async fn a_kill_during_dispatch_ends_pipeline_a_on_both_local_pipelines() {
         let pipeline = pipeline_a(local_pipeline, Arc::new(Hanging)).await;
         outcomes.push(kill_during_dispatch(pipeline, chat_request()).await);
     }
-    assert_eq!(outcomes, ["ok, 0 items", "error Cancelled"]);
+    assert_eq!(outcomes, ["ok, 0 items", "ok, 0 items"]);
 }
 
 /// Pipeline A behind the HTTP service, as the in-process HTTP input serves it: one model per
@@ -1157,3 +1146,4 @@ async fn pipeline_a_serves_the_same_chat_over_http_on_both_local_pipelines() {
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
 }
+
