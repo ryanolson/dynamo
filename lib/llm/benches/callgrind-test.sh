@@ -315,6 +315,59 @@ else
     echo "ok hotpath.sh base-nonnumeric-instructions"
 fi
 
+# The table starts with its provenance.
+if ! head -n 1 "$work/base" | grep -Eq "^# hotpath format=[0-9]+ arch=$(uname -m) gdl=[^ ]+ commit=[^ ]+$"; then
+    fail provenance "the table does not start with its provenance line"
+    sed 's/^/  base: /' "$work/base" >&2
+else
+    echo "ok hotpath.sh provenance"
+fi
+
+# Every base the strict parser cannot read in full fails before any run, even when the head
+# has a rise it would otherwise mark. Each case: name, then a sed script applied to the base.
+while IFS='|' read -r case_name edit; do
+    sed -e "$edit" "$work/base" >"$work/bad-base"
+    FAKE_RISE_ROW=b FAKE_RISE_ALLOCS=1 run "$here/hotpath.sh" --base "$work/bad-base"
+    if [[ $status -eq 0 ]]; then
+        fail "base-$case_name" "accepted the base"
+    elif grep -Eq '^B +dynamo ' "$work/stdout"; then
+        fail "base-$case_name" "printed a table from a base it should reject"
+    elif grep -q 'callgrind output:' "$work/stderr"; then
+        fail "base-$case_name" "ran callgrind before rejecting the base"
+    else
+        echo "ok hotpath.sh base-$case_name"
+    fi
+done <<'CASES'
+garbage-line|$a hello
+unexpected-row|/^C  *dynamo /{p;s/^C /D /}
+renamed-row|s/^C  *dynamo /D      dynamo /
+no-provenance|1d
+second-provenance|1p
+arch|1s/arch=[^ ]*/arch=riscv64/
+format|1s/format=[0-9]*/format=1/
+crlf|s/$/\r/
+row-before-header|2{h;d};3{p;x}
+CASES
+
+# A base that is itself the output of a --base run, with its base line and change columns,
+# is read like any other: unchanged counts pass, and a rise is still marked.
+FAKE_VALGRIND_MODE=ok run "$here/hotpath.sh" --base "$work/base"
+cp "$work/stdout" "$work/compared-base"
+if ! grep -q '^# base format=' "$work/compared-base"; then
+    fail compared-base "a --base table has no base line"
+fi
+FAKE_VALGRIND_MODE=ok run "$here/hotpath.sh" --base "$work/compared-base"
+if [[ $status -ne 0 ]] || grep -Eq 'RISE|WORSE' "$work/stdout"; then
+    fail compared-base "exit status $status against a --base table, want 0 and no marks"
+else
+    FAKE_RISE_ROW=b FAKE_RISE_ALLOCS=1 run "$here/hotpath.sh" --base "$work/compared-base"
+    if [[ $status -ne 1 ]] || ! grep -Eq '^B +dynamo .* RISE$' "$work/stdout"; then
+        fail compared-base "exit status $status, want 1 and RISE on B dynamo"
+    else
+        echo "ok hotpath.sh compared-base"
+    fi
+fi
+
 if ((failures > 0)); then
     echo "$failures failed" >&2
     exit 1
