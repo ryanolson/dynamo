@@ -81,8 +81,9 @@
 //! 2.4 KB each (7,200 bytes); the rest are small and take 1,829 bytes fewer than the `link`
 //! chain's.
 //!
-//! Most of `c`'s bytes are two boxed futures of 59,592 bytes each, allocated by the edge that
-//! carries the request from Migration (`RetryManager::new_stream`) to the next stage.
+//! The largest allocation of `b`, `c` and their gdl rows is one boxed future of 59,592 bytes per
+//! request, the same on both local pipelines. `a` and `embed`, which have no Migration, do not
+//! make it.
 //!
 //! Run: `cargo test -p dynamo-llm --test allocations`. For instructions per request, see
 //! `lib/llm/benches/callgrind.sh`, which runs this binary as
