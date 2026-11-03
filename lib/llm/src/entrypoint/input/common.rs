@@ -423,8 +423,12 @@ where
 }
 
 /// Build the embeddings pipeline: preprocessor, then backend, then `engine`.
+///
+/// The caller builds `preprocessor` (`OpenAIPreprocessor::new_for_embeddings`), so a card it
+/// cannot serve fails before the caller creates `engine`.
 pub fn build_embeddings_pipeline(
     card: &ModelDeploymentCard,
+    preprocessor: Arc<OpenAIPreprocessor>,
     engine: ServiceEngine<
         SingleIn<PreprocessedEmbeddingRequest>,
         ManyOut<Annotated<EmbeddingsEngineOutput>>,
@@ -434,7 +438,7 @@ pub fn build_embeddings_pipeline(
         SingleIn<NvCreateEmbeddingRequest>,
         ManyOut<Annotated<NvCreateEmbeddingResponse>>,
     >::new();
-    let preprocessor = OpenAIPreprocessor::new_for_embeddings(card.clone())?.into_operator();
+    let preprocessor = preprocessor.into_operator();
     let backend = Backend::from_mdc(card).into_operator();
     let service_backend = ServiceBackend::from_engine(engine);
 
