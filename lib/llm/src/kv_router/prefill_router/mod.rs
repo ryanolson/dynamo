@@ -27,12 +27,11 @@ use dynamo_runtime::{
 };
 use futures::FutureExt;
 use futures::stream::{self, StreamExt};
-use tracing::Instrument;
 
 use crate::{
     discovery::{ModelManager, WorkerSetTarget, WorkerSetTargetId},
     kv_router::{RoutingHost, SelectionPolicySource, routing_host::PrefillDispatch},
-    operator::{Downstream, DynamoDownstream, GdlDownstream, GdlOperator, native},
+    operator::{Downstream, DynamoDownstream, GdlDownstream, GdlOperator, detached, native},
     protocols::common::{
         extensions::{SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId},
         llm_backend::{LLMEngineOutput, PreprocessedRequest},
@@ -102,6 +101,17 @@ pub enum PrefillError {
 
     #[error("No disaggregated params in prefill response: {0}")]
     NoDisaggregatedParams(String),
+}
+
+/// What the prefill router does with a request, by its activation state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrefillGate {
+    /// Through remote prefill, then decode.
+    Prefill,
+    /// A target is set but its binding is not built yet: fail closed.
+    Pending,
+    /// Straight to the stage below: no target, or a query-only request.
+    PassThrough,
 }
 
 enum PrefillOutcome {
@@ -400,7 +410,7 @@ impl
         'life0: 'async_trait,
         Self: 'async_trait,
     {
-        Box::pin(self.route(request, DynamoDownstream(next)))
+        Box::pin(self.route(request, DynamoDownstream(next), None))
     }
 }
 
@@ -422,41 +432,68 @@ impl gdl::Operator for GdlOperator<PrefillRouter, PreprocessedRequest> {
         let router = Arc::clone(&self.op);
         let next = GdlDownstream::new(cx, next);
         async move {
-            if !router.may_route_to_prefill() {
-                return router.route(request, next).await;
+            let query_only = request.get_annotation_value("query_instance_id").is_some();
+            let gate = router.gate(query_only);
+            if gate != PrefillGate::Prefill {
+                return router.route(request, next, Some(gate)).await;
             }
             // Remote prefill stages KV on the prefill worker that only the decode leg
             // releases, and gdl drops this future when a kill cancels the request's `cx`.
             // So the route runs as a task that the drop detaches, and its decode leg runs
             // under a cleanup `Cx` that the kill does not cancel (`send_cleanup`).
-            let route = async move { router.route(request, next).await };
-            match tokio::spawn(route.instrument(tracing::Span::current())).await {
-                Ok(result) => result,
-                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-                Err(error) => Err(anyhow::Error::new(error).context("prefill routing task ended")),
-            }
+            detached(async move { router.route(request, next, Some(gate)).await }).await
         }
         .map(native)
     }
 }
 
 impl PrefillRouter {
-    /// Whether a request may go to remote prefill now. Untargeted requests pass straight
-    /// through; the route reads the target again, under its lock, and passes through
-    /// whenever this said no and nothing activated in between.
-    fn may_route_to_prefill(&self) -> bool {
-        self.lifecycle_state() == PrefillLifecycleState::Active
-            || !matches!(self.activation_snapshot(), ActivationSnapshot::Untargeted)
+    /// What the router does with a request, read once from its activation state.
+    fn gate(&self, query_only: bool) -> PrefillGate {
+        // Hot path: an active router with a published binding never takes the
+        // target lock. Anything else is resolved from one locked snapshot.
+        if self.lifecycle_state() != PrefillLifecycleState::Active {
+            match self.activation_snapshot() {
+                // Activation completed between the lock-free read and the snapshot:
+                // continue through the prefill path below.
+                ActivationSnapshot::Active(_) => {}
+                // Model admission gates on the registered worker topology, which counts
+                // a prefill worker as live the moment it registers. This router only
+                // learns the matching target then, and its binding is built
+                // asynchronously. Until that build completes the namespace is already
+                // selectable, so forwarding the request would hand a decode-only worker
+                // an aggregated request it cannot run (`bootstrap_info is required for
+                // disaggregated decode`). Fail closed with a migratable error instead:
+                // the retry layer re-dispatches and the client sees a retryable 503
+                // rather than a backend failure.
+                ActivationSnapshot::Pending if !query_only => return PrefillGate::Pending,
+                // Query-only previews never reach the engine. Otherwise no prefill
+                // target was ever set (aggregated-capable deployment) or every prefill
+                // worker left (target cleared): route directly to the backend.
+                ActivationSnapshot::Pending | ActivationSnapshot::Untargeted => {
+                    return PrefillGate::PassThrough;
+                }
+            }
+        }
+        if query_only {
+            PrefillGate::PassThrough
+        } else {
+            PrefillGate::Prefill
+        }
     }
 
     /// Route `request` through remote prefill when the router is active, then send its decode
-    /// leg on: the body of the prefill router's Dynamo and gdl operators.
+    /// leg on: the body of the prefill router's Dynamo and gdl operators. `gate` is the
+    /// router's decision for the request when the caller has read it already, so the route
+    /// acts on the decision the caller acted on.
     ///
-    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
+    /// Transition: make concrete, and take `gate` always, when the gdl pipeline is the only
+    /// local pipeline.
     async fn route<D>(
         &self,
         request: SingleIn<PreprocessedRequest>,
         next: D,
+        gate: Option<PrefillGate>,
     ) -> Result<D::Response<LLMEngineOutput>>
     where
         D: Downstream<PreprocessedRequest, LLMEngineOutput>,
@@ -480,50 +517,27 @@ impl PrefillRouter {
         // Save original max_tokens for decode
         let original_max_tokens = req.stop_conditions.max_tokens;
 
-        // Query-only requests are owned by the decode RoutingHost. In particular,
-        // do not turn an advisory worker lookup into conditional local execution.
-        let query_only = req.get_annotation_value("query_instance_id").is_some();
-
-        // Hot path: an active router with a published binding never takes the
-        // target lock. Anything else is resolved from one locked snapshot.
-        if self.lifecycle_state() != PrefillLifecycleState::Active {
-            match self.activation_snapshot() {
-                // Activation completed between the lock-free read and the snapshot:
-                // continue through the prefill path below.
-                ActivationSnapshot::Active(_) => {}
-                // Model admission gates on the registered worker topology, which counts
-                // a prefill worker as live the moment it registers. This router only
-                // learns the matching target then, and its binding is built
-                // asynchronously. Until that build completes the namespace is already
-                // selectable, so forwarding the request would hand a decode-only worker
-                // an aggregated request it cannot run (`bootstrap_info is required for
-                // disaggregated decode`). Fail closed with a migratable error instead:
-                // the retry layer re-dispatches and the client sees a retryable 503
-                // rather than a backend failure.
-                ActivationSnapshot::Pending if !query_only => {
-                    tracing::debug!(
-                        request_id = %request_id,
-                        model_name = %self.model_name,
-                        namespace = %self.namespace,
-                        "Prefill router target is still activating; rejecting request instead of \
-                         forwarding it to decode without a prefill hop"
-                    );
-                    return Err(prefill_activation_pending_error(
-                        &self.model_name,
-                        &self.namespace,
-                    ));
-                }
-                // Query-only previews never reach the engine. Otherwise no prefill
-                // target was ever set (aggregated-capable deployment) or every prefill
-                // worker left (target cleared): route directly to the backend.
-                ActivationSnapshot::Pending | ActivationSnapshot::Untargeted => {
-                    return next.forward(context.map(|_| req)).await;
-                }
+        let gate = gate.unwrap_or_else(|| {
+            // Query-only requests are owned by the decode RoutingHost. In particular,
+            // do not turn an advisory worker lookup into conditional local execution.
+            self.gate(req.get_annotation_value("query_instance_id").is_some())
+        });
+        match gate {
+            PrefillGate::Prefill => {}
+            PrefillGate::Pending => {
+                tracing::debug!(
+                    request_id = %request_id,
+                    model_name = %self.model_name,
+                    namespace = %self.namespace,
+                    "Prefill router target is still activating; rejecting request instead of \
+                     forwarding it to decode without a prefill hop"
+                );
+                return Err(prefill_activation_pending_error(
+                    &self.model_name,
+                    &self.namespace,
+                ));
             }
-        }
-
-        if query_only {
-            return next.forward(context.map(|_| req)).await;
+            PrefillGate::PassThrough => return next.forward(context.map(|_| req)).await,
         }
 
         let session_affinity = context
@@ -1976,6 +1990,49 @@ mod tests {
             .await
             .expect("the stream ends");
         }
+    }
+
+    /// The route acts on the gate its caller read, not on a later read of the router's state:
+    /// the native operator chooses whether to run the route as a task from that gate, so a
+    /// router that turns active in between must not send the request to remote prefill from a
+    /// route that runs inline.
+    #[tokio::test]
+    async fn the_route_acts_on_the_gate_its_caller_read() {
+        use crate::operator::DynamoDownstream;
+        use dynamo_runtime::{DistributedRuntime, Runtime, distributed::DistributedConfig};
+
+        let runtime = Runtime::from_current().unwrap();
+        let distributed =
+            DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+                .await
+                .unwrap();
+        let request = Context::new(inference_request());
+        let caller = request.context();
+        // An active router whose prefill worker kills the caller if it is ever reached.
+        let (routing, decode) =
+            prefill_handoff_routing(&distributed, "gate-read-once", caller.clone()).await;
+        let router = routing.prefill_router();
+        assert_eq!(router.gate(false), PrefillGate::Prefill);
+
+        let next: Arc<
+            dyn AsyncEngine<
+                    SingleIn<PreprocessedRequest>,
+                    ManyOut<Annotated<LLMEngineOutput>>,
+                    Error,
+                >,
+        > = decode.clone();
+        let response = router
+            .route(
+                request,
+                DynamoDownstream(next),
+                Some(PrefillGate::PassThrough),
+            )
+            .await
+            .unwrap();
+        drop(response);
+        assert!(!caller.is_killed(), "the route went to remote prefill");
+        assert_eq!(decode_calls(&decode, 1).await, [(false, false)]);
+        runtime.shutdown();
     }
 
     /// The decode calls `decode` has seen, once it has seen `count` or 5 seconds have passed.

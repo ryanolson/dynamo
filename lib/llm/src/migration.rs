@@ -413,6 +413,7 @@ impl MigrationEvent {
     }
 }
 
+/// Transition: make concrete over `D` when the gdl pipeline is the only local pipeline.
 struct RetryManager<Resp, D>
 where
     Resp: Data + HasTokenIds,

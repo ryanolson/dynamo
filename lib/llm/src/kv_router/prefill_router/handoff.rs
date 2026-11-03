@@ -108,6 +108,8 @@ impl PrefillTask {
     /// held until prefill finishes so a late failure cannot follow success.
     /// `output` sends prefill's output into the stream as soon as prefill
     /// finishes (`BeforeLast`), or before any decode output (`BeforeFirst`).
+    ///
+    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
     pub(super) async fn forward_decode<D>(
         self,
         decode: impl Future<Output = anyhow::Result<D::Stream>>,

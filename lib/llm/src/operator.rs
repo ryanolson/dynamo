@@ -22,6 +22,7 @@ use dynamo_runtime::engine::{AsyncEngine, AsyncEngineContext, Data, ResponseStre
 use dynamo_runtime::pipeline::{AsyncEngineContextProvider, Error, ManyOut, SingleIn};
 use dynamo_runtime::protocols::annotated::Annotated;
 use futures::{FutureExt, Stream, StreamExt};
+use tracing::Instrument;
 
 /// The stage below an operator, as the operator's body calls it.
 ///
@@ -263,6 +264,25 @@ impl<O, K> GdlOperator<O, K> {
         Self {
             op,
             key: PhantomData,
+        }
+    }
+}
+
+/// Run `work` as a task that a drop of the caller's future detaches rather than cancels, and
+/// wait for its result: for a native operator whose work must outlive a gdl cancel, which
+/// drops the operator's future. A panic in `work` resumes in the caller.
+///
+/// Not an `async fn`: the task starts here, so the future the caller holds is the task's
+/// handle alone, not `work` as well.
+pub(crate) fn detached<T: Send + 'static>(
+    work: impl Future<Output = anyhow::Result<T>> + Send + 'static,
+) -> impl Future<Output = anyhow::Result<T>> + Send {
+    let task = tokio::spawn(work.instrument(tracing::Span::current()));
+    async move {
+        match task.await {
+            Ok(result) => result,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => Err(anyhow::Error::new(error).context("detached operator task ended")),
         }
     }
 }

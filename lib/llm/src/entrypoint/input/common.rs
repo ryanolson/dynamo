@@ -718,6 +718,11 @@ impl PreprocessedRouting {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn prefill_router(&self) -> &Arc<PrefillRouter> {
+        &self.prefill_router
+    }
+
     /// Compose [`build_pipeline`](Self::build_pipeline) and
     /// [`build_preprocessed_pipeline`](Self::build_preprocessed_pipeline) on `local_pipeline`.
     ///
