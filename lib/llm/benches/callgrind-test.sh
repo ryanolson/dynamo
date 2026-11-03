@@ -386,6 +386,22 @@ else
     echo "ok hotpath.sh base-tab-row"
 fi
 
+# Counts beyond 2^53 must stay exact or fail closed, including a rise at 16 items only.
+FAKE_RISE_ROW=b FAKE_RISE_ITEMS=16 FAKE_RISE_ALLOCS=9007199254740975 \
+    run "$here/hotpath.sh"
+if [[ $status -eq 0 ]]; then
+    cp "$work/stdout" "$work/large-integer-base"
+    FAKE_RISE_ROW=b FAKE_RISE_ITEMS=16 FAKE_RISE_ALLOCS=9007199254740976 \
+        run "$here/hotpath.sh" --base "$work/large-integer-base"
+    if [[ $status -eq 0 ]]; then
+        fail large-integer-allocations "hid a 16-item allocation rise from 9007199254740992 to 9007199254740993"
+    else
+        echo "ok hotpath.sh large-integer-allocations"
+    fi
+else
+    echo "ok hotpath.sh large-integer-counts-rejected"
+fi
+
 if ((failures > 0)); then
     echo "$failures failed" >&2
     exit 1
