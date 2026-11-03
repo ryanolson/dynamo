@@ -11,14 +11,14 @@
 //! |---|---|---|
 //! | `engine` | the test LLM engine, called directly | itself |
 //! | `a` | `build_pipeline`: preprocessor, backend | test LLM engine |
-//! | `a-gdl` | `a` composed as a gdl local pipeline | test LLM engine |
+//! | `a-gdl` | `a` composed as a gdl local pipeline: the preprocessor and backend native | test LLM engine |
 //! | `b` | `PreprocessedRouting::build_pipeline`: preprocessor, migration, backend, encoder router, prefill router | test LLM engine, in place of `RoutingHost` |
 //! | `b-gdl` | `b` composed as a gdl local pipeline (`LocalPipeline::Gdl`, what `DYN_LOCAL_PIPELINE=gdl` selects): the preprocessor and backend native, the others adapted | test LLM engine, in place of `RoutingHost` |
 //! | `c` | `PreprocessedRouting::build_preprocessed_pipeline`: migration, encoder router, prefill router | test LLM engine, in place of `RoutingHost` |
 //! | `c-gdl` | `c` composed as a gdl local pipeline | test LLM engine, in place of `RoutingHost` |
 //! | `embed-engine` | the test embeddings engine, called directly | itself |
 //! | `embed` | `build_embeddings_pipeline`: preprocessor, backend | test embeddings engine, in place of `PushRouter` |
-//! | `embeddings-gdl` | `embed` composed as a gdl local pipeline | test embeddings engine, in place of `PushRouter` |
+//! | `embeddings-gdl` | `embed` composed as a gdl local pipeline: the preprocessor and backend native | test embeddings engine, in place of `PushRouter` |
 //!
 //! The second number of a row is stream items: 1 and 16. For the embeddings rows it is
 //! inputs per request instead, because an embeddings stream carries one item for any number of
@@ -51,14 +51,14 @@
 //! |---|---:|---:|---:|---:|
 //! | `engine` | 7 | 2,752 | 22 | 2,812 |
 //! | `a` | 349 | 100,958 | 862 | 122,446 |
-//! | `a-gdl` | 375 | 98,017 | 888 | 119,505 |
+//! | `a-gdl` | 349 | 82,423 | 862 | 103,911 |
 //! | `b` | 402 | 227,025 | 915 | 248,513 |
-//! | `b-gdl` | 429 | 208,445 | 942 | 229,933 |
+//! | `b-gdl` | 429 | 208,509 | 942 | 229,997 |
 //! | `c` | 71 | 144,683 | 86 | 144,743 |
 //! | `c-gdl` | 106 | 142,559 | 121 | 142,619 |
 //! | `embed-engine` | 8 | 6,548 | 23 | 88,868 |
 //! | `embed` | 199 | 44,406 | 2,283 | 529,854 |
-//! | `embeddings-gdl` | 225 | 49,777 | 2,309 | 535,225 |
+//! | `embeddings-gdl` | 200 | 45,455 | 2,284 | 530,903 |
 //!
 //! `b-gdl` costs 27 allocations more than `b` at both item counts, so nothing per item. Per stage,
 //! `lib/gdl-adapters/tests/allocations.rs` measures 14 allocations for a `link` stage, 23 for an
@@ -67,10 +67,9 @@
 //! and Migration, the encoder router and the prefill router adapted:
 //! 3 × (23 − 14) − 2 × (14 − 10) + 8 = 27. With all five native it would be 8 − 5 × 4 = −12.
 //!
-//! `a-gdl` costs 26 allocations more than `a` at both item counts: 2 adapted operators × 9 + 8
-//! at the boundary. It asks for 2,941 fewer bytes. By size, the `link` chain's 13 boxed futures
-//! of 2.2 to 5 KB (43,984 bytes) give way to one boxed future of 11.7 to 13.1 KB per
-//! `PipelineEngine` (36,544 bytes); the 26 extra allocations are small and add 4,499 bytes.
+//! `a-gdl` costs the same allocations as `a` at both item counts: 2 native operators save 4
+//! each against a `link` stage, and the boundary costs 8. It asks for 18,535 fewer bytes: one
+//! boxed future per native stage in place of the `link` chain's boxed futures per edge.
 //!
 //! `c-gdl` costs 35 allocations more than `c` at both item counts: 3 adapted operators × 9 + 8
 //! at the boundary, as for `b-gdl`. It asks for 2,124 fewer bytes. By size, the `link` chain's
@@ -78,10 +77,8 @@
 //! 11.7 KB per `PipelineEngine`, one at the boundary and one below each operator (46,800 bytes);
 //! the 35 extra allocations are small and add 6,012 bytes.
 //!
-//! `embeddings-gdl` costs 26 allocations and 5,371 bytes more than `embed` at both input counts:
-//! 2 adapted operators × 9 + 8 at the boundary. Its three `PipelineEngine`s box one future of
-//! 2.4 KB each (7,200 bytes); the rest are small and take 1,829 bytes fewer than the `link`
-//! chain's.
+//! `embeddings-gdl` costs 1 allocation and 1,049 bytes more than `embed` at both input counts:
+//! its preprocessor and backend are native, and the boundary costs 8.
 //!
 //! The largest allocation of `b`, `c` and their gdl rows is one boxed future of 59,592 bytes per
 //! request, the same on both local pipelines. `a` and `embed`, which have no Migration, do not
@@ -134,12 +131,12 @@ const BASELINE: &[Row] = &[
     row("engine", 16, 22, 2812),
     row("a", 1, 349, 100958),
     row("a", 16, 862, 122446),
-    row("a-gdl", 1, 375, 98017),
-    row("a-gdl", 16, 888, 119505),
+    row("a-gdl", 1, 349, 82423),
+    row("a-gdl", 16, 862, 103911),
     row("b", 1, 402, 227025),
     row("b", 16, 915, 248513),
-    row("b-gdl", 1, 429, 208445),
-    row("b-gdl", 16, 942, 229933),
+    row("b-gdl", 1, 429, 208509),
+    row("b-gdl", 16, 942, 229997),
     row("c", 1, 71, 144683),
     row("c", 16, 86, 144743),
     row("c-gdl", 1, 106, 142559),
@@ -148,8 +145,8 @@ const BASELINE: &[Row] = &[
     row("embed-engine", 16, 23, 88868),
     row("embed", 1, 199, 44406),
     row("embed", 16, 2283, 529854),
-    row("embeddings-gdl", 1, 225, 49777),
-    row("embeddings-gdl", 16, 2309, 535225),
+    row("embeddings-gdl", 1, 200, 45455),
+    row("embeddings-gdl", 16, 2284, 530903),
 ];
 
 #[global_allocator]

@@ -106,7 +106,9 @@ where
     Req: Data,
     T: Data,
 {
-    Arc::new(PipelineEngine::<_, Req, T>::for_dynamo_stages(Source::new(next)))
+    Arc::new(PipelineEngine::<_, Req, T>::for_dynamo_stages(Source::new(
+        next,
+    )))
 }
 
 /// What one call of [`Script`] saw.
