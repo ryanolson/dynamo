@@ -137,6 +137,8 @@ enum Reply {
     Items(Vec<Annotated<LLMEngineOutput>>),
     /// The items, then wait for a kill before the stream ends.
     ItemsThenHold(Vec<Annotated<LLMEngineOutput>>),
+    /// The items, then wait for a stop or a kill before the stream ends.
+    ItemsThenStopped(Vec<Annotated<LLMEngineOutput>>),
     Fail(fn() -> Error),
 }
 
@@ -203,6 +205,14 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                 let watched = context.clone();
                 let held = stream::iter(items.clone()).chain(
                     stream::once(async move { watched.killed().await })
+                        .filter_map(|()| async { None }),
+                );
+                Ok(ResponseStream::new(Box::pin(held), context))
+            }
+            Reply::ItemsThenStopped(items) => {
+                let watched = context.clone();
+                let held = stream::iter(items.clone()).chain(
+                    stream::once(async move { watched.stopped().await })
                         .filter_map(|()| async { None }),
                 );
                 Ok(ResponseStream::new(Box::pin(held), context))
@@ -644,6 +654,67 @@ async fn speculative_prefill_reaches_the_terminal_both_ways() {
             Some(1),
             "{way}"
         );
+    }
+}
+
+/// A client disconnect before the turn finishes: no speculative prefill is sent. The prefill
+/// waits for the turn's finish reason, and the request's end without one cancels it.
+#[tokio::test]
+async fn speculative_prefill_is_not_sent_after_a_disconnect_both_ways() {
+    let fixture = Fixture::load();
+    let mut reply = fixture.tokens("The fox crossed the river.");
+    for item in &mut reply {
+        item.data.as_mut().unwrap().finish_reason = None;
+    }
+    for (way, at) in [("dynamo", 0), ("gdl", 1)] {
+        let terminal = Script::new(Reply::ItemsThenHold(reply.clone()));
+        let engine = chat_both(&fixture, terminal.clone())[at].clone();
+        let hint = serde_json::json!({"nvext": {"agent_hints": {"speculative_prefill": true}}});
+        let request = request(chat(hint));
+        let context = request.context();
+        let mut stream = engine.generate(request).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("the first item arrives")
+            .unwrap();
+        // The disconnect: the HTTP handler kills the request and drops its stream.
+        context.kill();
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(terminal.calls(), 1, "{way}: a speculative prefill was sent");
+    }
+}
+
+/// A stop string: Backend ends the response at the string and stops the worker's context,
+/// which ends the worker's stream. The worker is stopped, not killed.
+#[tokio::test]
+async fn a_stop_string_stops_the_terminal_and_ends_the_stream_both_ways() {
+    let fixture = Fixture::load();
+    let mut reply = fixture.tokens("The fox crossed the river at dawn.");
+    for item in &mut reply {
+        item.data.as_mut().unwrap().finish_reason = None;
+    }
+    let terminals = [
+        Script::new(Reply::ItemsThenStopped(reply.clone())),
+        Script::new(Reply::ItemsThenStopped(reply)),
+    ];
+    let [dynamo, _] = chat_both(&fixture, terminals[0].clone());
+    let [_, gdl] = chat_both(&fixture, terminals[1].clone());
+    let [d, g] = both(dynamo, gdl, || {
+        request(chat(serde_json::json!({"stop": ["river"]})))
+    })
+    .await;
+    let (d, g) = (d.unwrap(), g.unwrap());
+    let (text, finished) = chat_text(&g);
+    assert!(
+        text.contains("fox crossed") && !text.contains("river") && finished,
+        "{text:?}: {g:?}"
+    );
+    assert_eq!(normalized(&d), normalized(&g));
+    for terminal in &terminals {
+        let calls = terminal.calls.lock().unwrap();
+        assert!(calls[0].context.is_stopped());
+        assert!(!calls[0].context.is_killed());
     }
 }
 
