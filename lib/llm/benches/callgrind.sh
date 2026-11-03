@@ -18,13 +18,18 @@
 # Callgrind runs all threads on one, so the totals include tokio's blocking pool, where the
 # preprocessor tokenizes.
 #
-# The gdl rows fault under valgrind in a default build: gdl's `Cx` reads the clock through
-# rustix's vDSO path, and valgrind does not map the vDSO. Build them with rustix's libc backend,
-# in a target dir of their own so the shared one keeps its flags, for example on aarch64:
-#   CARGO_TARGET_DIR=<scratch> RUSTFLAGS="-C target-cpu=neoverse-n1 -C force-frame-pointers=yes \
-#     --cfg tokio_unstable --cfg rustix_use_libc" lib/llm/benches/callgrind.sh
-# (RUSTFLAGS replaces the flags in .cargo/config.toml, so repeat them.) A run that dies under
-# valgrind fails the script instead of printing a count.
+# The script fails, naming the row and the valgrind log, when valgrind exits non-zero or its
+# log says the program died by a signal. A run that dies still writes a total, so a count
+# from such a run would be wrong.
+#
+# The gdl rows die with SIGSEGV under valgrind: gdl's `Cx` reads the clock through rustix's
+# vDSO path (`rustix::backend::param::auxv::check_elf_base`), and valgrind does not map the
+# vDSO. Building with `--cfg rustix_use_libc` fixes it (measured on aarch64). RUSTFLAGS
+# replaces the flags in .cargo/config.toml, so copy your target's list from there and add the
+# cfg. On x86_64:
+#   RUSTFLAGS="-C target-cpu=x86-64-v3 -C force-frame-pointers=yes --cfg tokio_unstable \
+#     --cfg rustix_use_libc" CARGO_TARGET_DIR=$PWD/target/valgrind lib/llm/benches/callgrind.sh
+# Changing RUSTFLAGS rebuilds every dependency, so give it its own CARGO_TARGET_DIR.
 
 set -euo pipefail
 
@@ -56,27 +61,38 @@ if (( $# % 2 != 0 )); then
     exit 1
 fi
 
-# Total instructions (Ir) for one run of the binary.
+# Total instructions (Ir) for one run of the binary. A run that dies still leaves a summary,
+# so check the exit status and the log before reading it.
 instructions() {
     local row=$1 items=$2 n=$3
     local out="$out_dir/$row-$items-$n.out"
-    # A run that dies still writes its totals, and the difference of two dead runs looks like
-    # a count near zero.
-    if ! valgrind --tool=callgrind --callgrind-out-file="$out" \
-        "$bin" row "$row" "$items" "$n" >/dev/null 2>"$out.log" ||
-        grep -q 'Process terminating' "$out.log"; then
-        echo "callgrind.sh: $row $items failed under valgrind; see $out.log" >&2
+    local what="row $row, $items items, $n requests"
+    local status=0
+    valgrind --tool=callgrind --callgrind-out-file="$out" \
+        "$bin" row "$row" "$items" "$n" >/dev/null 2>"$out.log" || status=$?
+    if (( status != 0 )); then
+        echo "callgrind.sh: $what: valgrind exited with status $status; see $out.log" >&2
         return 1
     fi
-    awk '/^(summary|totals):/ { print $2; exit }' "$out"
+    if grep -q 'Process terminating with default action of signal' "$out.log"; then
+        echo "callgrind.sh: $what: the program died by a signal; see $out.log" >&2
+        return 1
+    fi
+    local ir
+    ir=$(awk '/^(summary|totals):/ { print $2; exit }' "$out" 2>/dev/null) || true
+    if [[ ! $ir =~ ^[0-9]+$ ]]; then
+        echo "callgrind.sh: $what: no instruction total in $out; see $out.log" >&2
+        return 1
+    fi
+    echo "$ir"
 }
 
 printf '%-14s %6s %14s\n' row items instructions/request
 while (( $# > 0 )); do
     row=$1 items=$2
     shift 2
-    one=$(instructions "$row" "$items" "$requests")
-    two=$(instructions "$row" "$items" $((requests * 2)))
+    one=$(instructions "$row" "$items" "$requests") || exit 1
+    two=$(instructions "$row" "$items" $((requests * 2))) || exit 1
     printf '%-14s %6s %14s\n' "$row" "$items" $(((two - one) / requests))
 done
 echo "callgrind output: $out_dir"
