@@ -51,24 +51,25 @@
 //! |---|---:|---:|---:|---:|
 //! | `engine` | 7 | 2,752 | 22 | 2,812 |
 //! | `a` | 349 | 100,958 | 862 | 122,446 |
-//! | `a-gdl` | 357 | 96,841 | 870 | 118,329 |
+//! | `a-gdl` | 333 | 81,407 | 846 | 102,895 |
 //! | `b` | 402 | 227,025 | 915 | 248,513 |
-//! | `b-gdl` | 419 | 221,687 | 932 | 243,175 |
+//! | `b-gdl` | 395 | 206,317 | 908 | 227,805 |
 //! | `c` | 71 | 144,683 | 86 | 144,743 |
 //! | `c-gdl` | 82 | 140,991 | 97 | 141,051 |
 //! | `embed-engine` | 8 | 6,548 | 23 | 88,868 |
 //! | `embed` | 199 | 44,406 | 2,283 | 529,854 |
-//! | `embeddings-gdl` | 207 | 48,601 | 2,291 | 534,049 |
+//! | `embeddings-gdl` | 184 | 44,439 | 2,268 | 529,887 |
 //!
-//! Each gdl row costs the same number of allocations more than its dynamo row at both item
-//! counts, so nothing per item: `a-gdl` +8, `b-gdl` +17, `c-gdl` +11, `embeddings-gdl` +8. That
-//! is the Phase 1 adapters' cost.
-//! `lib/gdl-adapters/tests/allocations.rs` measures it in isolation: 17 allocations per adapted
-//! operator against 14 for a `link` stage, and 21 against 19 at the boundary (`PipelineEngine`
-//! above, `EngineSink` below). Native gdl operators remove the adapted stages.
+//! Each gdl row differs from its dynamo row by the same number of allocations at both item
+//! counts, so nothing per item: `a-gdl` −16, `b-gdl` −7, `c-gdl` +11, `embeddings-gdl` −15.
+//! `lib/gdl-adapters/tests/allocations.rs` measures the parts in isolation: 14 allocations for a
+//! `link` stage, 17 for an adapted operator, 5 for a native gdl operator, and 21 against 19 at the
+//! boundary (`PipelineEngine` above, `EngineSink` below). The preprocessor and backend are native
+//! in every gdl row that has them; Migration and the routers are still adapted, which is why
+//! `c-gdl` (3 adapted, nothing native) costs more than `c`.
 //! `a-gdl`, `b-gdl` and `c-gdl` ask for fewer bytes than their dynamo rows (the `link` chain
-//! boxes a future per edge, the gdl composition one per `PipelineEngine`); `embeddings-gdl` asks
-//! for more, because its `link` futures are small.
+//! boxes a future per edge, the gdl composition one per stage); `embeddings-gdl` asks for 33 more,
+//! because its `link` futures are small.
 //!
 //! The largest allocation of `b`, `c` and their gdl rows is one boxed future of 59,592 bytes per
 //! request, the same on both local pipelines. `a` and `embed`, which have no Migration, do not
@@ -125,24 +126,28 @@ const REQUESTS: usize = 200;
 const BASELINE: &[Row] = &[
     row("engine", 1, 7, 2752),
     row("engine", 16, 22, 2812),
+    // Transition: remove when the gdl pipeline is the only local pipeline.
     row("a", 1, 349, 100958),
     row("a", 16, 862, 122446),
-    row("a-gdl", 1, 357, 96841),
-    row("a-gdl", 16, 870, 118329),
+    row("a-gdl", 1, 333, 81407),
+    row("a-gdl", 16, 846, 102895),
+    // Transition: remove when the gdl pipeline is the only local pipeline.
     row("b", 1, 402, 227025),
     row("b", 16, 915, 248513),
-    row("b-gdl", 1, 419, 221687),
-    row("b-gdl", 16, 932, 243175),
+    row("b-gdl", 1, 395, 206317),
+    row("b-gdl", 16, 908, 227805),
+    // Transition: remove when the gdl pipeline is the only local pipeline.
     row("c", 1, 71, 144683),
     row("c", 16, 86, 144743),
     row("c-gdl", 1, 82, 140991),
     row("c-gdl", 16, 97, 141051),
     row("embed-engine", 1, 8, 6548),
     row("embed-engine", 16, 23, 88868),
+    // Transition: remove when the gdl pipeline is the only local pipeline.
     row("embed", 1, 199, 44406),
     row("embed", 16, 2283, 529854),
-    row("embeddings-gdl", 1, 207, 48601),
-    row("embeddings-gdl", 16, 2291, 534049),
+    row("embeddings-gdl", 1, 184, 44439),
+    row("embeddings-gdl", 16, 2268, 529887),
 ];
 
 #[global_allocator]
@@ -797,20 +802,24 @@ fn check_environment() {
 const ROWS: &[(&str, usize)] = &[
     ("engine", 1),
     ("engine", 16),
+    // Transition: remove when the gdl pipeline is the only local pipeline.
     ("a", 1),
     ("a", 16),
     ("a-gdl", 1),
     ("a-gdl", 16),
+    // Transition: remove when the gdl pipeline is the only local pipeline.
     ("b", 1),
     ("b", 16),
     ("b-gdl", 1),
     ("b-gdl", 16),
+    // Transition: remove when the gdl pipeline is the only local pipeline.
     ("c", 1),
     ("c", 16),
     ("c-gdl", 1),
     ("c-gdl", 16),
     ("embed-engine", 1),
     ("embed-engine", 16),
+    // Transition: remove when the gdl pipeline is the only local pipeline.
     ("embed", 1),
     ("embed", 16),
     ("embeddings-gdl", 1),

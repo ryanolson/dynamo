@@ -416,6 +416,8 @@ pub mod llm {
     /// token-input embeddings pipeline, and the in-process pipeline of the HTTP
     /// and gRPC inputs: `dynamo` (the default) or `gdl`. Read once per process;
     /// any other value fails the pipeline build.
+    ///
+    /// Transition: remove when the gdl pipeline is the only local pipeline.
     pub const DYN_LOCAL_PIPELINE: &str = "DYN_LOCAL_PIPELINE";
 
     /// LoRA cache directory path
@@ -1228,6 +1230,7 @@ mod tests {
             llm::DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS,
             llm::DYN_HTTP_PRE_COMMIT_ERROR_PEEK_MS,
             llm::DYN_LORA_ENABLED,
+            // Transition: remove when the gdl pipeline is the only local pipeline.
             llm::DYN_LOCAL_PIPELINE,
             llm::DYN_LORA_PATH,
             llm::DYN_ENABLE_ANTHROPIC_API,

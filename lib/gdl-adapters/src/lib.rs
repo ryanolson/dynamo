@@ -10,6 +10,10 @@
 //! - [`EngineSink`]: a Dynamo engine as a gdl `Sink`.
 //! - [`PipelineEngine`]: a gdl `Next` as a Dynamo `AsyncEngine`.
 //! - [`DynOperatorStage`]: a Dynamo `Operator` as the inner end of a gdl `Hop`.
+//! - [`AnnotatedItems`] and [`enter`]: what a native gdl operator over Dynamo
+//!   items uses to read its downstream and to raise an eager error, so it
+//!   behaves at its edges as the adapters do. `dynamo_llm::operator` builds
+//!   Backend and the preprocessor this way.
 //! - [`metrics`]: a gdl node's metrics on a Dynamo endpoint.
 //! - [`config`]: how a gdl node in Dynamo gets its configuration.
 //!
@@ -28,9 +32,10 @@
 //! Migration rebuilds the context of every attempt. Items stay `Annotated<T>`,
 //! so a Dynamo error item does not end a stream, while a gdl `Err` does.
 //!
-//! This is the only Dynamo crate that depends on gdl, and it takes the `gdl`
-//! crate alone: gdl's runtime and code generator link velo from git, which
-//! Dynamo already takes from crates.io. `tests/dependencies.rs` keeps them out.
+//! gdl enters Dynamo only here and in `dynamo-llm`'s gdl compositions and
+//! native operators, and both take the `gdl` crate alone: gdl's runtime and
+//! code generator link velo from git, which Dynamo already takes from
+//! crates.io. `tests/dependencies.rs` keeps them out of this crate.
 
 pub mod config;
 pub mod metrics;
@@ -42,6 +47,7 @@ mod sink;
 mod stage;
 
 pub use bridge::{CxBridge, REQUEST_ID};
-pub use engine::PipelineEngine;
+pub use engine::{AnnotatedItems, PipelineEngine};
+pub use error::enter;
 pub use sink::EngineSink;
 pub use stage::DynOperatorStage;

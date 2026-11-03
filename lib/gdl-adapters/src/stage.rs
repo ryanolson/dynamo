@@ -33,6 +33,8 @@ type Downstream<Req, T> = Arc<dyn AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T
 /// The stage's own `Cx` does not reach the operator, for the reason
 /// [`EngineSink`](crate::EngineSink) gives: the request's Dynamo context is
 /// the source of truth.
+///
+/// Transition: remove when Migration and the encoder and prefill routers run as native gdl stages.
 pub struct DynOperatorStage<O: ?Sized, UpReq, UpT, DownReq: Data, DownT: Data> {
     op: Arc<O>,
     next: Downstream<DownReq, DownT>,

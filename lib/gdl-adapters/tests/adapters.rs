@@ -224,6 +224,8 @@ fn gdl_stage(op: Arc<PassThrough>, engine: Engine) -> Engine {
 }
 
 /// `op` above `engine`, composed with Dynamo's `link` chain.
+///
+/// Transition: remove when the gdl pipeline is the only local pipeline.
 fn link_stage(op: Arc<PassThrough>, engine: Engine) -> Engine {
     let frontend = ServiceFrontend::<SingleIn<u32>, Out>::new();
     let operator = Operator::into_operator(&op);

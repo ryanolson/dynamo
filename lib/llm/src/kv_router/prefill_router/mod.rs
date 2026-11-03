@@ -1926,6 +1926,8 @@ mod tests {
                 .unwrap();
         let tokenizer = card.tokenizer().unwrap();
         let mut seen = Vec::new();
+        // Transition: remove the Dynamo case and keep the gdl assertions when the gdl pipeline is
+        // the only local pipeline.
         for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
             let name = local_pipeline.as_str();
 

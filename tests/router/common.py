@@ -551,6 +551,7 @@ def _test_router_two_routers(
             kv_router.__exit__(None, None, None)
 
 
+# Transition: remove when the gdl pipeline is the only local pipeline.
 def local_pipeline_env(local_pipeline: str | None) -> dict[str, str | None]:
     """Frontend environment that selects ``local_pipeline`` (``None`` removes
     ``DYN_LOCAL_PIPELINE``, so an inherited value cannot select gdl) and logs
@@ -565,6 +566,7 @@ def local_pipeline_env(local_pipeline: str | None) -> dict[str, str | None]:
     }
 
 
+# Transition: remove when the gdl pipeline is the only local pipeline.
 def assert_local_pipeline(frontend, local_pipeline: str | None) -> None:
     """Fail unless the frontend built every routed pipeline on ``local_pipeline``
     (``None`` means the default, Dynamo's). A flag the frontend ignored fails here."""

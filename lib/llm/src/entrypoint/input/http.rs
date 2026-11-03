@@ -297,6 +297,7 @@ async fn run_with_router_plugins(
             let checksum = model.card().mdcsum();
 
             let tokenizer = model.card().tokenizer()?;
+            // Transition: remove when the gdl pipeline is the only local pipeline.
             let local_pipeline = common::LocalPipeline::configured()?;
             let chat_pipeline = common::build_pipeline::<
                 NvCreateChatCompletionRequest,
@@ -316,6 +317,7 @@ async fn run_with_router_plugins(
             >(model.card(), inner_engine, tokenizer, local_pipeline)
             .await?;
             manager.add_completions_model(model.display_name(), checksum, cmpl_pipeline)?;
+            // Transition: remove when the gdl pipeline is the only local pipeline.
             tracing::info!(
                 model = model.display_name(),
                 local_pipeline = local_pipeline.as_str(),

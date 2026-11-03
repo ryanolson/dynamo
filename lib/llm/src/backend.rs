@@ -17,20 +17,23 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
+    pin::Pin,
     sync::Arc,
     time::Instant,
 };
 
 use anyhow::Result;
+use futures::FutureExt;
 use futures::stream::{self, StreamExt};
 
 use crate::model_card::ModelDeploymentCard;
+use crate::operator::{Downstream, DynamoDownstream, GdlDownstream, GdlOperator, native};
 use dynamo_runtime::dynamo_nvtx_range;
 use dynamo_runtime::{
     error::{DynamoError, ErrorClass},
     pipeline::{
-        AsyncEngineContextProvider, ManyOut, Operator, ResponseStream, ServerStreamingEngine,
-        SingleIn, async_trait,
+        AsyncEngineContextProvider, ManyOut, Operator, ServerStreamingEngine, SingleIn, async_trait,
     },
     protocols::{annotated::Annotated, maybe_error::MaybeError},
 };
@@ -65,9 +68,11 @@ pub struct Backend {
 
 /// Internal state for managing token decoding and stream processing
 /// Supports n>1 (multiple choices) by maintaining per-choice decoders.
+///
+/// Transition: make concrete when the gdl pipeline is the only local pipeline.
 #[allow(dead_code)]
-struct DecoderUnfoldState {
-    stream: ManyOut<ExecutionOutputStream>,
+struct DecoderUnfoldState<S> {
+    stream: S,
     decoders: HashMap<u32, Decoder>,
     finished_choices: HashSet<u32>,
     validate_engine_decode: bool,
@@ -200,11 +205,12 @@ impl Backend {
         }
     }
 
-    fn decoder(
+    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
+    fn decoder<S>(
         &self,
-        stream: ManyOut<ExecutionOutputStream>,
+        stream: S,
         params: DecoderParams,
-    ) -> anyhow::Result<DecoderUnfoldState> {
+    ) -> anyhow::Result<DecoderUnfoldState<S>> {
         let Some(tokenizer) = self.tokenizer.as_ref() else {
             anyhow::bail!("Backend built from blank ModelDeploymentCard, no tokenizer");
         };
@@ -235,7 +241,7 @@ impl Backend {
     }
 }
 
-#[async_trait]
+// Transition: remove when the gdl pipeline is the only local pipeline.
 impl
     Operator<
         SingleIn<PreprocessedRequest>,
@@ -244,14 +250,58 @@ impl
         ManyOut<Annotated<LLMEngineOutput>>,
     > for Backend
 {
-    async fn generate(
-        &self,
+    fn generate<'life0, 'async_trait>(
+        &'life0 self,
         request: SingleIn<PreprocessedRequest>,
         next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
-    ) -> Result<ManyOut<Annotated<BackendOutput>>> {
+    ) -> Pin<
+        Box<dyn Future<Output = Result<ManyOut<Annotated<BackendOutput>>>> + Send + 'async_trait>,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(self.generate_tokens(request, DynamoDownstream(next)))
+    }
+}
+
+impl gdl::Operator for GdlOperator<Backend, PreprocessedRequest> {
+    type UpReq = SingleIn<PreprocessedRequest>;
+    type UpItem = Annotated<BackendOutput>;
+    type DownReq = SingleIn<PreprocessedRequest>;
+    type DownItem = Annotated<LLMEngineOutput>;
+
+    fn generate<N>(
+        &self,
+        cx: gdl::Cx,
+        request: SingleIn<PreprocessedRequest>,
+        next: N,
+    ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<BackendOutput>>>> + Send
+    where
+        N: gdl::Next<SingleIn<PreprocessedRequest>, Annotated<LLMEngineOutput>>,
+    {
+        self.op
+            .generate_tokens(request, GdlDownstream::new(cx, next))
+            .map(native)
+    }
+}
+
+impl Backend {
+    /// Send `request` on and detokenize the response: the body of Backend's Dynamo and gdl
+    /// operators.
+    ///
+    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
+    async fn generate_tokens<D>(
+        &self,
+        request: SingleIn<PreprocessedRequest>,
+        next: D,
+    ) -> Result<D::Response<BackendOutput>>
+    where
+        D: Downstream<PreprocessedRequest, LLMEngineOutput>,
+    {
         let decoder_params = DecoderParams::from_request(&request);
 
-        let next_stream = next.generate(request).await?;
+        let next_stream = next.send(request).await?;
 
         let context = next_stream.context();
         let state = self.decoder(next_stream, decoder_params)?;
@@ -658,10 +708,11 @@ impl
             })
         });
 
-        Ok(ResponseStream::new(Box::pin(stream), context))
+        Ok(D::respond(stream, context))
     }
 }
 
+// Transition: remove when the gdl pipeline is the only local pipeline.
 #[async_trait]
 impl
     Operator<
@@ -689,6 +740,26 @@ impl
         // - Usage statistics validation
 
         Ok(response_stream)
+    }
+}
+
+/// As the Dynamo operator above, a pass-through: the response is the stage below's own.
+impl gdl::Operator for GdlOperator<Backend, PreprocessedEmbeddingRequest> {
+    type UpReq = SingleIn<PreprocessedEmbeddingRequest>;
+    type UpItem = Annotated<EmbeddingsEngineOutput>;
+    type DownReq = SingleIn<PreprocessedEmbeddingRequest>;
+    type DownItem = Annotated<EmbeddingsEngineOutput>;
+
+    async fn generate<N>(
+        &self,
+        cx: gdl::Cx,
+        request: SingleIn<PreprocessedEmbeddingRequest>,
+        next: N,
+    ) -> gdl::Result<gdl::Items<Annotated<EmbeddingsEngineOutput>>>
+    where
+        N: gdl::Next<SingleIn<PreprocessedEmbeddingRequest>, Annotated<EmbeddingsEngineOutput>>,
+    {
+        next.generate(cx, request).await
     }
 }
 
