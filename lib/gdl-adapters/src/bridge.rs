@@ -91,7 +91,9 @@ impl CxBridge {
 /// not land after one. A kill can arrive from anywhere while the stop is
 /// being sent; `killed` is a child of `target`, which the controller tells
 /// before it publishes the kill, so a kill it saw is sent again after the
-/// stop.
+/// stop. Until then the context reads as stopped, not killed
+/// (`tests/races.rs`); only a controller that keeps a kill once set closes
+/// that window.
 async fn forward(
     cx: Cx,
     target: Weak<dyn AsyncEngineContext>,
