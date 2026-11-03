@@ -292,6 +292,18 @@ for boundary_case in "floor 62 750" "percent 37450 752"; do
     done
 done
 
+# Conflicting duplicate rows must not hide an allocation rise behind the last row.
+cp "$work/base" "$work/duplicate-base"
+awk '$1 == "B" && $2 == "dynamo" { $3++; $7++; $9 = $3 ".." $3 "," $7 ".." $7; print }' "$work/base" \
+    >>"$work/duplicate-base"
+FAKE_RISE_ROW=b FAKE_RISE_ALLOCS=1 \
+    run "$here/hotpath.sh" --base "$work/duplicate-base"
+if [[ $status -eq 0 ]]; then
+    fail base-duplicate "accepted conflicting B dynamo rows and hid allocation rises from 2 to 3 and 17 to 18"
+else
+    echo "ok hotpath.sh base-duplicate"
+fi
+
 if ((failures > 0)); then
     echo "$failures failed" >&2
     exit 1
