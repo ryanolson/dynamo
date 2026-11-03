@@ -749,6 +749,10 @@ impl ModelWatcher {
                 None
             };
 
+            // Whether `PreprocessedRouting::build_pipeline` built a chat or completions
+            // engine, so the local pipeline it composed on is logged once for the model.
+            let mut routed_pipeline_built = false;
+
             // Add chat engine only if the model supports chat
             if card.model_type.supports_chat() {
                 let routing = preprocessed_routing.as_ref().ok_or_else(|| {
@@ -774,6 +778,7 @@ impl ModelWatcher {
                         Some(preprocessor) => preprocessor,
                         None => worker_set_chat_preprocessor(card, tk.clone(), &cancellation)?,
                     };
+                    routed_pipeline_built = true;
                     Some(
                         routing
                             .build_pipeline::<
@@ -830,12 +835,23 @@ impl ModelWatcher {
                         )
                         .context("PreprocessedRouting::build_pipeline")?;
                     worker_set.completions_engine = Some(completions_engine);
+                    routed_pipeline_built = true;
                     tracing::info!("Completions is ready");
                 } else {
                     tracing::warn!(
                         "Skipping completions engine: no Rust tokenizer available for this model"
                     );
                 }
+            }
+
+            if let Some(routing) = preprocessed_routing.as_ref()
+                && routed_pipeline_built
+            {
+                tracing::info!(
+                    model = card.name(),
+                    local_pipeline = routing.local_pipeline().as_str(),
+                    "Built the routed local pipeline"
+                );
             }
 
             // Generate is a frontend-native token-in/token-out surface. It

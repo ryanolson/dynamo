@@ -28,6 +28,7 @@ tokio = { workspace = true }
 dynamo-kv-router = { workspace = true }
 dynamo-llm = { workspace = true }
 dynamo-mocker = { workspace = true }
+dynamo-renderer = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 temp-env = { version = "0.3.6", features = ["async_closure"] }

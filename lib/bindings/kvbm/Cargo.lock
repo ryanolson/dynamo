@@ -2083,6 +2083,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dynamo-gdl-adapters"
+version = "1.7.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "dynamo-runtime",
+ "futures",
+ "gdl",
+ "tokio",
+]
+
+[[package]]
 name = "dynamo-kv-hashing"
 version = "1.7.0"
 dependencies = [
@@ -2167,6 +2179,7 @@ dependencies = [
  "dialoguer",
  "dynamo-custom-policy-builtin",
  "dynamo-decisions",
+ "dynamo-gdl-adapters",
  "dynamo-kv-router",
  "dynamo-memory",
  "dynamo-mocker",
@@ -2183,6 +2196,7 @@ dependencies = [
  "futures",
  "futures-util",
  "galil-seiferas",
+ "gdl",
  "half",
  "hf-hub",
  "http-body-util",
@@ -3002,6 +3016,86 @@ checksum = "794ac25cfda3fa11d2b07ff8c65889c6c03411646df54e59e606878d899e1d5a"
 dependencies = [
  "defmac",
  "unchecked-index",
+]
+
+[[package]]
+name = "gdl"
+version = "0.1.0"
+source = "git+https://github.com/ryanolson/gdl?rev=37864fbb59ceb3da04db3d2965dab3633430c283#37864fbb59ceb3da04db3d2965dab3633430c283"
+dependencies = [
+ "arc-swap",
+ "futures",
+ "gdl-macros",
+ "gdl-message",
+ "gdl-model",
+ "gdl-pools",
+ "pin-project-lite",
+ "prometheus",
+ "rmp-serde",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "gdl-macros"
+version = "0.1.0"
+source = "git+https://github.com/ryanolson/gdl?rev=37864fbb59ceb3da04db3d2965dab3633430c283#37864fbb59ceb3da04db3d2965dab3633430c283"
+dependencies = [
+ "gdl-model",
+ "gdl-syntax",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "gdl-message"
+version = "0.1.0"
+source = "git+https://github.com/ryanolson/gdl?rev=37864fbb59ceb3da04db3d2965dab3633430c283#37864fbb59ceb3da04db3d2965dab3633430c283"
+dependencies = [
+ "gdl-macros",
+ "gdl-model",
+ "linkme",
+ "serde",
+ "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
+name = "gdl-model"
+version = "0.1.0"
+source = "git+https://github.com/ryanolson/gdl?rev=37864fbb59ceb3da04db3d2965dab3633430c283#37864fbb59ceb3da04db3d2965dab3633430c283"
+dependencies = [
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
+name = "gdl-pools"
+version = "0.1.0"
+source = "git+https://github.com/ryanolson/gdl?rev=37864fbb59ceb3da04db3d2965dab3633430c283#37864fbb59ceb3da04db3d2965dab3633430c283"
+dependencies = [
+ "futures",
+ "gdl-model",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "gdl-syntax"
+version = "0.1.0"
+source = "git+https://github.com/ryanolson/gdl?rev=37864fbb59ceb3da04db3d2965dab3633430c283#37864fbb59ceb3da04db3d2965dab3633430c283"
+dependencies = [
+ "gdl-model",
+ "proc-macro2",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -4418,6 +4512,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f02ab6bace2054fb888a3c16f990117b579d14a3088e472d63c6011fa185c9d3"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "linkme"
+version = "0.3.37"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3045e122bd98aef8ec3ad58ce84f0791f64e70163d1a02710af4aa11a4d54cc5"
+dependencies = [
+ "linkme-impl",
+]
+
+[[package]]
+name = "linkme-impl"
+version = "0.3.37"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77060ebe535362c3da75682cd17b0431017b6e7c5661e714fc69a7ad017d1301"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -8199,6 +8313,21 @@ dependencies = [
 
 [[package]]
 name = "toml"
+version = "0.9.12+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf92845e79fc2e2def6a5d828f0801e29a2f8acc037becc5ab08595c7d5e9863"
+dependencies = [
+ "indexmap 2.14.0",
+ "serde_core",
+ "serde_spanned 1.1.1",
+ "toml_datetime 0.7.5+spec-1.1.0",
+ "toml_parser",
+ "toml_writer",
+ "winnow 0.7.15",
+]
+
+[[package]]
+name = "toml"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81f3d15e84cbcd896376e6730314d59fb5a87f31e4b038454184435cd57defee"
@@ -8217,6 +8346,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22cddaf88f4fbc13c51aebbf5f8eceb5c7c5a9da2ac40a13519eb5b0a0e8f11c"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "toml_datetime"
+version = "0.7.5+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92e1cfed4a3038bc5a127e35a2d360f145e1f4b971b551a2ba5fd7aedf7e1347"
+dependencies = [
+ "serde_core",
 ]
 
 [[package]]
@@ -8256,6 +8394,12 @@ name = "toml_write"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
+
+[[package]]
+name = "toml_writer"
+version = "1.1.3+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06bdbd8cfc056b8d2e2e85f29b56a3bdbecb527cef81eb39e3e7b98af4652770"
 
 [[package]]
 name = "tonic"

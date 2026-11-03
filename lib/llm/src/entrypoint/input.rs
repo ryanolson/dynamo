@@ -16,7 +16,8 @@ use std::{
 mod common;
 pub(crate) use common::build_preprocessed_routing_with_session_affinity_mode;
 pub use common::{
-    PreprocessedRouting, build_embeddings_pipeline, build_pipeline, build_preprocessed_routing,
+    LocalPipeline, PreprocessedRouting, build_embeddings_pipeline, build_pipeline,
+    build_preprocessed_routing,
 };
 pub mod endpoint;
 pub mod grpc;

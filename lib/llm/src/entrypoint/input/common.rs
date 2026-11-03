@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::pin::Pin;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -41,10 +42,12 @@ use crate::{
     },
 };
 
+use dynamo_gdl_adapters::{DynOperatorStage, EngineSink, PipelineEngine};
 use dynamo_kv_router::config::min_initial_workers_from_env;
 use dynamo_runtime::{
     DistributedRuntime,
     component::Client,
+    config::environment_names::llm::DYN_LOCAL_PIPELINE,
     engine::{AsyncEngineStream, Data},
     pipeline::{
         Context, ManyOut, MultimodalCacheKeyExtractor, Operator, RouterMode, SegmentSource,
@@ -59,6 +62,53 @@ pub struct PreprocessedRouting {
         ServiceEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>>,
     prefill_router: Arc<PrefillRouter>,
     encoder_router: Arc<EncoderRouter>,
+    local_pipeline: LocalPipeline,
+}
+
+/// How [`PreprocessedRouting::build_pipeline`] composes its stages. The stages and
+/// what they do are the same either way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LocalPipeline {
+    /// Dynamo's `link` chain.
+    #[default]
+    Dynamo,
+    /// A gdl local pipeline of nested calls, with Dynamo's operators and engine
+    /// wrapped by `dynamo-gdl-adapters`.
+    Gdl,
+}
+
+impl LocalPipeline {
+    /// The name `DYN_LOCAL_PIPELINE` takes, and the frontend logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dynamo => "dynamo",
+            Self::Gdl => "gdl",
+        }
+    }
+
+    /// The pipeline `DYN_LOCAL_PIPELINE` selects. The variable is read once per process.
+    pub fn configured() -> anyhow::Result<Self> {
+        static CONFIGURED: LazyLock<Result<LocalPipeline, String>> = LazyLock::new(|| {
+            let value = match std::env::var(DYN_LOCAL_PIPELINE) {
+                Ok(value) => Some(value),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(error) => return Err(format!("invalid {DYN_LOCAL_PIPELINE}: {error}")),
+            };
+            LocalPipeline::parse(value.as_deref()).map_err(|error| format!("{error:#}"))
+        });
+        CONFIGURED.clone().map_err(anyhow::Error::msg)
+    }
+
+    fn parse(value: Option<&str>) -> anyhow::Result<Self> {
+        match value.map(str::trim) {
+            None | Some("") => Ok(Self::Dynamo),
+            Some(value) if value.eq_ignore_ascii_case("dynamo") => Ok(Self::Dynamo),
+            Some(value) if value.eq_ignore_ascii_case("gdl") => Ok(Self::Gdl),
+            Some(value) => {
+                anyhow::bail!("invalid {DYN_LOCAL_PIPELINE}={value:?}: expected `dynamo` or `gdl`")
+            }
+        }
+    }
 }
 
 pub struct PreparedEngine {
@@ -265,11 +315,10 @@ pub(crate) async fn build_preprocessed_routing_with_session_affinity_mode(
             .set_decode_routing_host(routing_host.clone())
             .context("install conditional-disagg decode RoutingHost")?;
     }
-    Ok(PreprocessedRouting::new(
-        routing_host,
-        prefill_router,
-        encoder_router,
-    ))
+    Ok(
+        PreprocessedRouting::new(routing_host, prefill_router, encoder_router)
+            .with_local_pipeline(LocalPipeline::configured()?),
+    )
 }
 
 /// Turns an EngineConfig into an OpenAI chat-completions and completions supported StreamingEngine.
@@ -452,10 +501,12 @@ pub fn build_embeddings_pipeline(
 }
 
 impl PreprocessedRouting {
-    /// Route through `backend_engine` behind the given prefill and encoder routers.
+    /// Route through `backend_engine` behind the given prefill and encoder routers, on
+    /// Dynamo's local pipeline.
     ///
     /// [`build_preprocessed_routing`] builds the backend engine (a `RoutingHost`) from a
-    /// discovery client; this takes any engine, so a test can stand in for the workers.
+    /// discovery client and selects the local pipeline from `DYN_LOCAL_PIPELINE`; this takes
+    /// any engine, so a test can stand in for the workers.
     pub fn new(
         backend_engine: ServiceEngine<
             SingleIn<PreprocessedRequest>,
@@ -468,7 +519,19 @@ impl PreprocessedRouting {
             backend_engine,
             prefill_router,
             encoder_router,
+            local_pipeline: LocalPipeline::Dynamo,
         }
+    }
+
+    /// Compose [`build_pipeline`](Self::build_pipeline) on `local_pipeline`.
+    pub fn with_local_pipeline(mut self, local_pipeline: LocalPipeline) -> Self {
+        self.local_pipeline = local_pipeline;
+        self
+    }
+
+    /// The local pipeline [`build_pipeline`](Self::build_pipeline) composes on.
+    pub fn local_pipeline(&self) -> LocalPipeline {
+        self.local_pipeline
     }
 
     /// The normal way to build an inference pipeline. Connect this directly to HTTP layer.
@@ -491,11 +554,16 @@ impl PreprocessedRouting {
                 Pin<Box<dyn AsyncEngineStream<Annotated<BackendOutput>>>>,
             >,
     {
+        let token_backend = Backend::from_tokenizer(tokenizer);
+        let migration = Migration::from_mdc(card, migration_limit, migration_max_seq_len, metrics);
+        if self.local_pipeline == LocalPipeline::Gdl {
+            return Ok(self.compose_gdl_pipeline(preprocessor, migration, token_backend));
+        }
+
         let frontend = SegmentSource::<SingleIn<Req>, ManyOut<Annotated<Resp>>>::new();
         let preprocessor_op = preprocessor.into_operator();
-        let token_backend = Backend::from_tokenizer(tokenizer).into_operator();
-        let migration = Migration::from_mdc(card, migration_limit, migration_max_seq_len, metrics)
-            .into_operator_for::<BackendOutput>();
+        let token_backend = token_backend.into_operator();
+        let migration = migration.into_operator_for::<BackendOutput>();
         let prefill_op = self.prefill_router.into_operator();
         let encoder_op = self.encoder_router.into_operator();
         let backend = ServiceBackend::from_engine(self.backend_engine.clone());
@@ -515,6 +583,59 @@ impl PreprocessedRouting {
             .link_terminal(frontend)?;
 
         Ok(engine)
+    }
+
+    /// [`build_pipeline`](Self::build_pipeline)'s chain as a gdl local pipeline: each
+    /// operator calls the hop below it directly, with no response map per stage.
+    ///
+    /// Built from the terminal up, since each stage owns the hop it calls. Each operator
+    /// is a `DynOperatorStage`, so it still gets its downstream as an `AsyncEngine`; the
+    /// types are spelled out because Backend and the preprocessor implement `Operator`
+    /// more than once.
+    fn compose_gdl_pipeline<Req, Resp>(
+        &self,
+        preprocessor: Arc<OpenAIPreprocessor>,
+        migration: Arc<Migration>,
+        token_backend: Arc<Backend>,
+    ) -> ServiceEngine<SingleIn<Req>, ManyOut<Annotated<Resp>>>
+    where
+        Req: Data,
+        Resp: Data,
+        OpenAIPreprocessor: Operator<
+                Context<Req>,
+                Pin<Box<dyn AsyncEngineStream<Annotated<Resp>>>>,
+                Context<PreprocessedRequest>,
+                Pin<Box<dyn AsyncEngineStream<Annotated<BackendOutput>>>>,
+            >,
+    {
+        use gdl::{Hop, SinkStage};
+        type Pre = PreprocessedRequest;
+        type Out = LLMEngineOutput;
+
+        let routing = SinkStage::new(Arc::new(EngineSink::new(self.backend_engine.clone())));
+        let prefill = DynOperatorStage::<_, Pre, Out, Pre, Out>::new(
+            self.prefill_router.clone(),
+            Hop::new((), routing, ()),
+        );
+        let encoder = DynOperatorStage::<_, Pre, Out, Pre, Out>::new(
+            self.encoder_router.clone(),
+            Hop::new((), prefill, ()),
+        );
+        let token_backend = DynOperatorStage::<_, Pre, BackendOutput, Pre, Out>::new(
+            token_backend,
+            Hop::new((), encoder, ()),
+        );
+        let migration = DynOperatorStage::<_, Pre, BackendOutput, Pre, BackendOutput>::new(
+            migration,
+            Hop::new((), token_backend, ()),
+        );
+        let preprocessor = DynOperatorStage::<_, Req, Resp, Pre, BackendOutput>::new(
+            preprocessor,
+            Hop::new((), migration, ()),
+        );
+        Arc::new(PipelineEngine::<_, Req, Resp>::new(gdl::Source::new(
+            Hop::new((), preprocessor, ()),
+        )))
     }
 
     /// Bring your own pre/post processor. Used when frontend has `--dyn-chat-processor
@@ -555,6 +676,31 @@ impl PreprocessedRouting {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_pipeline_is_dynamo_unless_gdl_is_named() {
+        for value in [None, Some(""), Some("dynamo"), Some(" Dynamo ")] {
+            assert_eq!(
+                LocalPipeline::parse(value).unwrap(),
+                LocalPipeline::Dynamo,
+                "{value:?}"
+            );
+        }
+        for value in [Some("gdl"), Some("GDL"), Some(" gdl\n")] {
+            assert_eq!(
+                LocalPipeline::parse(value).unwrap(),
+                LocalPipeline::Gdl,
+                "{value:?}"
+            );
+        }
+        // A misspelled value must not fall back to Dynamo's pipeline: the run
+        // would look like a gdl run and measure Dynamo's.
+        let err = LocalPipeline::parse(Some("gld")).unwrap_err().to_string();
+        assert!(
+            err.contains("DYN_LOCAL_PIPELINE") && err.contains("gld"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn test_validate_router_mode_for_lora() {

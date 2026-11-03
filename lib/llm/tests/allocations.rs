@@ -12,6 +12,7 @@
 //! | `engine` | the test LLM engine, called directly | itself |
 //! | `a` | `build_pipeline`: preprocessor, backend | test LLM engine |
 //! | `b` | `PreprocessedRouting::build_pipeline`: preprocessor, migration, backend, encoder router, prefill router | test LLM engine, in place of `RoutingHost` |
+//! | `b-gdl` | `b` composed as a gdl local pipeline (`LocalPipeline::Gdl`, what `DYN_LOCAL_PIPELINE=gdl` selects) | test LLM engine, in place of `RoutingHost` |
 //! | `c` | `PreprocessedRouting::build_preprocessed_pipeline`: migration, encoder router, prefill router | test LLM engine, in place of `RoutingHost` |
 //! | `embed-engine` | the test embeddings engine, called directly | itself |
 //! | `embed` | `build_embeddings_pipeline`: preprocessor, backend | test embeddings engine, in place of `PushRouter` |
@@ -48,9 +49,15 @@
 //! | `engine` | 7 | 2,752 | 22 | 2,812 |
 //! | `a` | 349 | 100,958 | 862 | 122,446 |
 //! | `b` | 402 | 227,025 | 915 | 248,513 |
+//! | `b-gdl` | 455 | 223,943 | 968 | 245,431 |
 //! | `c` | 71 | 144,683 | 86 | 144,743 |
 //! | `embed-engine` | 8 | 6,548 | 23 | 88,868 |
 //! | `embed` | 199 | 44,406 | 2,283 | 529,854 |
+//!
+//! `b-gdl` costs 53 allocations more than `b` at both item counts, so nothing per item. That is
+//! the adapters' cost in `lib/gdl-adapters/tests/allocations.rs`: 23 allocations per adapted
+//! operator against 14 for a `link` stage, 5 operators, and 8 more at the boundary
+//! (`PipelineEngine` above, `EngineSink` below): 5 × 9 + 8 = 53. Native gdl operators remove it.
 //!
 //! Most of `c`'s bytes are two boxed futures of 59,592 bytes each, allocated by the edge that
 //! carries the request from Migration (`RetryManager::new_stream`) to the next stage.
@@ -71,7 +78,7 @@ use futures::StreamExt;
 use dynamo_llm::backend::ExecutionContext;
 use dynamo_llm::discovery::ModelManager;
 use dynamo_llm::entrypoint::input::{
-    PreprocessedRouting, build_embeddings_pipeline, build_pipeline,
+    LocalPipeline, PreprocessedRouting, build_embeddings_pipeline, build_pipeline,
 };
 use dynamo_llm::http::service::metrics::Metrics;
 use dynamo_llm::kv_router::{EncoderRouter, PrefillRouter};
@@ -104,6 +111,8 @@ const BASELINE: &[Row] = &[
     row("a", 16, 862, 122446),
     row("b", 1, 402, 227025),
     row("b", 16, 915, 248513),
+    row("b-gdl", 1, 455, 223943),
+    row("b-gdl", 16, 968, 245431),
     row("c", 1, 71, 144683),
     row("c", 16, 86, 144743),
     row("embed-engine", 1, 8, 6548),
@@ -533,8 +542,14 @@ async fn measure_a(fixture: &Fixture, items: usize, requests: usize) -> Measured
     .await
 }
 
-async fn measure_b(fixture: &Fixture, items: usize, requests: usize) -> Measured {
-    let routing = fixture.routing(items);
+async fn measure_b(
+    fixture: &Fixture,
+    name: &'static str,
+    local_pipeline: LocalPipeline,
+    items: usize,
+    requests: usize,
+) -> Measured {
+    let routing = fixture.routing(items).with_local_pipeline(local_pipeline);
     let cancel = tokio_util::sync::CancellationToken::new();
     let dynamo_renderer::PromptFormatter::OAI(formatter) =
         prompt_formatter_from_mdc(&fixture.card).expect("formatter");
@@ -555,7 +570,7 @@ async fn measure_b(fixture: &Fixture, items: usize, requests: usize) -> Measured
             Arc::new(Metrics::new()),
         )
         .expect("pipeline b");
-    measure("b", items, requests, || {
+    measure(name, items, requests, || {
         let pipeline = pipeline.clone();
         let request = chat_request();
         async move { drain(pipeline.generate(Context::new(request)).await.unwrap()).await }
@@ -622,7 +637,8 @@ async fn measure_row(fixture: &Fixture, name: &str, items: usize, requests: usiz
     match name {
         "engine" => measure_engine(fixture, items, requests).await,
         "a" => measure_a(fixture, items, requests).await,
-        "b" => measure_b(fixture, items, requests).await,
+        "b" => measure_b(fixture, "b", LocalPipeline::Dynamo, items, requests).await,
+        "b-gdl" => measure_b(fixture, "b-gdl", LocalPipeline::Gdl, items, requests).await,
         "c" => measure_c(fixture, items, requests).await,
         "embed-engine" => measure_embed_engine(fixture, items, requests).await,
         "embed" => measure_embed(fixture, items, requests).await,
@@ -712,6 +728,8 @@ const ROWS: &[(&str, usize)] = &[
     ("a", 16),
     ("b", 1),
     ("b", 16),
+    ("b-gdl", 1),
+    ("b-gdl", 16),
     ("c", 1),
     ("c", 16),
     ("embed-engine", 1),
