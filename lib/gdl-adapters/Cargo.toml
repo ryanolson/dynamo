@@ -14,4 +14,7 @@ publish = false
 # Only the `gdl` crate, never gdl's runtime or code generator: they bring a
 # second velo from git. `tests/dependencies.rs` checks.
 [dependencies]
+async-trait = { workspace = true }
+dynamo-runtime = { workspace = true }
 gdl = { workspace = true }
+tokio = { workspace = true }

@@ -2492,7 +2492,10 @@ dependencies = [
 name = "dynamo-gdl-adapters"
 version = "1.7.0"
 dependencies = [
+ "async-trait",
+ "dynamo-runtime",
  "gdl",
+ "tokio",
 ]
 
 [[package]]
