@@ -2769,6 +2769,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "percent-encoding",
+ "pin-project-lite",
  "prometheus",
  "proptest",
  "prost 0.13.5",
