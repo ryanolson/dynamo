@@ -235,17 +235,24 @@ async fn window<F: std::future::Future>(body: F) -> (Counts, F::Output) {
     let out = body.await;
     let settle_start = std::time::Instant::now();
     let settled = || settle_start.elapsed() < std::time::Duration::from_secs(5);
+    let total =
+        || ON_THREAD_ALLOCS.load(Ordering::SeqCst) + OFF_THREAD_ALLOCS.load(Ordering::SeqCst);
+    // Settle in rounds until one round allocates nothing. Work that spawns more work allocates
+    // to spawn it, so a quiet round means nothing is left that could allocate.
     loop {
-        // Each yield also polls the I/O driver, so tasks waiting on a socket make progress.
-        tokio::task::yield_now().await;
-        let alive = runtime.num_alive_tasks();
-        if alive > tasks_before {
+        let before = total();
+        loop {
+            // Each yield also polls the I/O driver, so tasks waiting on a socket make progress.
+            tokio::task::yield_now().await;
+            let alive = runtime.num_alive_tasks();
+            if alive <= tasks_before {
+                break;
+            }
             assert!(
                 settled(),
                 "a request left {} tasks running",
                 alive - tasks_before
             );
-            continue;
         }
         // `num_alive_tasks` does not see blocking jobs. The runtime has one blocking thread, so
         // a no-op job finishes only after every job queued before it. Spawning it allocates on
@@ -260,8 +267,7 @@ async fn window<F: std::future::Future>(body: F) -> (Counts, F::Output) {
         HARNESS.with(|h| h.set(true));
         drop(barrier);
         HARNESS.with(|h| h.set(false));
-        // The blocking work may have spawned tasks of its own.
-        if runtime.num_alive_tasks() <= tasks_before {
+        if total() == before {
             break;
         }
     }
@@ -648,6 +654,21 @@ async fn check_counter() {
         (detached.off_allocs, detached.off_bytes),
         (1, 8),
         "a detached blocking job's allocation must count in its window"
+    );
+    // So does blocking work that blocking work spawns after the window began to settle.
+    let (nested, ()) = window(async {
+        drop(tokio::task::spawn_blocking(|| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            drop(tokio::task::spawn_blocking(|| {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                std::hint::black_box(Box::new([0u8; 4096]));
+            }));
+        }));
+    })
+    .await;
+    assert!(
+        nested.off_bytes >= 4096,
+        "a nested blocking job's allocation must count in its window: {nested:?}"
     );
 }
 
