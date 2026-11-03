@@ -254,6 +254,34 @@ for base_case in empty six-column; do
     fi
 done
 
+# A rise equal to the instruction tolerance must pass, including fractional per-item counts.
+for boundary_case in "floor 62 750" "percent 37450 752"; do
+    read -r boundary_name base_rise allowed_rise <<<"$boundary_case"
+    FAKE_RISE_ROW=b FAKE_RISE_ITEMS=16 FAKE_RISE_INSTR=$base_rise \
+        run "$here/hotpath.sh"
+    if [[ $status -ne 0 ]]; then
+        fail "item-$boundary_name-base" "exit status $status, want 0"
+        continue
+    fi
+    cp "$work/stdout" "$work/boundary-base"
+    for offset in -1 0 1; do
+        want=0
+        ((offset > 0)) && want=1
+        FAKE_RISE_ROW=b FAKE_RISE_ITEMS=16 \
+            FAKE_RISE_INSTR=$((base_rise + allowed_rise + offset)) \
+            run "$here/hotpath.sh" --base "$work/boundary-base"
+        if [[ $status -ne $want ]]; then
+            fail "item-$boundary_name-$offset" "exit status $status, want $want at tolerance offset $offset/15"
+        elif [[ $want -eq 0 ]] && grep -Eq 'RISE|WORSE' "$work/stdout"; then
+            fail "item-$boundary_name-$offset" "marked a rise within the tolerance"
+        elif [[ $want -eq 1 ]] && ! grep -Eq '^B +dynamo .* RISE$' "$work/stdout"; then
+            fail "item-$boundary_name-$offset" "did not mark B dynamo above the tolerance"
+        else
+            echo "ok hotpath.sh item-$boundary_name-$offset"
+        fi
+    done
+done
+
 if ((failures > 0)); then
     echo "$failures failed" >&2
     exit 1
