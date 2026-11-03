@@ -50,10 +50,10 @@
 //! | Row | Allocations, 1 item | Bytes, 1 item | Allocations, 16 items | Bytes, 16 items |
 //! |---|---:|---:|---:|---:|
 //! | `engine` | 7 | 2,752 | 22 | 2,812 |
-//! | `a` | 349 | 100,958 | 862 | 122,446 |
-//! | `a-gdl` | 333 | 81,383 | 846 | 102,871 |
-//! | `b` | 402 | 227,025 | 915 | 248,513 |
-//! | `b-gdl` | 359 | 127,458 | 872 | 148,946 |
+//! | `a` | 347 | 100,862 | 860 | 122,350 |
+//! | `a-gdl` | 331 | 81,271 | 844 | 102,759 |
+//! | `b` | 400 | 226,929 | 913 | 248,417 |
+//! | `b-gdl` | 357 | 127,346 | 870 | 148,834 |
 //! | `c` | 71 | 144,683 | 86 | 144,743 |
 //! | `c-gdl` | 46 | 62,124 | 61 | 62,184 |
 //! | `embed-engine` | 8 | 6,548 | 23 | 88,868 |
@@ -75,12 +75,13 @@
 //! that of `b-gdl` and `c-gdl` is 16,496 bytes (debug build). `a` and `embed`, which have no
 //! Migration, make neither.
 //!
-//! Run: `cargo test -p dynamo-llm --test allocations`. For instructions per request, see
-//! `lib/llm/benches/callgrind.sh` and `hotpath.sh`, which run this binary under callgrind as
-//! `allocations row <row> <items> <requests>`. Callgrind counts only the measured requests: the
-//! binary asks it for one dump after warm-up and one after the last measured request (see
-//! `lib/runtime/tests/common/callgrind.rs`). Callgrind does not count the system allocator,
-//! whose cost follows its heap state, nor this thread while it waits at the end of a window.
+//! Run: `cargo test -p dynamo-llm --test allocations`. For instructions and `memcpy` calls per
+//! request, see `lib/llm/benches/callgrind.sh` and `hotpath.sh`, which run this binary under
+//! callgrind as `allocations row <row> <items> <requests>`. Callgrind counts only the measured
+//! requests: the binary asks it for one dump after warm-up and one after the last measured
+//! request (see `lib/runtime/tests/common/callgrind.rs`). Callgrind does not count the system
+//! allocator, whose cost follows its heap state, nor this thread while it waits at the end of a
+//! window.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -127,15 +128,15 @@ const BASELINE: &[Row] = &[
     row("engine", 1, 7, 2752),
     row("engine", 16, 22, 2812),
     // Transition: remove when the gdl pipeline is the only local pipeline.
-    row("a", 1, 349, 100958),
-    row("a", 16, 862, 122446),
-    row("a-gdl", 1, 333, 81383),
-    row("a-gdl", 16, 846, 102871),
+    row("a", 1, 347, 100862),
+    row("a", 16, 860, 122350),
+    row("a-gdl", 1, 331, 81271),
+    row("a-gdl", 16, 844, 102759),
     // Transition: remove when the gdl pipeline is the only local pipeline.
-    row("b", 1, 402, 227025),
-    row("b", 16, 915, 248513),
-    row("b-gdl", 1, 359, 127458),
-    row("b-gdl", 16, 872, 148946),
+    row("b", 1, 400, 226929),
+    row("b", 16, 913, 248417),
+    row("b-gdl", 1, 357, 127346),
+    row("b-gdl", 16, 870, 148834),
     // Transition: remove when the gdl pipeline is the only local pipeline.
     row("c", 1, 71, 144683),
     row("c", 16, 86, 144743),

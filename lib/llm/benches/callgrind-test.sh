@@ -18,9 +18,12 @@
 #   nowindow   writes no window dump, as when the client requests are no-ops, and exits 0
 #   noallocs   prints no allocs= and exits 0
 #
-# Counts: a row of name length L at I items makes L + I allocations and 1000 * L + 10 * I
-# instructions per request, plus FAKE_RISE_ALLOCS and FAKE_RISE_INSTR for the row named
-# FAKE_RISE_ROW. The window of N requests holds N times the per-request instructions; the whole
+# Counts: a row of name length L at I items makes L + I allocations, 1000 * L + 10 * I
+# instructions and 2 * L + I memcpy calls per request, plus FAKE_RISE_ALLOCS, FAKE_RISE_INSTR and
+# FAKE_RISE_MEMCPY for the row named FAKE_RISE_ROW. FAKE_RISE_WINDOW_MEMCPY adds calls once to
+# that row's measured window. The window spreads the memcpy calls over
+# glibc's aarch64 and x86_64 names, through `__memcpy_chk`, whose own call to memcpy is not
+# another move, and next to a call to a function whose name only contains "mem". The window of N requests holds N times the per-request instructions; the whole
 # run holds more, so reading it gives a wrong count. With FAKE_JITTER, a run after the first of
 # a row (its output file's index is 22 or more) costs 100 instructions more per request.
 
@@ -54,10 +57,14 @@ args=("$@")
 row=${args[$# - 3]} items=${args[$# - 2]}
 allocs=$((${#row} + items))
 per=$((1000 * ${#row} + 10 * items))
+moves=$((items))
+extra_moves=0
 if [[ $row == "${FAKE_RISE_ROW:-}" ]] \
     && [[ -z ${FAKE_RISE_ITEMS:-} || $items == "$FAKE_RISE_ITEMS" ]]; then
     allocs=$((allocs + ${FAKE_RISE_ALLOCS:-0}))
     per=$((per + ${FAKE_RISE_INSTR:-0}))
+    moves=$((moves + ${FAKE_RISE_MEMCPY:-0}))
+    extra_moves=${FAKE_RISE_WINDOW_MEMCPY:-0}
 fi
 index=$(basename "$out")
 index=${index%%.*}
@@ -74,6 +81,24 @@ if [[ $mode != nowindow ]]; then
     {
         echo "desc: Trigger: Client Request: measured requests"
         [[ $mode == nosummary ]] || echo "summary: $((per * n))"
+        echo "fn=(1) caller_a"
+        echo "cfn=(2) __GI_memcpy"
+        echo "calls=$((${#row} * n)) 0"
+        echo "0 10"
+        echo "cfn=(6) core::mem::replace"
+        echo "calls=$((3 * n)) 0"
+        echo "0 10"
+        echo "fn=(3) __memcpy_chk"
+        echo "cfn=(2)"
+        echo "calls=$((${#row} * n)) 0"
+        echo "0 10"
+        echo "fn=(4) caller_b"
+        echo "cfn=(3)"
+        echo "calls=$((${#row} * n)) 0"
+        echo "0 10"
+        echo "cfn=(5) __memmove_avx_unaligned_erms"
+        echo "calls=$((moves * n + extra_moves)) 0"
+        echo "0 10"
     } >"$out.2"
 fi
 # FAKE_FLIP_ROW: some requests make 2 allocations fewer, and they are the typical ones.
@@ -111,14 +136,15 @@ fail() {
 }
 
 # callgrind.sh reads the window, not the whole run, and the allocations of the same run.
-# b-gdl: 5 + 1 allocations, 5000 + 10 instructions; ingress at 16: 23, 7160.
+# b-gdl: 5 + 1 allocations, 5000 + 10 instructions, 10 + 1 memcpy calls; ingress at 16: 23,
+# 7160, 30.
 FAKE_VALGRIND_MODE=ok run "$here/callgrind.sh" b-gdl 1 ingress 16
 if [[ $status -ne 0 ]]; then
     fail ok "exit status $status, want 0"
-elif ! grep -Eq '^b-gdl +1 +6 +5010 +6\.\.6$' "$work/stdout"; then
-    fail ok "no 'b-gdl 1 6 5010 6..6' row"
-elif ! grep -Eq '^ingress +16 +23 +7160 +23\.\.23$' "$work/stdout"; then
-    fail ok "no 'ingress 16 23 7160 23..23' row"
+elif ! grep -Eq '^b-gdl +1 +6 +5010 +11 +6\.\.6$' "$work/stdout"; then
+    fail ok "no 'b-gdl 1 6 5010 11 6..6' row"
+elif ! grep -Eq '^ingress +16 +23 +7160 +30 +23\.\.23$' "$work/stdout"; then
+    fail ok "no 'ingress 16 23 7160 30 23..23' row"
 elif ! grep -q '"executable":"/nonexistent/ingress_allocations"' <(PATH="$work/bin:$PATH" cargo test --test ingress_allocations); then
     fail ok "the cargo stand-in does not name the ingress binary"
 else
@@ -146,13 +172,14 @@ else
     echo "ok callgrind.sh order"
 fi
 
-# hotpath.sh: the table. A dynamo: 1 + 1 = 2 allocations and 1010 instructions at 1 item,
-# 17 and 1160 at 16, so 1.00 allocations and 10 instructions per extra item.
+# hotpath.sh: the table. A dynamo: 1 + 1 = 2 allocations, 1010 instructions and 3 memcpy calls
+# at 1 item, 17, 1160 and 18 at 16, so 1.00 allocations, 10 instructions and 1.00 memcpy calls
+# per extra item.
 FAKE_VALGRIND_MODE=ok run "$here/hotpath.sh"
 if [[ $status -ne 0 ]]; then
     fail table "exit status $status, want 0"
-elif ! grep -Eq '^A +dynamo +2 +1\.00 +1010 +10 +17 +1160 +2\.\.2,17\.\.17 *$' "$work/stdout"; then
-    fail table "no 'A dynamo 2 1.00 1010 10 17 1160 2..2,17..17' row"
+elif ! grep -Eq '^A +dynamo +2 +1\.00 +1010 +10 +3 +1\.00 +17 +1160 +18 +2\.\.2,17\.\.17 *$' "$work/stdout"; then
+    fail table "no 'A dynamo 2 1.00 1010 10 3 1.00 17 1160 18 2..2,17..17' row"
 elif [[ $(grep -Ec '^(engine|A|B|C|embed-engine|embeddings|ingress) ' "$work/stdout") -ne 11 ]]; then
     fail table "want 11 rows"
 else
@@ -170,7 +197,7 @@ fi
 
 # The change columns against an unchanged base are all zero, the per-item one included.
 FAKE_VALGRIND_MODE=ok run "$here/hotpath.sh" --base "$work/base"
-if ! awk '/^pipeline / { rows = 1; next } rows && NF >= 13 && ($10 != 0 || $11 != 0 || $12 != 0 || $13 != 0) { bad = 1 }
+if ! awk '/^pipeline / { rows = 1; next } rows && NF >= 18 && ($13 != 0 || $14 != 0 || $15 != 0 || $16 != 0 || $17 != 0 || $18 != 0) { bad = 1 }
     END { exit bad }' "$work/stdout"; then
     fail same-changes "a change column is not zero against an unchanged base"
 else
@@ -184,6 +211,30 @@ if [[ $status -ne 1 ]] || ! grep -Eq '^B +dynamo .* RISE$' "$work/stdout" \
     fail rise "exit status $status, want 1 and one RISE on B dynamo"
 else
     echo "ok hotpath.sh rise"
+fi
+
+# One more memcpy call per request at 16 items, a move of an item in one of 15 requests' worth
+# of items: far below the instruction tolerance, but RISE on the default path and WORSE on a
+# gdl row.
+for memcpy_case in "b B dynamo RISE" "a-gdl A gdl WORSE"; do
+    read -r rise_row pipeline form want_mark <<<"$memcpy_case"
+    FAKE_RISE_ROW=$rise_row FAKE_RISE_ITEMS=16 FAKE_RISE_MEMCPY=1 FAKE_RISE_INSTR=150 \
+        run "$here/hotpath.sh" --base "$work/base"
+    if [[ $status -ne 1 ]] || ! grep -Eq "^$pipeline +$form .* \\+1 +$want_mark\$" "$work/stdout" \
+        || [[ $(grep -Ec 'RISE|WORSE' "$work/stdout") -ne 1 ]]; then
+        fail "memcpy-$rise_row" "exit status $status, want 1 and one $want_mark on $pipeline $form"
+    else
+        echo "ok hotpath.sh memcpy-$rise_row"
+    fi
+done
+
+# A single extra copy in the measured window must survive request-count normalization.
+FAKE_RISE_ROW=b FAKE_RISE_ITEMS=16 FAKE_RISE_WINDOW_MEMCPY=1 \
+    run "$here/hotpath.sh" --base "$work/base"
+if [[ $status -eq 0 ]]; then
+    fail memcpy-window-rise "the window gained one memcpy call across four requests (72 to 73), want non-zero exit; got exit 0"
+else
+    echo "ok hotpath.sh memcpy-window-rise"
 fi
 
 # A gdl row with more instructions than the tolerance: WORSE, exit 1.
@@ -303,7 +354,7 @@ done
 
 # Conflicting duplicate rows must not hide an allocation rise behind the last row.
 cp "$work/base" "$work/duplicate-base"
-awk '$1 == "B" && $2 == "dynamo" { $3++; $7++; $9 = $3 ".." $3 "," $7 ".." $7; print }' "$work/base" \
+awk '$1 == "B" && $2 == "dynamo" { $3++; $9++; $12 = $3 ".." $3 "," $9 ".." $9; print }' "$work/base" \
     >>"$work/duplicate-base"
 FAKE_RISE_ROW=b FAKE_RISE_ALLOCS=1 \
     run "$here/hotpath.sh" --base "$work/duplicate-base"
@@ -314,7 +365,7 @@ else
 fi
 
 # A nonnumeric instruction count cannot establish the per-item tolerance.
-awk '$1 == "B" && $2 == "dynamo" { $8 = "999999junk" } { print }' "$work/base" \
+awk '$1 == "B" && $2 == "dynamo" { $10 = "999999junk" } { print }' "$work/base" \
     >"$work/nonnumeric-instructions-base"
 FAKE_RISE_ROW=b FAKE_RISE_ITEMS=16 FAKE_RISE_INSTR=751 \
     run "$here/hotpath.sh" --base "$work/nonnumeric-instructions-base"

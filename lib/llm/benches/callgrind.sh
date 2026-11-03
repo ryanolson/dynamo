@@ -20,10 +20,18 @@
 #   (default: the number of CPUs). CALLGRIND_PROFILE sets the cargo profile (default
 #   profiling). CARGO_TARGET_DIR is honored.
 #
-# Output: a header, then one line per argument pair, "ROW ITEMS ALLOCATIONS INSTRUCTIONS RANGE",
-# in argument order. ALLOCATIONS is the binary's typical request; RANGE is the lowest and
-# highest of its measured requests, "LOW..HIGH". A pair may repeat, for repeated runs. A row that fails prints no line, and the
-# script exits non-zero.
+# Output: a header, then one line per argument pair,
+# "ROW ITEMS ALLOCATIONS INSTRUCTIONS MEMCPY RANGE", in argument order. ALLOCATIONS is the
+# binary's typical request; MEMCPY is the calls to memcpy and memmove in the window, per
+# request; RANGE is the lowest and highest allocations of its measured requests, "LOW..HIGH". A
+# pair may repeat, for repeated runs. A row that fails prints no line, and the script exits
+# non-zero.
+#
+# MEMCPY counts what the instructions cannot show: each move of a large value (a stream item of
+# about 1 KB) that the compiler does not elide is one call, of 100 to 200 instructions, below
+# the instruction tolerance of hotpath.sh. It counts calls from any function that is not itself
+# a memcpy or memmove, so `__memcpy_chk` calling `memcpy` counts once. The names match glibc's
+# on aarch64 (`__GI_memcpy`) and x86_64 (`__memmove_avx_unaligned_erms` and the like).
 #
 # Record counts from the `profiling` profile (release with symbols); debug counts mean little.
 # Callgrind runs all threads on one, so the totals include tokio's blocking pool, where the
@@ -83,8 +91,29 @@ for ((i = 1; i <= $#; i += 2)); do
     fi
 done
 
-# "ALLOCATIONS INSTRUCTIONS RANGE" per request for one run of a row. Check the exit status, the log and
-# the window dump before reading a count.
+# Calls to memcpy and memmove in the callgrind dump FILE, from functions that are not themselves
+# one. Function names are compressed: "(ID) NAME" the first time, "(ID)" after.
+memcpy_calls() {
+    awk '
+    function name(spec,    id, rest) {
+        if (!match(spec, /^\([0-9]+\)/)) return spec
+        id = substr(spec, 2, RLENGTH - 2)
+        rest = substr(spec, RLENGTH + 2)
+        if (rest != "") names[id] = rest
+        return id in names ? names[id] : spec
+    }
+    BEGIN { copy = "^(__GI_)?_*mem(cpy|move)" }
+    /^fn=/ { fn = name(substr($0, 4)); next }
+    /^cfn=/ { cfn = name(substr($0, 5)); next }
+    /^calls=/ {
+        split(substr($0, 7), c, " ")
+        if (cfn ~ copy && fn !~ copy) total += c[1]
+    }
+    END { print total + 0 }' "$1"
+}
+
+# "ALLOCATIONS INSTRUCTIONS MEMCPY RANGE" per request for one run of a row. Check the exit
+# status, the log and the window dump before reading a count.
 measure() {
     local bin=$1 row=$2 items=$3 n=$4 i=$5
     local out="$out_dir/$i.$row-$items.out"
@@ -113,6 +142,19 @@ measure() {
         echo "callgrind.sh: $what: no instruction total in $window; see $out.log" >&2
         return 1
     fi
+    local memcpy
+    memcpy=$(memcpy_calls "$window") || true
+    if [[ ! $memcpy =~ ^[0-9]+$ ]]; then
+        echo "callgrind.sh: $what: could not count memcpy calls in $window; see $out.log" >&2
+        return 1
+    fi
+    # Every request of a row makes the same copies, so the window's count divides by N. A
+    # remainder is a copy that not every request makes; dividing would round it away, and a
+    # rise hidden that way would pass the zero tolerance of hotpath.sh.
+    if (( memcpy % n != 0 )); then
+        echo "callgrind.sh: $what: $memcpy memcpy calls in $n requests is not a whole number per request; see $window" >&2
+        return 1
+    fi
     local allocs range
     allocs=$(grep -o 'allocs=[0-9]*' "$out.stdout" | head -n 1 | cut -d= -f2) || true
     if [[ ! $allocs =~ ^[0-9]+$ ]]; then
@@ -122,7 +164,7 @@ measure() {
     # The ingress row prints no range: it fails unless every request allocates the same.
     range=$(grep -o 'allocs_range=[0-9]*\.\.[0-9]*' "$out.stdout" | head -n 1 | cut -d= -f2) || true
     [[ -n $range ]] || range=$allocs..$allocs
-    echo "$allocs $((ir / n)) $range"
+    echo "$allocs $((ir / n)) $((memcpy / n)) $range"
 }
 
 # Rows run in parallel, CALLGRIND_JOBS at a time (default: the number of CPUs). Each run is one
@@ -147,16 +189,16 @@ done
 wait
 failed=0
 
-printf '%-14s %6s %12s %14s %12s\n' row items allocations instructions range
+printf '%-14s %6s %12s %14s %8s %12s\n' row items allocations instructions memcpy range
 for i in "${!rows[@]}"; do
     read -r row items <<<"${rows[$i]}"
     counts=$(cat "$out_dir/result.$i" 2>/dev/null) || true
-    if [[ ! $counts =~ ^[0-9]+\ [0-9]+\ [0-9]+\.\.[0-9]+$ ]]; then
+    if [[ ! $counts =~ ^[0-9]+\ [0-9]+\ [0-9]+\ [0-9]+\.\.[0-9]+$ ]]; then
         failed=1
         continue
     fi
-    read -r allocs ir range <<<"$counts"
-    printf '%-14s %6s %12s %14s %12s\n' "$row" "$items" "$allocs" "$ir" "$range"
+    read -r allocs ir memcpy range <<<"$counts"
+    printf '%-14s %6s %12s %14s %8s %12s\n' "$row" "$items" "$allocs" "$ir" "$memcpy" "$range"
 done
 echo "callgrind output: $out_dir" >&2
 exit "$failed"
