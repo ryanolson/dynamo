@@ -8,12 +8,11 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use dynamo_gdl_adapters::{CxBridge, DynOperatorStage, EngineSink, PipelineEngine, REQUEST_ID};
+use dynamo_gdl_adapters::{CxBridge, EngineSink, PipelineEngine, REQUEST_ID};
 use dynamo_runtime::engine::{AsyncEngine, AsyncEngineContext, ResponseStream};
 use dynamo_runtime::error::{DynamoError, ErrorClass};
 use dynamo_runtime::pipeline::{
-    AsyncEngineContextProvider, Context, Error, ManyOut, Operator, ServiceBackend, ServiceFrontend,
-    SingleIn, Source as _, async_trait,
+    AsyncEngineContextProvider, Context, Error, ManyOut, SingleIn, async_trait,
 };
 use dynamo_runtime::protocols::annotated::Annotated;
 use futures::{StreamExt, stream};
@@ -172,72 +171,46 @@ impl AsyncEngine<SingleIn<u32>, Out, Error> for Failing {
     }
 }
 
-/// Adds one to the request and multiplies each item by ten, as Dynamo
-/// operators do: call `next`, then wrap its stream with the same context.
+/// Adds one to the request and multiplies each item by ten, as a native gdl
+/// operator over Dynamo's request and items.
 #[derive(Default)]
-struct PassThrough {
-    /// Build a new context for the downstream call, as Migration does.
-    fresh_context: bool,
+struct Relay {
     /// Keep only the first downstream item, then drop the downstream stream.
     first_only: bool,
-    nexts: Mutex<Vec<usize>>,
 }
 
-#[async_trait]
-impl Operator<SingleIn<u32>, Out, SingleIn<u32>, Out> for PassThrough {
-    async fn generate(
+impl gdl::Operator for Relay {
+    type UpReq = SingleIn<u32>;
+    type UpItem = Annotated<u32>;
+    type DownReq = SingleIn<u32>;
+    type DownItem = Annotated<u32>;
+
+    fn generate<N>(
         &self,
+        cx: Cx,
         request: SingleIn<u32>,
-        next: Arc<dyn AsyncEngine<SingleIn<u32>, Out, Error>>,
-    ) -> Result<Out, Error> {
-        self.nexts
-            .lock()
-            .unwrap()
-            .push(Arc::as_ptr(&next) as *const () as usize);
-        let context = request.context();
-        let down = if self.fresh_context {
-            let down = Context::with_id_and_metadata(
-                *request.content() + 1,
-                format!("{}-attempt", request.id()),
-                Default::default(),
-            );
-            context.link_child(down.context());
-            down
-        } else {
-            request.map(|n| n + 1)
-        };
-        let downstream = next.generate(down).await?;
-        let items = downstream.map(|item| item.map_data(|n| Ok(n * 10)));
-        let items: dynamo_runtime::engine::DataStream<Annotated<u32>> = if self.first_only {
-            Box::pin(items.take(1))
-        } else {
-            Box::pin(items)
-        };
-        Ok(ResponseStream::new(items, context))
+        next: N,
+    ) -> impl Future<Output = gdl::Result<Items<Annotated<u32>>>> + Send
+    where
+        N: gdl::Next<SingleIn<u32>, Annotated<u32>>,
+    {
+        let first_only = self.first_only;
+        async move {
+            let items = next.generate(cx, request.map(|n| n + 1)).await?;
+            let items = items.map(|item| item.map(|item| item.map_data(|n| Ok(n * 10))));
+            Ok(if first_only {
+                gdl::items(items.take(1))
+            } else {
+                gdl::items(items)
+            })
+        }
     }
 }
 
 /// `op` above `engine`, composed with gdl.
-fn gdl_stage(op: Arc<PassThrough>, engine: Engine) -> Engine {
-    let stage = DynOperatorStage::<_, u32, u32, u32, u32>::new(op, sink_hop(engine));
+fn gdl_stage(op: Arc<Relay>, engine: Engine) -> Engine {
+    let stage = gdl::OperatorStage::new(op, sink_hop(engine));
     engine_of(Source::new(Hop::new((), stage, ())))
-}
-
-/// `op` above `engine`, composed with Dynamo's `link` chain.
-///
-/// Transition: remove when the gdl pipeline is the only local pipeline.
-fn link_stage(op: Arc<PassThrough>, engine: Engine) -> Engine {
-    let frontend = ServiceFrontend::<SingleIn<u32>, Out>::new();
-    let operator = Operator::into_operator(&op);
-    frontend
-        .link(operator.forward_edge())
-        .unwrap()
-        .link(ServiceBackend::from_engine(engine))
-        .unwrap()
-        .link(operator.backward_edge())
-        .unwrap()
-        .link_terminal(frontend)
-        .unwrap()
 }
 
 #[tokio::test]
@@ -296,11 +269,7 @@ async fn a_normal_end_neither_stops_nor_kills_the_request() {
 #[tokio::test]
 async fn an_operator_that_drops_its_downstream_early_kills_nothing() {
     let engine = Scripted::new(vec![Annotated::from_data(1), Annotated::from_data(2)]);
-    let op = Arc::new(PassThrough {
-        first_only: true,
-        ..Default::default()
-    });
-    let pipeline = gdl_stage(op, engine.clone());
+    let pipeline = gdl_stage(Arc::new(Relay { first_only: true }), engine.clone());
     let request = make_request(1);
     let context = request.context();
     let items: Vec<_> = pipeline.generate(request).await.unwrap().collect().await;
@@ -445,83 +414,52 @@ async fn a_request_killed_before_it_starts_fails_as_cancelled() {
     assert!(engine.seen().is_empty());
 }
 
+/// A call that must reach its stage after the request is killed, such as the leg that
+/// releases staged KV, runs under a cleanup `Cx`: the kill neither cancels nor stops it, so gdl
+/// starts the call, and the stage still sees the kill through the request's context.
 #[tokio::test]
-async fn an_operator_stage_matches_the_link_chain() {
+async fn a_call_under_a_cleanup_cx_reaches_its_sink_after_a_kill() {
+    let engine = Scripted::new(vec![Annotated::from_data(2)]);
+    let pipeline = Source::new(sink_hop(engine.clone()));
+
+    let request = make_request(1);
+    let context = request.context();
+    context.kill();
+    let refused = pipeline
+        .call(CxBridge::cx(context.as_ref()), make_request(1))
+        .await;
+    assert_eq!(
+        refused.err().map(|error| error.kind()),
+        Some(gdl::ErrorKind::Cancelled)
+    );
+
+    let cx = CxBridge::cx_for_cleanup(context.as_ref());
+    assert_eq!(cx.meta().get(REQUEST_ID).map(String::as_str), Some("req-1"));
+    assert!(!cx.is_stopping());
+    let items: Vec<_> = pipeline.call(cx, request).await.unwrap().collect().await;
+    assert_eq!(items.len(), 2);
+    let seen = engine.seen();
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].is_killed());
+}
+
+/// A Dynamo error item reaches the caller through a native stage as an item,
+/// and the stream goes on after it.
+#[tokio::test]
+async fn an_error_item_passes_through_a_native_stage() {
     let script = vec![
         Annotated::from_data(1),
         Annotated::from_error("mid-stream failure"),
         Annotated::from_data(2),
     ];
-    for fresh_context in [false, true] {
-        let op = || {
-            Arc::new(PassThrough {
-                fresh_context,
-                ..Default::default()
-            })
-        };
-        let linked: Vec<_> = link_stage(op(), Scripted::new(script.clone()))
-            .generate(make_request(7))
-            .await
-            .unwrap()
-            .collect()
-            .await;
-        let composed: Vec<_> = gdl_stage(op(), Scripted::new(script.clone()))
-            .generate(make_request(7))
-            .await
-            .unwrap()
-            .collect()
-            .await;
-        assert_eq!(data(&composed), data(&linked));
-        assert_eq!(data(&composed), [Some(80), Some(10), None, Some(20)]);
-        assert!(composed[2].is_error());
-    }
-}
-
-#[tokio::test]
-async fn an_operator_stage_builds_its_downstream_engine_once() {
-    let op = Arc::new(PassThrough::default());
-    let pipeline = gdl_stage(op.clone(), Scripted::new(vec![]));
-    for _ in 0..3 {
-        let _: Vec<_> = pipeline
-            .generate(make_request(1))
-            .await
-            .unwrap()
-            .collect()
-            .await;
-    }
-    let nexts = op.nexts.lock().unwrap();
-    assert_eq!(nexts.len(), 3);
-    assert!(nexts.iter().all(|next| *next == nexts[0]));
-}
-
-#[tokio::test]
-async fn each_downstream_call_gets_a_cx_of_the_context_it_passes() {
-    let sink = Arc::new(StopAwareSink::default());
-    let op = Arc::new(PassThrough {
-        fresh_context: true,
-        ..Default::default()
-    });
-    let stage = DynOperatorStage::<_, u32, u32, u32, u32>::new(
-        op,
-        Hop::new((), gdl::SinkStage::new(sink.clone()), ()),
-    );
-    let pipeline = engine_of(Source::new(Hop::new((), stage, ())));
-    let request = make_request(1);
-    let context = request.context();
-    let _stream = pipeline.generate(request).await.unwrap();
-
-    let cx = sink.seen.lock().unwrap()[0].clone();
-    assert_eq!(
-        cx.meta().get(REQUEST_ID).map(String::as_str),
-        Some("req-1-attempt")
-    );
-    // The attempt's context is a child of the request's, so a stop reaches
-    // the attempt's `Cx` through Dynamo. A kill does not cancel it: below a
-    // Dynamo operator the kill is the operator's to handle (see `CxBridge`).
-    context.stop_generating();
-    assert!(cx.is_stopping());
-    context.kill();
-    assert!(!cx.is_cancelled());
+    let composed: Vec<_> = gdl_stage(Arc::default(), Scripted::new(script))
+        .generate(make_request(7))
+        .await
+        .unwrap()
+        .collect()
+        .await;
+    assert_eq!(data(&composed), [Some(80), Some(10), None, Some(20)]);
+    assert!(composed[2].is_error());
 }
 
 #[tokio::test]

@@ -4,10 +4,12 @@
 use std::{
     collections::HashSet,
     future::{Future, ready},
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
 
+use dynamo_gdl_adapters::enter;
 use dynamo_kv_router::{
     protocols::{TokensWithHashes, WorkerConfigLike, WorkerWithDpRank},
     scheduling::{AbortCause, KvSchedulerError},
@@ -25,6 +27,7 @@ use dynamo_runtime::{
     },
     protocols::annotated::Annotated,
 };
+use futures::FutureExt;
 use futures::stream::{self, StreamExt};
 use tracing::Instrument;
 
@@ -721,7 +724,47 @@ impl RoutingHost {
 impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>, Error>
     for RoutingHost
 {
-    /// Generate a request through the selected routing plane.
+    /// Route and dispatch `request`, as [`RoutingHost::route`] describes.
+    async fn generate(
+        &self,
+        request: SingleIn<PreprocessedRequest>,
+    ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+        self.route(request).await
+    }
+}
+
+/// The host as the sink of a gdl local pipeline, over the same body as its Dynamo engine.
+///
+/// The request's Dynamo context carries its stop and kill to the dispatch, as it does for the
+/// engine. The sink's `cx` does not: gdl cancels it whenever its attempt ends, also when the
+/// response ends normally. An eager error enters gdl with the host's error as its source.
+impl gdl::Sink for RoutingHost {
+    type Req = SingleIn<PreprocessedRequest>;
+    type Item = Annotated<LLMEngineOutput>;
+
+    fn generate(
+        &self,
+        _cx: gdl::Cx,
+        request: SingleIn<PreprocessedRequest>,
+    ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<LLMEngineOutput>>>> + Send {
+        // On the heap, as the host's Dynamo engine has it, for the same one allocation. Held
+        // inline, the route's future is moved through each stage above it, and in a debug
+        // build every poll frame on the way keeps room for it: a routed pipeline then
+        // overflows a tokio worker's 2 MiB stack (`routed_gdl_pipelines_reach_a_kv_routing_host`).
+        // Erased, it also ends the type the compiler walks to prove a routed pipeline `Send`,
+        // which is deeper than the default recursion limit with the route inside it.
+        let route: Pin<Box<dyn Future<Output = Result<RouteResponse, Error>> + Send + '_>> =
+            Box::pin(self.route(request));
+        route.map(|result| match result {
+            Ok(stream) => Ok(gdl::items(stream.map(Ok))),
+            Err(error) => Err(enter(error)),
+        })
+    }
+}
+
+impl RoutingHost {
+    /// Route a request through the selected routing plane and dispatch it: the body of the
+    /// host's Dynamo engine and gdl sink.
     ///
     /// On the KV plane, `query_instance_id` performs an advisory selection:
     ///    - Returns the best matching worker ID without routing the request
@@ -744,7 +787,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
     ///
     /// The router state updates include tracking active sequences and managing
     /// prefill/completion lifecycle for proper KV cache management.
-    async fn generate(
+    async fn route(
         &self,
         request: SingleIn<PreprocessedRequest>,
     ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
@@ -811,6 +854,8 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
         self.dispatch_kv_plan(request, plan).await
     }
 }
+
+type RouteResponse = ManyOut<Annotated<LLMEngineOutput>>;
 
 enum ResponseItemOutcome {
     /// The stream is healthy and must keep running.

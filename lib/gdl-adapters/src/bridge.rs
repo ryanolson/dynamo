@@ -24,14 +24,14 @@ pub const REQUEST_ID: &str = "dynamo.request_id";
 /// leaves the cancelled state, so a kill stays a kill whatever comes after it,
 /// on either side.
 ///
-/// Except below Dynamo operators. gdl's `Hop` races each inner call against
+/// Except above a Dynamo engine. gdl's `Hop` races each inner call against
 /// the attempt's cancel and drops the call when the cancel wins, and refuses
-/// to start a call for a cancelled `Cx`. A Dynamo operator handles a kill
-/// itself and may still have work to do after it: PrefillRouter sends the
-/// decode leg that releases staged KV after the caller is killed at the
-/// prefill handoff. So a pipeline of Dynamo operators derives its `Cx` with
+/// to start a call for a cancelled `Cx`. A Dynamo engine handles a kill
+/// itself, and ends a killed request with an empty stream, where a dropped
+/// call fails it as `Cancelled`. So a pipeline with a Dynamo engine in it
+/// derives its `Cx` with
 /// [`cx_for_dynamo_stages`](Self::cx_for_dynamo_stages), which a kill does
-/// not cancel; the operators see the kill through their own context, as on
+/// not cancel; the engine sees the kill through its own context, as on
 /// Dynamo's `link` chain. [`cx`](Self::cx) is for gdl-native nodes.
 pub struct CxBridge;
 
@@ -49,12 +49,26 @@ impl CxBridge {
     }
 
     /// A fresh root `Cx` that follows `context`'s stop but not its kill, for a
-    /// pipeline whose stages are Dynamo operators and engines (see
-    /// [`CxBridge`]). Otherwise as [`cx`](Self::cx).
+    /// pipeline with a Dynamo engine in it (see [`CxBridge`]). Otherwise as
+    /// [`cx`](Self::cx).
     ///
     /// Transition: remove when no Dynamo stage runs inside a gdl pipeline.
     pub fn cx_for_dynamo_stages(context: &dyn AsyncEngineContext) -> Cx {
         Self::linked(context, false)
+    }
+
+    /// A fresh root `Cx` that nothing of `context` cancels or stops, for a call that must
+    /// reach its stage after the request is killed: the leg that releases what a worker holds
+    /// for the request, such as the prefill router's decode leg after a KV handoff. The stage
+    /// sees the request's stop and kill through `context`, which the request carries. The
+    /// Dynamo id is in its metadata under [`REQUEST_ID`].
+    ///
+    /// It is not linked to `context`: the call's own attempt ends when its response stream
+    /// ends or is dropped.
+    pub fn cx_for_cleanup(context: &dyn AsyncEngineContext) -> Cx {
+        let mut cx = Cx::new();
+        cx.insert_meta(REQUEST_ID, context.id());
+        cx
     }
 
     fn linked(context: &dyn AsyncEngineContext, cancel_on_kill: bool) -> Cx {

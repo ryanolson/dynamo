@@ -5,8 +5,13 @@
 //!
 //! The error's source is shared among its clones, so while one is alive the
 //! original `anyhow::Error` cannot be moved out on the way back, and the HTTP
-//! handler's downcast to `HttpError` fails. No node in a Phase 1 pipeline
-//! keeps one.
+//! handler's downcast to `HttpError` fails. No node in Dynamo's gdl
+//! pipelines keeps one: Migration, which holds an eager error while it
+//! decides on a retry, returns it as itself
+//! (`migration_returns_an_eager_error_it_does_not_retry_as_itself_both_ways`
+//! in `lib/llm/tests/native_operators.rs`), and the routed pipeline answers
+//! 403 through HTTP (`an_engines_http_error_keeps_its_status_through_the_adapters`
+//! in `tests/llm.rs`).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
