@@ -5085,15 +5085,12 @@ async fn the_host_as_a_gdl_sink_routes_as_the_dynamo_engine_does() {
         request.routing_mut().backend_instance_id = Some(worker_id + 1);
         Context::new(request)
     };
-    let engine = AsyncEngine::generate(router.as_ref(), pinned())
-        .await
-        .err()
-        .expect("an unknown pinned worker is refused");
-    let sink = pipeline
-        .call(gdl::Cx::new(), pinned())
-        .await
-        .err()
-        .expect("an unknown pinned worker is refused");
+    let Err(engine) = AsyncEngine::generate(router.as_ref(), pinned()).await else {
+        panic!("the engine refuses an unknown pinned worker");
+    };
+    let Err(sink) = pipeline.call(gdl::Cx::new(), pinned()).await else {
+        panic!("the sink refuses an unknown pinned worker");
+    };
     let mut chain =
         std::iter::successors(Some(&sink as &(dyn std::error::Error + 'static)), |error| {
             error.source()
@@ -5106,5 +5103,79 @@ async fn the_host_as_a_gdl_sink_routes_as_the_dynamo_engine_does() {
 
     drop(pipeline);
     drop(router);
+    runtime.shutdown();
+}
+
+/// Pipelines B and C on gdl over a KV routing host, as the frontend builds them for aggregated
+/// serving, on tokio workers with the frontend's stack size. The whole pipeline is one nested
+/// future, polled on one stack, down to the host's dispatch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn routed_gdl_pipelines_reach_a_kv_routing_host() {
+    use crate::entrypoint::input::{LocalPipeline, PreprocessedRouting};
+    use crate::kv_router::{EncoderRouter, PrefillRouter};
+    use crate::model_card::ModelDeploymentCard;
+    use crate::preprocessor::{OpenAIPreprocessor, prompt::prompt_formatter_from_mdc};
+    use crate::protocols::openai::chat_completions::{
+        NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse,
+    };
+
+    let (router, dispatch, worker_id, runtime) =
+        router_with_recorded_dispatch("kv-gdl-pipelines").await;
+    let card = ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
+        .unwrap();
+    let tokenizer = card.tokenizer().unwrap();
+    let routing = PreprocessedRouting::with_routing_host(
+        Arc::new(router),
+        PrefillRouter::disabled(
+            Arc::new(crate::discovery::ModelManager::new()),
+            RouterMode::KV,
+            None,
+        ),
+        EncoderRouter::disabled(),
+    )
+    .with_local_pipeline(LocalPipeline::Gdl);
+
+    let c = routing
+        .build_preprocessed_pipeline(&card, 3, None, Arc::new(Metrics::new()))
+        .unwrap();
+    let items: Vec<_> = c
+        .generate(Context::new(request()))
+        .await
+        .unwrap()
+        .collect()
+        .await;
+    assert!(items.iter().all(|item| !item.is_error()), "{items:?}");
+
+    let dynamo_renderer::PromptFormatter::OAI(formatter) =
+        prompt_formatter_from_mdc(&card).unwrap();
+    let preprocessor =
+        OpenAIPreprocessor::new_with_parts(card.clone(), formatter, tokenizer.clone()).unwrap();
+    let b = routing
+        .build_pipeline::<NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse>(
+            &card,
+            preprocessor,
+            tokenizer,
+            3,
+            None,
+            Arc::new(Metrics::new()),
+        )
+        .unwrap();
+    let chat: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "TinyLlama_v1.1",
+        "messages": [{"role": "user", "content": "Write one sentence about a fox."}],
+        "max_tokens": 8,
+    }))
+    .unwrap();
+    let items: Vec<_> = b
+        .generate(Context::new(chat))
+        .await
+        .unwrap()
+        .collect()
+        .await;
+    assert!(items.iter().all(|item| !item.is_error()), "{items:?}");
+    assert_eq!(*dispatch.worker_ids.lock().unwrap(), [worker_id, worker_id]);
+
+    drop((b, c, routing));
     runtime.shutdown();
 }

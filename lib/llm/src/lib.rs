@@ -6,6 +6,11 @@
 //! The `dynamo.llm` crate is a Rust library that provides a set of traits and types for building
 //! distributed LLM inference solutions.
 
+// A gdl local pipeline is one nested future type from its source to its terminal, and the
+// compiler proves it `Send` by walking that type. The routed pipelines on gdl, with the
+// prefill router's own dispatch inside them, are deeper than the default limit of 128.
+#![recursion_limit = "256"]
+
 pub mod admission_gate;
 pub mod backend;
 pub mod common;

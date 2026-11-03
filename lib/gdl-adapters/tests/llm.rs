@@ -327,10 +327,8 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, Out, Error> for Hanging {
 /// A kill while an attempt is still dispatching. Dynamo's `link` chain lets
 /// Migration see the kill and end with its own outcome; under a
 /// `PipelineEngine::new`, the kill cancels the hop, which drops Migration's
-/// future and fails the call as `Cancelled`. This is why compositions of
-/// Dynamo operators use `PipelineEngine::for_dynamo_stages` (see
-/// `kill_during_dispatch`). This test pins both outcomes, so a change to
-/// either shows.
+/// future and fails the call as `Cancelled` (see `kill_during_dispatch`).
+/// This test pins both outcomes, so a change to either shows.
 #[tokio::test]
 async fn a_kill_during_dispatch_ends_the_request_on_both_paths() {
     let mut outcomes = Vec::new();
@@ -655,8 +653,9 @@ async fn a_stop_and_a_kill_reach_the_terminal_through_pipeline_b_on_gdl() {
     assert!(rest.iter().all(|item| !item.is_error()), "{rest:?}");
 }
 
-/// A kill while the terminal is still dispatching, through all of pipeline B, ends the call
-/// the same way on both local pipelines (see `kill_during_dispatch`).
+/// A kill while the terminal is still dispatching, through all of pipeline B (see
+/// `kill_during_dispatch`). Pipeline B on gdl is native and rooted with `PipelineEngine::new`,
+/// so the kill cancels it and gdl drops the terminal's call.
 #[tokio::test]
 async fn a_kill_during_dispatch_ends_pipeline_b_on_both_local_pipelines() {
     let mut outcomes = Vec::new();
@@ -666,13 +665,17 @@ async fn a_kill_during_dispatch_ends_pipeline_b_on_both_local_pipelines() {
         let pipeline = pipeline_b(local_pipeline, Arc::new(Hanging), 3);
         outcomes.push(kill_during_dispatch(pipeline, chat_request()).await);
     }
-    assert_eq!(outcomes, ["ok, 0 items", "ok, 0 items"]);
+    assert_eq!(outcomes, ["ok, 0 items", "error Cancelled"]);
 }
 
-/// What a kill while the terminal is still dispatching does to `pipeline`'s call. The operators
-/// see the kill through their own context and end the request themselves, on Dynamo's `link`
-/// chain and on gdl's compositions alike: a kill does not cancel a gdl pipeline of Dynamo
-/// operators (see `CxBridge`), so gdl does not drop the call.
+/// What a kill while the terminal is still dispatching does to `pipeline`'s call.
+///
+/// On Dynamo's `link` chain, and on a gdl pipeline with a Dynamo engine inside it (A and
+/// embeddings, rooted with `PipelineEngine::for_dynamo_stages`), the stages see the kill
+/// through their own context and end the request with an empty stream. A native gdl pipeline
+/// (B and C) is rooted with `PipelineEngine::new`: the kill cancels its `Cx`, gdl drops every
+/// call still in flight, as a client disconnect drops the handler's call on Dynamo's chain,
+/// and the call fails as `Cancelled`. The HTTP handler reports both as a client disconnect.
 async fn kill_during_dispatch<Req: Data, T: Data>(
     pipeline: Arc<dyn AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, Error>>,
     request: SingleIn<Req>,
@@ -797,7 +800,7 @@ async fn a_kill_during_dispatch_ends_pipeline_c_on_both_local_pipelines() {
         let pipeline = pipeline_c(local_pipeline, Arc::new(Hanging), 3);
         outcomes.push(kill_during_dispatch(pipeline, request()).await);
     }
-    assert_eq!(outcomes, ["ok, 0 items", "ok, 0 items"]);
+    assert_eq!(outcomes, ["ok, 0 items", "error Cancelled"]);
 }
 
 type EmbedOut = ManyOut<Annotated<EmbeddingsEngineOutput>>;

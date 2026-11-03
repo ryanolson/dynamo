@@ -791,16 +791,17 @@ fn with_session(mut request: SingleIn<PreprocessedRequest>) -> SingleIn<Preproce
     request
 }
 
-/// What the terminal saw of each call: id, metadata, session, prompt and token budget.
-fn attempts(
-    terminal: &Script,
-) -> Vec<(
+/// What the terminal saw of one call: id, tenant, session, prompt and token budget.
+type Attempt = (
     String,
     Option<String>,
     Option<String>,
     Vec<u32>,
     Option<u32>,
-)> {
+);
+
+/// What the terminal saw of each call.
+fn attempts(terminal: &Script) -> Vec<Attempt> {
     terminal
         .calls
         .lock()

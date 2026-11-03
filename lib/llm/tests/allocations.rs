@@ -13,9 +13,9 @@
 //! | `a` | `build_pipeline`: preprocessor, backend | test LLM engine |
 //! | `a-gdl` | `a` composed as a gdl local pipeline | test LLM engine |
 //! | `b` | `PreprocessedRouting::build_pipeline`: preprocessor, migration, backend, encoder router, prefill router | test LLM engine, in place of `RoutingHost` |
-//! | `b-gdl` | `b` composed as a gdl local pipeline (`LocalPipeline::Gdl`, what `DYN_LOCAL_PIPELINE=gdl` selects) | test LLM engine, in place of `RoutingHost` |
+//! | `b-gdl` | `b` composed as a gdl local pipeline (`LocalPipeline::Gdl`, what `DYN_LOCAL_PIPELINE=gdl` selects) | test LLM engine, in place of `RoutingHost`, through `EngineSink` |
 //! | `c` | `PreprocessedRouting::build_preprocessed_pipeline`: migration, encoder router, prefill router | test LLM engine, in place of `RoutingHost` |
-//! | `c-gdl` | `c` composed as a gdl local pipeline | test LLM engine, in place of `RoutingHost` |
+//! | `c-gdl` | `c` composed as a gdl local pipeline | test LLM engine, in place of `RoutingHost`, through `EngineSink` |
 //! | `embed-engine` | the test embeddings engine, called directly | itself |
 //! | `embed` | `build_embeddings_pipeline`: preprocessor, backend | test embeddings engine, in place of `PushRouter` |
 //! | `embeddings-gdl` | `embed` composed as a gdl local pipeline | test embeddings engine, in place of `PushRouter` |
@@ -53,29 +53,30 @@
 //! | `a` | 349 | 100,958 | 862 | 122,446 |
 //! | `a-gdl` | 335 | 81,439 | 848 | 102,927 |
 //! | `b` | 402 | 227,025 | 915 | 248,513 |
-//! | `b-gdl` | 397 | 206,061 | 910 | 227,549 |
+//! | `b-gdl` | 362 | 180,214 | 875 | 201,702 |
 //! | `c` | 71 | 144,683 | 86 | 144,743 |
-//! | `c-gdl` | 82 | 140,607 | 97 | 140,667 |
+//! | `c-gdl` | 47 | 114,736 | 62 | 114,796 |
 //! | `embed-engine` | 8 | 6,548 | 23 | 88,868 |
 //! | `embed` | 199 | 44,406 | 2,283 | 529,854 |
 //! | `embeddings-gdl` | 186 | 44,471 | 2,271 | 529,919 |
 //!
 //! Each gdl row differs from its dynamo row by the same number of allocations at both item
-//! counts, so nothing per item: `a-gdl` −14, `b-gdl` −5, `c-gdl` +11, `embeddings-gdl` −13 (−12
-//! at 16 items). The gdl rows other than `c-gdl` vary by up to two allocations between runs,
-//! and their records hold the higher count.
-//! `lib/gdl-adapters/tests/allocations.rs` measures the parts in isolation: 14 allocations for a
-//! `link` stage, 17 for an adapted operator, 5 for a native gdl operator, and 21 against 19 at the
-//! boundary (`PipelineEngine` above, `EngineSink` below). The preprocessor and backend are native
-//! in every gdl row that has them; Migration and the routers are still adapted, which is why
-//! `c-gdl` (3 adapted, nothing native) costs more than `c`.
+//! counts, so nothing per item: `a-gdl` −14, `b-gdl` −40, `c-gdl` −24, `embeddings-gdl` −13
+//! (−12 at 16 items). `a-gdl` and `embeddings-gdl` vary by up to two allocations between runs,
+//! and their records hold the higher count; `b-gdl` and `c-gdl` gave the same count in every
+//! run. `lib/gdl-adapters/tests/allocations.rs` measures the parts in isolation: 14 allocations
+//! for a `link` stage, 5 for a native gdl operator, and 21 against 19 at the boundary
+//! (`PipelineEngine` above, `EngineSink` below). Every operator in the gdl rows is native; the
+//! test engine at the terminal enters through `EngineSink`, where the frontend's `RoutingHost`
+//! is a gdl sink of its own.
 //! `a-gdl`, `b-gdl` and `c-gdl` ask for fewer bytes than their dynamo rows (the `link` chain
 //! boxes a future per edge, the gdl composition one per stage); `embeddings-gdl` asks for 65 more,
 //! because its `link` futures are small.
 //!
-//! The largest allocation of `b`, `c` and their gdl rows is one boxed future of 59,592 bytes per
-//! request, the same on both local pipelines. `a` and `embed`, which have no Migration, do not
-//! make it.
+//! The largest allocation of `b` and `c` is Migration's boxed future, 59,592 bytes per request.
+//! That of `b-gdl` and `c-gdl` is the prefill router's native future, 62,048 bytes, which holds
+//! its whole route even when it passes a request through (debug build). `a` and `embed`, which
+//! have neither operator, make neither.
 //!
 //! Run: `cargo test -p dynamo-llm --test allocations`. For instructions per request, see
 //! `lib/llm/benches/callgrind.sh`, which runs this binary as
@@ -130,13 +131,13 @@ const BASELINE: &[Row] = &[
     // Transition: remove when the gdl pipeline is the only local pipeline.
     row("b", 1, 402, 227025),
     row("b", 16, 915, 248513),
-    row("b-gdl", 1, 397, 206061),
-    row("b-gdl", 16, 910, 227549),
+    row("b-gdl", 1, 362, 180214),
+    row("b-gdl", 16, 875, 201702),
     // Transition: remove when the gdl pipeline is the only local pipeline.
     row("c", 1, 71, 144683),
     row("c", 16, 86, 144743),
-    row("c-gdl", 1, 82, 140607),
-    row("c-gdl", 16, 97, 140667),
+    row("c-gdl", 1, 47, 114736),
+    row("c-gdl", 16, 62, 114796),
     row("embed-engine", 1, 8, 6548),
     row("embed-engine", 16, 23, 88868),
     // Transition: remove when the gdl pipeline is the only local pipeline.

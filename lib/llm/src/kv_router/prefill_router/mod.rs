@@ -1890,6 +1890,9 @@ mod tests {
             &self,
             request: SingleIn<PreprocessedRequest>,
         ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+            // A dispatch that waits, as one to a worker does: a kill that cancels the caller
+            // can end the call here, before the leg reaches the worker.
+            tokio::task::yield_now().await;
             self.requests
                 .lock()
                 .push((request.staged_kv_cleanup, request.context().is_killed()));
@@ -1901,7 +1904,7 @@ mod tests {
     }
 
     /// Routing whose prefill worker kills `caller` as it hands off, and whose decode engine
-    /// records each call it gets as `(staged_kv_cleanup, killed)`.
+    /// records each call it reaches as `(staged_kv_cleanup, killed)`.
     async fn prefill_handoff_routing(
         distributed: &dynamo_runtime::DistributedRuntime,
         namespace: &str,
@@ -1975,10 +1978,55 @@ mod tests {
         }
     }
 
+    /// The decode calls `decode` has seen, once it has seen `count` or 5 seconds have passed.
+    /// On gdl a kill cancels the request's `Cx`, so the call can return before the route's
+    /// task has sent the decode leg.
+    async fn decode_calls(decode: &CleanupDecode, count: usize) -> Vec<(bool, bool)> {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while decode.requests.lock().len() < count {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        decode.requests.lock().clone()
+    }
+
+    /// A caller killed at the prefill handoff, on pipeline C composed on gdl: the kill cancels
+    /// the pipeline's `Cx`, so gdl drops the in-flight future of every stage. The prefill
+    /// router's route must still send the decode leg that releases the staged KV, with the
+    /// caller's killed context and its cleanup obligation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pipeline_c_preserves_decode_cleanup_after_kill_at_prefill_handoff() {
+        use crate::entrypoint::input::LocalPipeline;
+        use crate::http::service::metrics::Metrics;
+        use crate::model_card::ModelDeploymentCard;
+        use dynamo_runtime::{DistributedRuntime, Runtime, distributed::DistributedConfig};
+
+        let runtime = Runtime::from_current().unwrap();
+        let distributed =
+            DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+                .await
+                .unwrap();
+        let card =
+            ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
+                .unwrap();
+        let request = Context::new(inference_request());
+        let caller = request.context();
+        let (routing, decode) =
+            prefill_handoff_routing(&distributed, "cleanup-c-native", caller.clone()).await;
+        let pipeline = routing
+            .with_local_pipeline(LocalPipeline::Gdl)
+            .build_preprocessed_pipeline(&card, 3, None, Arc::new(Metrics::new()))
+            .unwrap();
+        drain(pipeline.generate(request)).await;
+        assert!(caller.is_killed(), "the prefill handoff kills the caller");
+        assert_eq!(decode_calls(&decode, 1).await, [(true, true)]);
+        runtime.shutdown();
+    }
+
     /// A caller killed while PrefillRouter hands off from prefill must still get the decode
     /// leg that releases the staged KV, on gdl as on Dynamo's chain, through the routed chat
-    /// pipeline (B) and the preprocessed pipeline (C). gdl drops a call whose `Cx` is
-    /// cancelled, so a kill must not cancel a pipeline of Dynamo operators.
+    /// pipeline (B) and the preprocessed pipeline (C).
     #[tokio::test]
     async fn routed_pipelines_send_decode_cleanup_after_a_kill_at_prefill_handoff() {
         use crate::entrypoint::input::LocalPipeline;
@@ -2016,7 +2064,7 @@ mod tests {
                 .unwrap();
             drain(pipeline.generate(request)).await;
             assert!(caller.is_killed(), "the prefill handoff kills the caller");
-            seen.push(("c", name, decode.requests.lock().clone()));
+            seen.push(("c", name, decode_calls(&decode, 1).await));
 
             let chat: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
                 "model": "TinyLlama_v1.1",
@@ -2047,7 +2095,7 @@ mod tests {
                 .unwrap();
             drain(pipeline.generate(request)).await;
             assert!(caller.is_killed(), "the prefill handoff kills the caller");
-            seen.push(("b", name, decode.requests.lock().clone()));
+            seen.push(("b", name, decode_calls(&decode, 1).await));
         }
         runtime.shutdown();
 

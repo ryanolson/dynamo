@@ -4,6 +4,7 @@
 use std::{
     collections::HashSet,
     future::{Future, ready},
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
@@ -746,7 +747,13 @@ impl gdl::Sink for RoutingHost {
         _cx: gdl::Cx,
         request: SingleIn<PreprocessedRequest>,
     ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<LLMEngineOutput>>>> + Send {
-        self.route(request).map(|result| match result {
+        // On the heap, as the host's Dynamo engine has it, for the same one allocation. Held
+        // inline, the route's future is moved through each stage above it, and in a debug
+        // build every poll frame on the way keeps room for it: a routed pipeline then
+        // overflows a tokio worker's 2 MiB stack (`routed_gdl_pipelines_reach_a_kv_routing_host`).
+        let route: Pin<Box<dyn Future<Output = Result<RouteResponse, Error>> + Send + '_>> =
+            Box::pin(self.route(request));
+        route.map(|result| match result {
             Ok(stream) => Ok(gdl::items(stream.map(Ok))),
             Err(error) => Err(enter(error)),
         })
@@ -845,6 +852,8 @@ impl RoutingHost {
         self.dispatch_kv_plan(request, plan).await
     }
 }
+
+type RouteResponse = ManyOut<Annotated<LLMEngineOutput>>;
 
 enum ResponseItemOutcome {
     /// The stream is healthy and must keep running.

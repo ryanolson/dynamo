@@ -192,12 +192,12 @@ where
         self.send_under(cx, request)
     }
 
-    /// Transition: root with `PipelineEngine::new` when Migration and the encoder and prefill
-    /// routers run as native gdl stages.
+    /// Transition: root with `PipelineEngine::new` when no Dynamo engine runs inside a gdl
+    /// pipeline.
     fn engine(&self) -> Arc<dyn AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, Error>> {
         // Each call derives a fresh root `Cx`: the request's `cx` is cancelled once its
-        // response ends. The stages below are Dynamo's, so a kill reaches them through the
-        // request's context, not a cancel that would drop a call one is still finishing.
+        // response ends. Below the preprocessor of pipeline A is a Dynamo engine, so a kill
+        // reaches it through the request's context, not a cancel that would drop its call.
         Arc::new(PipelineEngine::for_dynamo_stages(self.next.clone()))
     }
 
