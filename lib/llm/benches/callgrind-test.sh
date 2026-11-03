@@ -418,6 +418,20 @@ for arch_suffix in '=other' $'\tother'; do
     fi
 done
 
+# A blank line before provenance violates the table's required first line.
+{
+    echo
+    cat "$work/base"
+} >"$work/leading-blank-base"
+run "$here/hotpath.sh" --base "$work/leading-blank-base"
+if [[ $status -eq 0 ]]; then
+    fail base-leading-blank "accepted a base whose provenance is on line 2"
+elif grep -q 'callgrind output:' "$work/stderr"; then
+    fail base-leading-blank "ran callgrind before rejecting provenance after a blank line"
+else
+    echo "ok hotpath.sh base-leading-blank"
+fi
+
 if ((failures > 0)); then
     echo "$failures failed" >&2
     exit 1
