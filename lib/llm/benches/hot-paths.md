@@ -27,7 +27,43 @@ the stages.
   200 instructions, inside the instruction tolerance, so the `memcpy` columns are what catch it.
 - **Rule:** a stage edits a stream item through `&mut` in a stream that owns its state. It does
   not take the item by value and return it (`map(|mut item| { ...; item })`, `unfold`), because
-  each such step moves the 1 KB item two or three times.
+  each such step moves the 1 KB item two or three times. Box the fields that are `None` on the
+  default path, so that `None` costs a pointer (`engine_and_backend_outputs_stay_small` keeps the
+  sizes).
+
+  Worked example, Migration's response. It was
+
+  ```rust
+  stream::unfold(retry_manager, |mut retry_manager| async move {
+      retry_manager.next().await.map(|response| (response, retry_manager))
+  })
+  .fuse()
+  ```
+
+  Every item moved the whole `RetryManager`, with its `PreprocessedRequest`, into a new future
+  and out again, and moved the item through the future's output tuple, `Option` and `Fuse`. Now
+  `Migrated` (`lib/llm/src/migration.rs`) owns the manager. It polls the attempt's stream,
+  checks the item through `&mut` (`RetryManager::accept`), and returns the same `Poll` value it
+  got, so the item is not taken out and wrapped again. Only a migration, which must await the
+  next dispatch, runs as a future, and that future owns the manager until it ends. Per extra
+  item (aarch64, 16 items, before and after this change alone):
+
+  | Row | `memcpy` calls | Instructions |
+  |---|---:|---:|
+  | `c` | 13 -> 5 | 2,826 -> 1,109 |
+  | `c-gdl` | 22 -> 13 | 4,264 -> 2,627 |
+  | `b` | 55.2 -> 43.2 | 23,270 -> 20,943 |
+  | `b-gdl` | 70.2 -> 59.2 | 25,492 -> 23,636 |
+
+  Wrapping an item as `Ok(item)` for gdl costs no `memcpy` (`Result<Annotated<T>, gdl::Error>`
+  and `Annotated<T>` have the same layout), but taking it out of a `Result` does: about 3 calls
+  per item at the `PipelineEngine` boundary.
+
+  The same pattern is still on per-item paths that no row measures: the reasoning parser
+  (`parse_reasoning_content_from_stream_inner` and `strip_leading_reasoning_start_from_stream`,
+  both `unfold`; `annotate_reasoning_usage`, a `map`), the input `map` of
+  `apply_tool_calling_jail`, the `map` in `apply_unified_response_policies`, and the response
+  `map`s of the HTTP completions handler (`http/service/openai.rs`).
 - **Profile:** callgrind over the measured window (`lib/llm/benches/callgrind.sh`) of rows `a` and
   `a-gdl`, at 1 and 16 items, 200 and 400 requests. Per extra item = (16 items - 1 item) / 15.
   Self instructions, grouped by component. Commit 845f5a9993, x86_64 bench host
