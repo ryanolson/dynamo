@@ -12,7 +12,7 @@ use std::time::Duration;
 use dynamo_gdl_adapters::{DynOperatorStage, EngineSink, PipelineEngine, REQUEST_ID};
 use dynamo_llm::discovery::ModelManager;
 use dynamo_llm::entrypoint::input::{
-    LocalPipeline, PreprocessedRouting, build_embeddings_pipeline,
+    LocalPipeline, PreprocessedRouting, build_embeddings_pipeline, build_pipeline,
 };
 use dynamo_llm::http::service::axum::http::HeaderMap;
 use dynamo_llm::http::service::error::HttpError;
@@ -954,6 +954,117 @@ async fn a_kill_during_dispatch_ends_pipeline_embeddings_on_both_local_pipelines
     for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
         let pipeline = pipeline_embeddings(local_pipeline, Arc::new(HangingEmbeddings));
         outcomes.push(kill_during_dispatch(pipeline, embedding_request()).await);
+    }
+    assert_eq!(outcomes, ["ok, 0 items", "error Cancelled"]);
+}
+
+/// The in-process pipeline the HTTP and gRPC inputs build over a token engine, over `engine`,
+/// on the given local pipeline.
+async fn pipeline_a(
+    local_pipeline: LocalPipeline,
+    engine: Engine,
+) -> Arc<
+    dyn AsyncEngine<
+            SingleIn<NvCreateChatCompletionRequest>,
+            ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>,
+            Error,
+        >,
+> {
+    let card = ModelDeploymentCard::load_from_disk(SAMPLE_MODEL, None).unwrap();
+    let tokenizer = card.tokenizer().unwrap();
+    build_pipeline::<NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse>(
+        &card,
+        engine,
+        tokenizer,
+        local_pipeline,
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn pipeline_a_streams_the_same_chat_on_both_local_pipelines() {
+    let mut runs = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        let engine = Flaky::new(0, false);
+        let items: Vec<_> = pipeline_a(local_pipeline, engine.clone())
+            .await
+            .generate(chat_request())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        let (text, errored) = content(&items);
+        assert!(
+            !text.is_empty(),
+            "{local_pipeline:?}: no content in {items:?}"
+        );
+        assert!(!errored, "{local_pipeline:?}: {items:?}");
+        runs.push((text, items.len(), calls(&engine)));
+    }
+    assert_eq!(runs[0], runs[1]);
+    assert_eq!(runs[1].2.len(), 1);
+}
+
+/// Pipeline A has no Migration: the terminal's eager error reaches the caller as it left the
+/// engine, through the backend and the preprocessor.
+#[tokio::test]
+async fn pipeline_a_returns_its_terminals_eager_error_on_both_local_pipelines() {
+    let mut errors = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        let engine = Flaky::new(1, false);
+        let error = match pipeline_a(local_pipeline, engine.clone())
+            .await
+            .generate(chat_request())
+            .await
+        {
+            Ok(_) => panic!("{local_pipeline:?}: the eager error was lost"),
+            Err(error) => error,
+        };
+        let error_type = error
+            .downcast_ref::<DynamoError>()
+            .map(DynamoError::error_type)
+            .unwrap_or_else(|| panic!("{local_pipeline:?}: {error:#}"));
+        errors.push((error_type, error.to_string(), calls(&engine).len()));
+    }
+    assert_eq!(errors[0], errors[1]);
+    assert_eq!(errors[1].0, ErrorClass::WorkerUnavailable);
+    assert_eq!(errors[1].2, 1);
+}
+
+/// A stop and a kill of the HTTP handler's context reach the terminal engine's context through
+/// both adapted stages.
+#[tokio::test]
+async fn a_stop_and_a_kill_reach_the_terminal_through_pipeline_a_on_gdl() {
+    let engine = Flaky::new(0, true);
+    let pipeline = pipeline_a(LocalPipeline::Gdl, engine.clone()).await;
+    let request = chat_request();
+    let context = request.context();
+    let mut stream = pipeline.generate(request).await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("the first item arrives")
+        .unwrap();
+    assert!(!first.is_error(), "{first:?}");
+
+    let terminal = engine.calls.lock().unwrap()[0].context.clone();
+    context.stop_generating();
+    assert!(terminal.is_stopped());
+    assert!(!terminal.is_killed());
+    context.kill();
+    assert!(terminal.is_killed());
+    let rest: Vec<_> = tokio::time::timeout(Duration::from_secs(5), stream.collect())
+        .await
+        .expect("the stream ends after the kill");
+    assert!(rest.iter().all(|item| !item.is_error()), "{rest:?}");
+}
+
+#[tokio::test]
+async fn a_kill_during_dispatch_ends_pipeline_a_on_both_local_pipelines() {
+    let mut outcomes = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        let pipeline = pipeline_a(local_pipeline, Arc::new(Hanging)).await;
+        outcomes.push(kill_during_dispatch(pipeline, chat_request()).await);
     }
     assert_eq!(outcomes, ["ok, 0 items", "error Cancelled"]);
 }

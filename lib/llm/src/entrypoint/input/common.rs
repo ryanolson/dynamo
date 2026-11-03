@@ -65,9 +65,9 @@ pub struct PreprocessedRouting {
     local_pipeline: LocalPipeline,
 }
 
-/// How [`PreprocessedRouting::build_pipeline`] and
-/// [`PreprocessedRouting::build_preprocessed_pipeline`] compose their stages. The stages
-/// and what they do are the same either way.
+/// How a local pipeline composes its stages: [`PreprocessedRouting::build_pipeline`],
+/// [`PreprocessedRouting::build_preprocessed_pipeline`], [`build_pipeline`] and
+/// [`build_embeddings_pipeline`]. The stages and what they do are the same either way.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LocalPipeline {
     /// Dynamo's `link` chain.
@@ -425,7 +425,12 @@ pub async fn prepare_engine(
             let pipeline = build_pipeline::<
                 NvCreateChatCompletionRequest,
                 NvCreateChatCompletionStreamResponse,
-            >(model.card(), inner_engine, model.card().tokenizer()?)
+            >(
+                model.card(),
+                inner_engine,
+                model.card().tokenizer()?,
+                LocalPipeline::configured()?,
+            )
             .await?;
 
             let service_name = model.service_name().to_string();
@@ -440,11 +445,14 @@ pub async fn prepare_engine(
     }
 }
 
+/// Build the in-process pipeline: preprocessor, then backend, then `engine`, composed on
+/// `local_pipeline`. The HTTP and gRPC inputs build it over an in-process token engine.
 pub async fn build_pipeline<Req, Resp>(
     card: &ModelDeploymentCard,
     engine: ExecutionContext,
     tokenizer: crate::tokenizers::Tokenizer,
-) -> anyhow::Result<Arc<ServiceFrontend<SingleIn<Req>, ManyOut<Annotated<Resp>>>>>
+    local_pipeline: LocalPipeline,
+) -> anyhow::Result<ServiceEngine<SingleIn<Req>, ManyOut<Annotated<Resp>>>>
 where
     Req: Data,
     Resp: Data,
@@ -455,12 +463,21 @@ where
             Pin<Box<dyn AsyncEngineStream<Annotated<BackendOutput>>>>,
         >,
 {
-    let frontend = ServiceFrontend::<SingleIn<Req>, ManyOut<Annotated<Resp>>>::new();
     let PromptFormatter::OAI(formatter) = prompt_formatter_from_mdc(card)?;
     let preprocessor =
-        OpenAIPreprocessor::new_with_parts(card.clone(), formatter, tokenizer.clone())?
-            .into_operator();
-    let backend = Backend::from_tokenizer(tokenizer).into_operator();
+        OpenAIPreprocessor::new_with_parts(card.clone(), formatter, tokenizer.clone())?;
+    let backend = Backend::from_tokenizer(tokenizer);
+    if local_pipeline == LocalPipeline::Gdl {
+        return Ok(compose_gdl_in_process_pipeline(
+            preprocessor,
+            backend,
+            engine,
+        ));
+    }
+
+    let frontend = ServiceFrontend::<SingleIn<Req>, ManyOut<Annotated<Resp>>>::new();
+    let preprocessor = preprocessor.into_operator();
+    let backend = backend.into_operator();
     let engine = ServiceBackend::from_engine(engine);
 
     Ok(frontend
@@ -470,6 +487,40 @@ where
         .link(backend.backward_edge())?
         .link(preprocessor.backward_edge())?
         .link_terminal(frontend)?)
+}
+
+/// [`build_pipeline`]'s chain as a gdl local pipeline, built from the terminal up as
+/// [`PreprocessedRouting::build_pipeline`]'s is.
+fn compose_gdl_in_process_pipeline<Req, Resp>(
+    preprocessor: Arc<OpenAIPreprocessor>,
+    backend: Arc<Backend>,
+    engine: ExecutionContext,
+) -> ServiceEngine<SingleIn<Req>, ManyOut<Annotated<Resp>>>
+where
+    Req: Data,
+    Resp: Data,
+    OpenAIPreprocessor: Operator<
+            Context<Req>,
+            Pin<Box<dyn AsyncEngineStream<Annotated<Resp>>>>,
+            Context<PreprocessedRequest>,
+            Pin<Box<dyn AsyncEngineStream<Annotated<BackendOutput>>>>,
+        >,
+{
+    use gdl::{Hop, SinkStage};
+    type Pre = PreprocessedRequest;
+
+    let engine = SinkStage::new(Arc::new(EngineSink::new(engine)));
+    let backend = DynOperatorStage::<_, Pre, BackendOutput, Pre, LLMEngineOutput>::new(
+        backend,
+        Hop::new((), engine, ()),
+    );
+    let preprocessor = DynOperatorStage::<_, Req, Resp, Pre, BackendOutput>::new(
+        preprocessor,
+        Hop::new((), backend, ()),
+    );
+    Arc::new(PipelineEngine::<_, Req, Resp>::new(gdl::Source::new(
+        Hop::new((), preprocessor, ()),
+    )))
 }
 
 /// Build the embeddings pipeline: preprocessor, then backend, then `engine`, composed on

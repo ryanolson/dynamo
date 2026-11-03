@@ -412,9 +412,10 @@ pub mod llm {
     pub const DYN_LORA_ENABLED: &str = "DYN_LORA_ENABLED";
 
     /// The local pipeline that composes the frontend's routed pipelines (chat,
-    /// completions, Generate, and the Python `chat_engine_factory`'s) and its
-    /// token-input embeddings pipeline: `dynamo` (the default) or `gdl`. Read
-    /// once per process; any other value fails the model's pipeline build.
+    /// completions, Generate, and the Python `chat_engine_factory`'s), its
+    /// token-input embeddings pipeline, and the in-process pipeline of the HTTP
+    /// and gRPC inputs: `dynamo` (the default) or `gdl`. Read once per process;
+    /// any other value fails the pipeline build.
     pub const DYN_LOCAL_PIPELINE: &str = "DYN_LOCAL_PIPELINE";
 
     /// LoRA cache directory path

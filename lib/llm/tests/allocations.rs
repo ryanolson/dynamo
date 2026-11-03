@@ -11,6 +11,7 @@
 //! |---|---|---|
 //! | `engine` | the test LLM engine, called directly | itself |
 //! | `a` | `build_pipeline`: preprocessor, backend | test LLM engine |
+//! | `a-gdl` | `a` composed as a gdl local pipeline | test LLM engine |
 //! | `b` | `PreprocessedRouting::build_pipeline`: preprocessor, migration, backend, encoder router, prefill router | test LLM engine, in place of `RoutingHost` |
 //! | `b-gdl` | `b` composed as a gdl local pipeline (`LocalPipeline::Gdl`, what `DYN_LOCAL_PIPELINE=gdl` selects) | test LLM engine, in place of `RoutingHost` |
 //! | `c` | `PreprocessedRouting::build_preprocessed_pipeline`: migration, encoder router, prefill router | test LLM engine, in place of `RoutingHost` |
@@ -50,6 +51,7 @@
 //! |---|---:|---:|---:|---:|
 //! | `engine` | 7 | 2,752 | 22 | 2,812 |
 //! | `a` | 349 | 100,958 | 862 | 122,446 |
+//! | `a-gdl` | 375 | 97,969 | 888 | 119,457 |
 //! | `b` | 402 | 227,025 | 915 | 248,513 |
 //! | `b-gdl` | 455 | 223,943 | 968 | 245,431 |
 //! | `c` | 71 | 144,683 | 86 | 144,743 |
@@ -62,6 +64,11 @@
 //! the adapters' cost in `lib/gdl-adapters/tests/allocations.rs`: 23 allocations per adapted
 //! operator against 14 for a `link` stage, 5 operators, and 8 more at the boundary
 //! (`PipelineEngine` above, `EngineSink` below): 5 × 9 + 8 = 53. Native gdl operators remove it.
+//!
+//! `a-gdl` costs 26 allocations more than `a` at both item counts: 2 adapted operators × 9 + 8
+//! at the boundary. It asks for 2,989 fewer bytes. By size, the `link` chain's 13 boxed futures
+//! of 2.2 to 5 KB (43,984 bytes) give way to one boxed future of 11.7 to 13.1 KB per
+//! `PipelineEngine` (36,544 bytes); the 26 extra allocations are small and add 4,451 bytes.
 //!
 //! `c-gdl` costs 35 allocations more than `c` at both item counts: 3 adapted operators × 9 + 8
 //! at the boundary, as for `b-gdl`. It asks for 2,188 fewer bytes. By size, the `link` chain's
@@ -124,6 +131,8 @@ const BASELINE: &[Row] = &[
     row("engine", 16, 22, 2812),
     row("a", 1, 349, 100958),
     row("a", 16, 862, 122446),
+    row("a-gdl", 1, 375, 97969),
+    row("a-gdl", 16, 888, 119457),
     row("b", 1, 402, 227025),
     row("b", 16, 915, 248513),
     row("b-gdl", 1, 455, 223943),
@@ -545,15 +554,24 @@ async fn measure_engine(fixture: &Fixture, items: usize, requests: usize) -> Mea
     .await
 }
 
-async fn measure_a(fixture: &Fixture, items: usize, requests: usize) -> Measured {
+async fn measure_a(
+    fixture: &Fixture,
+    name: &'static str,
+    local_pipeline: LocalPipeline,
+    items: usize,
+    requests: usize,
+) -> Measured {
     let engine: ExecutionContext = fixture.llm_engine(items);
-    let pipeline = build_pipeline::<
-        NvCreateChatCompletionRequest,
-        NvCreateChatCompletionStreamResponse,
-    >(&fixture.card, engine, fixture.tokenizer.clone())
-    .await
-    .expect("pipeline a");
-    measure("a", items, requests, || {
+    let pipeline =
+        build_pipeline::<NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse>(
+            &fixture.card,
+            engine,
+            fixture.tokenizer.clone(),
+            local_pipeline,
+        )
+        .await
+        .expect("pipeline a");
+    measure(name, items, requests, || {
         let pipeline = pipeline.clone();
         let request = chat_request();
         async move { drain(pipeline.generate(Context::new(request)).await.unwrap()).await }
@@ -669,7 +687,8 @@ async fn measure_embed(
 async fn measure_row(fixture: &Fixture, name: &str, items: usize, requests: usize) -> Measured {
     match name {
         "engine" => measure_engine(fixture, items, requests).await,
-        "a" => measure_a(fixture, items, requests).await,
+        "a" => measure_a(fixture, "a", LocalPipeline::Dynamo, items, requests).await,
+        "a-gdl" => measure_a(fixture, "a-gdl", LocalPipeline::Gdl, items, requests).await,
         "b" => measure_b(fixture, "b", LocalPipeline::Dynamo, items, requests).await,
         "b-gdl" => measure_b(fixture, "b-gdl", LocalPipeline::Gdl, items, requests).await,
         "c" => measure_c(fixture, "c", LocalPipeline::Dynamo, items, requests).await,
@@ -770,6 +789,8 @@ const ROWS: &[(&str, usize)] = &[
     ("engine", 16),
     ("a", 1),
     ("a", 16),
+    ("a-gdl", 1),
+    ("a-gdl", 16),
     ("b", 1),
     ("b", 16),
     ("b-gdl", 1),
