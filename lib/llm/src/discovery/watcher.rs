@@ -14,17 +14,13 @@ use dynamo_kv_router::PrefillLoadEstimator;
 use dynamo_runtime::{
     DistributedRuntime,
     discovery::{DiscoveryInstance, DiscoveryQuery, DiscoveryStream, ModelCardInstanceId},
-    pipeline::{
-        ManyOut, Operator, RouterMode, SegmentSource, ServiceBackend, SingleIn, Source,
-        network::egress::push_router::PushRouter,
-    },
+    pipeline::{RouterMode, network::egress::push_router::PushRouter},
     protocols::{EndpointId, annotated::Annotated},
 };
 
 use dynamo_renderer::PromptFormatter;
 
 use crate::{
-    backend::Backend,
     discovery::{LoadThresholdHandle, WORKER_TYPE_DECODE, WorkerSet},
     entrypoint::{self, ChatEngineFactoryCallback, RouterConfig},
     http::service::metrics::Metrics,
@@ -1020,16 +1016,6 @@ impl ModelWatcher {
             worker_set.set_load_context(load_context);
         } else if card.model_input == ModelInput::Tokens && card.model_type.supports_embedding() {
             // Case 4: Tokens + Embeddings
-            // Create preprocessing pipeline similar to Backend
-            let frontend = SegmentSource::<
-                SingleIn<NvCreateEmbeddingRequest>,
-                ManyOut<Annotated<NvCreateEmbeddingResponse>>,
-            >::new();
-
-            let preprocessor =
-                OpenAIPreprocessor::new_for_embeddings(card.clone())?.into_operator();
-            let backend = Backend::from_mdc(card).into_operator();
-
             let router = PushRouter::<
                 PreprocessedEmbeddingRequest,
                 Annotated<EmbeddingsEngineOutput>,
@@ -1039,16 +1025,8 @@ impl ModelWatcher {
             .await?;
 
             // Note: Embeddings don't need KV routing complexity or load monitoring
-            let service_backend = ServiceBackend::from_engine(Arc::new(router));
-
-            // Link the pipeline: frontend -> preprocessor -> backend -> service_backend -> backend -> preprocessor -> frontend
-            let embedding_engine = frontend
-                .link(preprocessor.forward_edge())?
-                .link(backend.forward_edge())?
-                .link(service_backend)?
-                .link(backend.backward_edge())?
-                .link(preprocessor.backward_edge())?
-                .link_terminal(frontend)?;
+            let embedding_engine =
+                entrypoint::input::build_embeddings_pipeline(card, Arc::new(router))?;
 
             worker_set.embeddings_engine = Some(embedding_engine);
         } else if card.model_input == ModelInput::Tensor && card.model_type.supports_tensor() {
@@ -1573,7 +1551,9 @@ mod tests {
     use crate::session_affinity::SessionAffinityMode;
     use dynamo_runtime::discovery::DiscoveryEvent;
     use dynamo_runtime::engine::AsyncEngine;
-    use dynamo_runtime::pipeline::Error;
+    use dynamo_runtime::pipeline::{
+        Error, ManyOut, Operator, SegmentSource, ServiceBackend, SingleIn, Source,
+    };
     use dynamo_runtime::{Runtime, distributed::DistributedConfig};
     use futures::StreamExt;
 
