@@ -68,6 +68,8 @@ pub struct Backend {
 
 /// Internal state for managing token decoding and stream processing
 /// Supports n>1 (multiple choices) by maintaining per-choice decoders.
+///
+/// Transition: make concrete when the gdl pipeline is the only local pipeline.
 #[allow(dead_code)]
 struct DecoderUnfoldState<S> {
     stream: S,
@@ -203,6 +205,7 @@ impl Backend {
         }
     }
 
+    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
     fn decoder<S>(
         &self,
         stream: S,
@@ -238,6 +241,7 @@ impl Backend {
     }
 }
 
+// Transition: remove when the gdl pipeline is the only local pipeline.
 impl
     Operator<
         SingleIn<PreprocessedRequest>,
@@ -285,6 +289,8 @@ impl gdl::Operator for GdlOperator<Backend, PreprocessedRequest> {
 impl Backend {
     /// Send `request` on and detokenize the response: the body of Backend's Dynamo and gdl
     /// operators.
+    ///
+    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
     async fn generate_tokens<D>(
         &self,
         request: SingleIn<PreprocessedRequest>,
@@ -706,6 +712,7 @@ impl Backend {
     }
 }
 
+// Transition: remove when the gdl pipeline is the only local pipeline.
 #[async_trait]
 impl
     Operator<

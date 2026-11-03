@@ -23,6 +23,8 @@ use dynamo_runtime::protocols::annotated::Annotated;
 use futures::{FutureExt, Stream, StreamExt};
 
 /// The stage below an operator, as the operator's body calls it.
+///
+/// Transition: remove when the gdl pipeline is the only local pipeline.
 pub(crate) trait Downstream<Req: Data, T: Data>: Send + Sync {
     /// The response stream of one call. It gives the request's Dynamo context, which the body
     /// stops to stop the stages below.
@@ -42,9 +44,13 @@ pub(crate) trait Downstream<Req: Data, T: Data>: Send + Sync {
     fn engine(&self) -> Arc<dyn AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, Error>>;
 
     /// The operator's response, as its caller takes it.
+    ///
+    /// Transition: remove when the gdl pipeline is the only local pipeline.
     type Response<U: Data>;
 
     /// Box the operator's response stream once, for its caller. `context` is the request's.
+    ///
+    /// Transition: remove when the gdl pipeline is the only local pipeline.
     fn respond<U, S>(stream: S, context: Arc<dyn AsyncEngineContext>) -> Self::Response<U>
     where
         U: Data,
@@ -57,6 +63,8 @@ pub(crate) trait Downstream<Req: Data, T: Data>: Send + Sync {
 /// compiler checks the body's future for `Send` with the trait object's lifetime erased, and an
 /// impl for the `'static` trait object is then not general enough. The newtype fixes the
 /// lifetime where it is defined.
+///
+/// Transition: remove when the gdl pipeline is the only local pipeline.
 pub(crate) struct DynamoDownstream<Req: Data, T: Data>(
     pub(crate) Arc<dyn AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, Error>>,
 );
@@ -124,6 +132,8 @@ where
             })
     }
 
+    /// Transition: root with `PipelineEngine::new` when Migration and the encoder and prefill
+    /// routers run as native gdl stages.
     fn engine(&self) -> Arc<dyn AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, Error>> {
         // Each call derives a fresh root `Cx`: the request's `cx` is cancelled once its
         // response ends. The stages below are Dynamo's, so a kill reaches them through the

@@ -599,6 +599,7 @@ def test_mocker_two_kv_router(
         )
 
 
+# Transition: keep only the gdl case when the gdl pipeline is the only local pipeline.
 LOCAL_PIPELINES = (
     pytest.param(None, id="dynamo"),
     pytest.param("gdl", id="gdl"),

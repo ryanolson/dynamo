@@ -63,12 +63,15 @@ pub struct PreprocessedRouting {
         ServiceEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>>,
     prefill_router: Arc<PrefillRouter>,
     encoder_router: Arc<EncoderRouter>,
+    /// Transition: remove when the gdl pipeline is the only local pipeline.
     local_pipeline: LocalPipeline,
 }
 
 /// How a local pipeline composes its stages: [`PreprocessedRouting::build_pipeline`],
 /// [`PreprocessedRouting::build_preprocessed_pipeline`], [`build_pipeline`] and
 /// [`build_embeddings_pipeline`]. The stages and what they do are the same either way.
+///
+/// Transition: remove when the gdl pipeline is the only local pipeline.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LocalPipeline {
     /// Dynamo's `link` chain.
@@ -81,6 +84,8 @@ pub enum LocalPipeline {
 
 impl LocalPipeline {
     /// The name `DYN_LOCAL_PIPELINE` takes, and the frontend logs.
+    ///
+    /// Transition: remove when the gdl pipeline is the only local pipeline.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Dynamo => "dynamo",
@@ -89,6 +94,8 @@ impl LocalPipeline {
     }
 
     /// The pipeline `DYN_LOCAL_PIPELINE` selects. The variable is read once per process.
+    ///
+    /// Transition: remove when the gdl pipeline is the only local pipeline.
     pub fn configured() -> anyhow::Result<Self> {
         static CONFIGURED: LazyLock<Result<LocalPipeline, String>> = LazyLock::new(|| {
             let value = match std::env::var(DYN_LOCAL_PIPELINE) {
@@ -101,6 +108,7 @@ impl LocalPipeline {
         CONFIGURED.clone().map_err(anyhow::Error::msg)
     }
 
+    /// Transition: remove when the gdl pipeline is the only local pipeline.
     fn parse(value: Option<&str>) -> anyhow::Result<Self> {
         match value.map(str::trim) {
             None | Some("") => Ok(Self::Dynamo),
@@ -319,6 +327,7 @@ pub(crate) async fn build_preprocessed_routing_with_session_affinity_mode(
     }
     Ok(
         PreprocessedRouting::new(routing_host, prefill_router, encoder_router)
+            // Transition: remove when the gdl pipeline is the only local pipeline.
             .with_local_pipeline(LocalPipeline::configured()?),
     )
 }
@@ -452,6 +461,7 @@ pub async fn build_pipeline<Req, Resp>(
     card: &ModelDeploymentCard,
     engine: ExecutionContext,
     tokenizer: crate::tokenizers::Tokenizer,
+    // Transition: remove when the gdl pipeline is the only local pipeline.
     local_pipeline: LocalPipeline,
 ) -> anyhow::Result<ServiceEngine<SingleIn<Req>, ManyOut<Annotated<Resp>>>>
 where
@@ -482,6 +492,7 @@ where
         ));
     }
 
+    // Transition: remove when the gdl pipeline is the only local pipeline.
     let frontend = ServiceFrontend::<SingleIn<Req>, ManyOut<Annotated<Resp>>>::new();
     let preprocessor = preprocessor.into_operator();
     let backend = backend.into_operator();
@@ -543,6 +554,7 @@ pub fn build_embeddings_pipeline(
         SingleIn<PreprocessedEmbeddingRequest>,
         ManyOut<Annotated<EmbeddingsEngineOutput>>,
     >,
+    // Transition: remove when the gdl pipeline is the only local pipeline.
     local_pipeline: LocalPipeline,
 ) -> anyhow::Result<OpenAIEmbeddingsStreamingEngine> {
     let backend = Backend::from_mdc(card);
@@ -554,6 +566,7 @@ pub fn build_embeddings_pipeline(
         ));
     }
 
+    // Transition: remove when the gdl pipeline is the only local pipeline.
     let frontend = SegmentSource::<
         SingleIn<NvCreateEmbeddingRequest>,
         ManyOut<Annotated<NvCreateEmbeddingResponse>>,
@@ -626,6 +639,8 @@ impl PreprocessedRouting {
 
     /// Compose [`build_pipeline`](Self::build_pipeline) and
     /// [`build_preprocessed_pipeline`](Self::build_preprocessed_pipeline) on `local_pipeline`.
+    ///
+    /// Transition: remove when the gdl pipeline is the only local pipeline.
     pub fn with_local_pipeline(mut self, local_pipeline: LocalPipeline) -> Self {
         self.local_pipeline = local_pipeline;
         self
@@ -633,6 +648,8 @@ impl PreprocessedRouting {
 
     /// The local pipeline [`build_pipeline`](Self::build_pipeline) and
     /// [`build_preprocessed_pipeline`](Self::build_preprocessed_pipeline) compose on.
+    ///
+    /// Transition: remove when the gdl pipeline is the only local pipeline.
     pub fn local_pipeline(&self) -> LocalPipeline {
         self.local_pipeline
     }
@@ -669,6 +686,7 @@ impl PreprocessedRouting {
             return Ok(self.compose_gdl_pipeline(preprocessor, migration, token_backend));
         }
 
+        // Transition: remove when the gdl pipeline is the only local pipeline.
         let frontend = SegmentSource::<SingleIn<Req>, ManyOut<Annotated<Resp>>>::new();
         let preprocessor_op = preprocessor.into_operator();
         let token_backend = token_backend.into_operator();
@@ -731,6 +749,7 @@ impl PreprocessedRouting {
             Arc::new(GdlOperator::<_, Pre>::new(token_backend)),
             Hop::new((), self.gdl_routers(), ()),
         );
+        // Transition: remove when Migration runs as a native gdl stage.
         let migration = DynOperatorStage::<_, Pre, BackendOutput, Pre, BackendOutput>::new(
             migration,
             Hop::new((), token_backend, ()),
@@ -760,11 +779,14 @@ impl PreprocessedRouting {
         type Pre = PreprocessedRequest;
         type Out = LLMEngineOutput;
 
+        // Transition: remove when RoutingHost runs as a native gdl sink.
         let routing = SinkStage::new(Arc::new(EngineSink::new(self.backend_engine.clone())));
+        // Transition: remove when the encoder and prefill routers run as native gdl stages.
         let prefill = DynOperatorStage::<_, Pre, Out, Pre, Out>::new(
             self.prefill_router.clone(),
             Hop::new((), routing, ()),
         );
+        // Transition: remove when the encoder and prefill routers run as native gdl stages.
         DynOperatorStage::new(self.encoder_router.clone(), Hop::new((), prefill, ()))
     }
 
@@ -784,6 +806,7 @@ impl PreprocessedRouting {
             return Ok(self.compose_gdl_preprocessed_pipeline(migration));
         }
 
+        // Transition: remove when the gdl pipeline is the only local pipeline.
         let frontend = SegmentSource::<
             SingleIn<PreprocessedRequest>,
             ManyOut<Annotated<LLMEngineOutput>>,
@@ -817,6 +840,7 @@ impl PreprocessedRouting {
         type Pre = PreprocessedRequest;
         type Out = LLMEngineOutput;
 
+        // Transition: remove when Migration runs as a native gdl stage.
         let migration = DynOperatorStage::<_, Pre, Out, Pre, Out>::new(
             migration,
             Hop::new((), self.gdl_routers(), ()),
@@ -831,6 +855,7 @@ impl PreprocessedRouting {
 mod tests {
     use super::*;
 
+    /// Transition: remove when the gdl pipeline is the only local pipeline.
     #[test]
     fn local_pipeline_is_dynamo_unless_gdl_is_named() {
         for value in [None, Some(""), Some("dynamo"), Some(" Dynamo ")] {

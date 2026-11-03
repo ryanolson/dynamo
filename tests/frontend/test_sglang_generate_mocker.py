@@ -37,6 +37,7 @@ pytestmark = [
 
 # The Generate route runs the frontend's preprocessed pipeline, so each test runs on Dynamo's
 # local pipeline and on gdl's.
+# Transition: keep only the gdl case when the gdl pipeline is the only local pipeline.
 LOCAL_PIPELINES = (
     pytest.param(None, id="dynamo"),
     pytest.param("gdl", id="gdl"),

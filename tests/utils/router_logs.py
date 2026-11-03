@@ -356,6 +356,7 @@ def wait_for_worker_routing_events(
         time.sleep(poll_interval_s)
 
 
+# Transition: remove when the gdl pipeline is the only local pipeline.
 @dataclass(frozen=True)
 class LocalPipelineRecord:
     """The local pipeline a frontend composed a model's routed chat and
@@ -365,6 +366,7 @@ class LocalPipelineRecord:
     local_pipeline: str
 
 
+# Transition: remove when the gdl pipeline is the only local pipeline.
 def parse_local_pipeline_records(log_content: str) -> list[LocalPipelineRecord]:
     """Parse local-pipeline records, ignoring unrelated or partial log lines."""
 

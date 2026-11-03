@@ -8375,6 +8375,7 @@ fn preprocessing_lifecycle(context: &PipelineContext<()>) -> LifecycleTrace {
 // any prompt template that does not support this should return an error
 // oob - we should update any prompt template that does not support this to support it
 
+// Transition: remove when the gdl pipeline is the only local pipeline.
 impl
     Operator<
         SingleIn<NvCreateChatCompletionRequest>,
@@ -8434,6 +8435,8 @@ impl gdl::Operator for GdlOperator<OpenAIPreprocessor, NvCreateChatCompletionReq
 impl OpenAIPreprocessor {
     /// Preprocess a chat request, send it on, and postprocess the response: the body of the
     /// chat preprocessor's Dynamo and gdl operators.
+    ///
+    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
     async fn generate_chat<D>(
         &self,
         request: SingleIn<NvCreateChatCompletionRequest>,
@@ -8705,6 +8708,7 @@ impl OpenAIPreprocessor {
     }
 }
 
+// Transition: remove when the gdl pipeline is the only local pipeline.
 impl
     Operator<
         SingleIn<NvCreateCompletionRequest>,
@@ -8758,6 +8762,8 @@ impl gdl::Operator for GdlOperator<OpenAIPreprocessor, NvCreateCompletionRequest
 impl OpenAIPreprocessor {
     /// Preprocess a completions request, send it on, and postprocess the response: the body
     /// of the completions preprocessor's Dynamo and gdl operators.
+    ///
+    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
     async fn generate_completion<D>(
         &self,
         request: SingleIn<NvCreateCompletionRequest>,
@@ -8906,6 +8912,7 @@ impl OpenAIPreprocessor {
     }
 }
 
+// Transition: remove when the gdl pipeline is the only local pipeline.
 impl
     Operator<
         SingleIn<NvCreateEmbeddingRequest>,
@@ -8963,6 +8970,8 @@ impl gdl::Operator for GdlOperator<OpenAIPreprocessor, NvCreateEmbeddingRequest>
 impl OpenAIPreprocessor {
     /// Preprocess an embeddings request, send it on, and postprocess the response: the body of
     /// the embeddings preprocessor's Dynamo and gdl operators.
+    ///
+    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
     async fn generate_embedding<D>(
         &self,
         request: SingleIn<NvCreateEmbeddingRequest>,

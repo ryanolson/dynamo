@@ -122,20 +122,24 @@ const REQUESTS: usize = 200;
 const BASELINE: &[Row] = &[
     row("engine", 1, 7, 2752),
     row("engine", 16, 22, 2812),
+    // Transition: remove when the gdl pipeline is the only local pipeline.
     row("a", 1, 349, 100958),
     row("a", 16, 862, 122446),
     row("a-gdl", 1, 335, 81439),
     row("a-gdl", 16, 848, 102927),
+    // Transition: remove when the gdl pipeline is the only local pipeline.
     row("b", 1, 402, 227025),
     row("b", 16, 915, 248513),
     row("b-gdl", 1, 397, 206061),
     row("b-gdl", 16, 910, 227549),
+    // Transition: remove when the gdl pipeline is the only local pipeline.
     row("c", 1, 71, 144683),
     row("c", 16, 86, 144743),
     row("c-gdl", 1, 82, 140607),
     row("c-gdl", 16, 97, 140667),
     row("embed-engine", 1, 8, 6548),
     row("embed-engine", 16, 23, 88868),
+    // Transition: remove when the gdl pipeline is the only local pipeline.
     row("embed", 1, 199, 44406),
     row("embed", 16, 2283, 529854),
     row("embeddings-gdl", 1, 186, 44471),
@@ -780,20 +784,24 @@ fn check_environment() {
 const ROWS: &[(&str, usize)] = &[
     ("engine", 1),
     ("engine", 16),
+    // Transition: remove when the gdl pipeline is the only local pipeline.
     ("a", 1),
     ("a", 16),
     ("a-gdl", 1),
     ("a-gdl", 16),
+    // Transition: remove when the gdl pipeline is the only local pipeline.
     ("b", 1),
     ("b", 16),
     ("b-gdl", 1),
     ("b-gdl", 16),
+    // Transition: remove when the gdl pipeline is the only local pipeline.
     ("c", 1),
     ("c", 16),
     ("c-gdl", 1),
     ("c-gdl", 16),
     ("embed-engine", 1),
     ("embed-engine", 16),
+    // Transition: remove when the gdl pipeline is the only local pipeline.
     ("embed", 1),
     ("embed", 16),
     ("embeddings-gdl", 1),

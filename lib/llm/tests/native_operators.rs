@@ -50,6 +50,8 @@ const MODEL_PATH: &str = "tests/data/sample-models/TinyLlama_v1.1";
 type Engine<Req, T> = Arc<DynEngine<Req, T>>;
 
 /// A Dynamo operator over `next`, as a Dynamo engine: the call a `link` chain makes.
+///
+/// Transition: remove when the gdl pipeline is the only local pipeline.
 struct Linked<O, DReq: Data, DT: Data> {
     op: Arc<O>,
     next: Engine<DReq, DT>,
@@ -70,6 +72,7 @@ where
     }
 }
 
+/// Transition: remove when the gdl pipeline is the only local pipeline.
 fn linked<O, Req, T, DReq, DT>(op: Arc<O>, next: Engine<DReq, DT>) -> Engine<Req, T>
 where
     O: Operator<SingleIn<Req>, ManyOut<Annotated<T>>, SingleIn<DReq>, ManyOut<Annotated<DT>>>,
@@ -106,6 +109,7 @@ where
     Req: Data,
     T: Data,
 {
+    // Transition: root with PipelineEngine::new when no Dynamo stage runs inside a gdl pipeline.
     Arc::new(PipelineEngine::<_, Req, T>::for_dynamo_stages(Source::new(
         next,
     )))
@@ -327,6 +331,9 @@ async fn collect<T: Data>(stream: ManyOut<Annotated<T>>) -> Vec<Annotated<T>> {
 }
 
 /// Runs `make()` both ways and returns the dynamo and gdl results.
+///
+/// Transition: remove the Dynamo case and keep the gdl assertions when the gdl pipeline is the only
+/// local pipeline.
 async fn both<Req: Data, T: Data>(
     dynamo: Engine<Req, T>,
     gdl: Engine<Req, T>,
@@ -726,6 +733,8 @@ async fn embeddings_are_the_same_both_ways() {
 
 /// A Dynamo operator that, as the prefill router does during its handoff, holds its eager
 /// future until it sees the request's kill through its own context, and then cleans up.
+///
+/// Transition: remove when the encoder and prefill routers run as native gdl stages.
 #[derive(Default)]
 struct Handoff {
     entered: AtomicBool,

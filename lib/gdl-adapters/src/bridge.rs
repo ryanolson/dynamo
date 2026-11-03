@@ -51,6 +51,8 @@ impl CxBridge {
     /// A fresh root `Cx` that follows `context`'s stop but not its kill, for a
     /// pipeline whose stages are Dynamo operators and engines (see
     /// [`CxBridge`]). Otherwise as [`cx`](Self::cx).
+    ///
+    /// Transition: remove when no Dynamo stage runs inside a gdl pipeline.
     pub fn cx_for_dynamo_stages(context: &dyn AsyncEngineContext) -> Cx {
         Self::linked(context, false)
     }
@@ -192,6 +194,8 @@ impl AsyncEngineContext for KillLatch {
 struct CxLink {
     cx: Cx,
     /// Whether a kill cancels `cx` (see [`CxBridge`]).
+    ///
+    /// Transition: remove when no Dynamo stage runs inside a gdl pipeline.
     cancel_on_kill: bool,
     children: Mutex<Vec<Arc<dyn AsyncEngineContext>>>,
 }

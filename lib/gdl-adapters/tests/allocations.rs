@@ -131,6 +131,8 @@ impl gdl::Operator for NativeIdentity {
 
 /// `stages` identity operators above `engine` in one `link` chain, as
 /// `lib/llm/src/entrypoint/input/common.rs` builds its pipelines.
+///
+/// Transition: remove when the gdl pipeline is the only local pipeline.
 fn link(stages: usize, engine: Engine) -> Engine {
     let operators: Vec<_> = (0..stages)
         .map(|_| Operator::into_operator(&Arc::new(Identity)))
@@ -161,6 +163,8 @@ fn link(stages: usize, engine: Engine) -> Engine {
 
 /// `stages` adapted operators above an adapted engine. Each stage is a type
 /// of its own, so the composition is built by recursion on a const.
+///
+/// Transition: remove when Migration and the encoder and prefill routers run as native gdl stages.
 fn adapted(stages: usize, engine: Engine) -> Engine {
     fn wrap<N: gdl::Next<SingleIn<u32>, Annotated<u32>>>(next: N) -> Engine {
         Arc::new(PipelineEngine::<_, u32, u32>::new(next))

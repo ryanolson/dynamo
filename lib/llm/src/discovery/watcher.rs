@@ -865,6 +865,7 @@ impl ModelWatcher {
                 tracing::info!("Generate (token-in/token-out) is ready");
             }
 
+            // Transition: remove when the gdl pipeline is the only local pipeline.
             if let Some(routing) = preprocessed_routing.as_ref()
                 && routed_pipeline_built
             {
@@ -1037,6 +1038,7 @@ impl ModelWatcher {
             // Build the preprocessor and read the local pipeline first: a router started for a
             // card that fails here would leave its discovery watch running.
             let preprocessor = OpenAIPreprocessor::new_for_embeddings(card.clone())?;
+            // Transition: remove when the gdl pipeline is the only local pipeline.
             let local_pipeline = entrypoint::input::LocalPipeline::configured()?;
             let router = PushRouter::<
                 PreprocessedEmbeddingRequest,
@@ -1053,6 +1055,7 @@ impl ModelWatcher {
                 Arc::new(router),
                 local_pipeline,
             )?;
+            // Transition: remove when the gdl pipeline is the only local pipeline.
             tracing::info!(
                 model = card.name(),
                 local_pipeline = local_pipeline.as_str(),

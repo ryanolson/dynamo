@@ -36,6 +36,8 @@ use crate::error::{exit, exit_item};
 pub struct PipelineEngine<N, Req, T> {
     next: N,
     /// Whether a kill of the request cancels the `Cx` (see [`CxBridge`]).
+    ///
+    /// Transition: remove when no Dynamo stage runs inside a gdl pipeline.
     cancel_on_kill: bool,
     types: PhantomData<fn(Req) -> T>,
 }
@@ -55,6 +57,8 @@ impl<N, Req, T> PipelineEngine<N, Req, T> {
     /// kill reaches them through the request's context only, so gdl does not
     /// drop a call an operator is still finishing
     /// ([`CxBridge::cx_for_dynamo_stages`]).
+    ///
+    /// Transition: remove when no Dynamo stage runs inside a gdl pipeline.
     pub fn for_dynamo_stages(next: N) -> Self {
         Self {
             next,

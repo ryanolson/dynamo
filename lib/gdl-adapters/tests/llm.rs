@@ -173,6 +173,8 @@ fn gdl_migration(engine: Engine) -> Engine {
 }
 
 /// Migration above `engine`, composed with Dynamo's `link` chain.
+///
+/// Transition: remove when the gdl pipeline is the only local pipeline.
 fn link_migration(engine: Engine) -> Engine {
     let frontend = ServiceFrontend::<SingleIn<PreprocessedRequest>, Out>::new();
     let operator = Operator::<SingleIn<PreprocessedRequest>, Out, SingleIn<PreprocessedRequest>, Out>::into_operator(&migration());
@@ -204,6 +206,8 @@ fn tokens(items: &[Annotated<LLMEngineOutput>]) -> Vec<Vec<u32>> {
 #[tokio::test]
 async fn migration_retries_an_eager_worker_unavailable_through_the_adapters() {
     let mut results = Vec::new();
+    // Transition: remove the Dynamo case and keep the gdl assertions when the gdl pipeline is the
+    // only local pipeline.
     for compose in [link_migration, gdl_migration] {
         let engine = Flaky::new(1, false);
         let items: Vec<_> = compose(engine.clone())
@@ -311,6 +315,8 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, Out, Error> for Hanging {
 #[tokio::test]
 async fn a_kill_during_dispatch_ends_the_request_on_both_paths() {
     let mut outcomes = Vec::new();
+    // Transition: remove the Dynamo case and keep the gdl assertions when the gdl pipeline is the
+    // only local pipeline.
     for compose in [link_migration, gdl_migration] {
         let pipeline = compose(Arc::new(Hanging));
         let request = request();
@@ -529,6 +535,8 @@ fn calls(engine: &Flaky) -> Vec<(String, Option<String>)> {
 #[tokio::test]
 async fn pipeline_b_streams_the_same_chat_on_both_local_pipelines() {
     let mut runs = Vec::new();
+    // Transition: remove the Dynamo case and keep the gdl assertions when the gdl pipeline is the
+    // only local pipeline.
     for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
         let engine = Flaky::new(0, false);
         let items: Vec<_> = pipeline_b(local_pipeline, engine.clone(), 0)
@@ -554,6 +562,8 @@ async fn pipeline_b_streams_the_same_chat_on_both_local_pipelines() {
 #[tokio::test]
 async fn pipeline_b_retries_an_eager_worker_unavailable_from_its_terminal() {
     let mut runs = Vec::new();
+    // Transition: remove the Dynamo case and keep the gdl assertions when the gdl pipeline is the
+    // only local pipeline.
     for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
         let engine = Flaky::new(1, false);
         let items: Vec<_> = pipeline_b(local_pipeline, engine.clone(), 3)
@@ -607,6 +617,8 @@ async fn a_stop_and_a_kill_reach_the_terminal_through_pipeline_b_on_gdl() {
 #[tokio::test]
 async fn a_kill_during_dispatch_ends_pipeline_b_on_both_local_pipelines() {
     let mut outcomes = Vec::new();
+    // Transition: remove the Dynamo case and keep the gdl assertions when the gdl pipeline is the
+    // only local pipeline.
     for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
         let pipeline = pipeline_b(local_pipeline, Arc::new(Hanging), 3);
         outcomes.push(kill_during_dispatch(pipeline, chat_request()).await);
@@ -656,6 +668,8 @@ fn pipeline_c(local_pipeline: LocalPipeline, engine: Engine, migration_limit: u3
 #[tokio::test]
 async fn pipeline_c_streams_the_same_tokens_on_both_local_pipelines() {
     let mut runs = Vec::new();
+    // Transition: remove the Dynamo case and keep the gdl assertions when the gdl pipeline is the
+    // only local pipeline.
     for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
         let engine = Flaky::new(0, false);
         let items: Vec<_> = pipeline_c(local_pipeline, engine.clone(), 0)
@@ -683,6 +697,8 @@ async fn pipeline_c_streams_the_same_tokens_on_both_local_pipelines() {
 #[tokio::test]
 async fn pipeline_c_retries_an_eager_worker_unavailable_from_its_terminal() {
     let mut runs = Vec::new();
+    // Transition: remove the Dynamo case and keep the gdl assertions when the gdl pipeline is the
+    // only local pipeline.
     for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
         let engine = Flaky::new(1, false);
         let items: Vec<_> = pipeline_c(local_pipeline, engine.clone(), 3)
@@ -732,6 +748,8 @@ async fn a_stop_and_a_kill_reach_the_terminal_through_pipeline_c_on_gdl() {
 #[tokio::test]
 async fn a_kill_during_dispatch_ends_pipeline_c_on_both_local_pipelines() {
     let mut outcomes = Vec::new();
+    // Transition: remove the Dynamo case and keep the gdl assertions when the gdl pipeline is the
+    // only local pipeline.
     for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
         let pipeline = pipeline_c(local_pipeline, Arc::new(Hanging), 3);
         outcomes.push(kill_during_dispatch(pipeline, request()).await);
@@ -844,6 +862,8 @@ fn embedding_request() -> SingleIn<NvCreateEmbeddingRequest> {
 #[tokio::test]
 async fn pipeline_embeddings_answers_the_same_on_both_local_pipelines() {
     let mut runs = Vec::new();
+    // Transition: remove the Dynamo case and keep the gdl assertions when the gdl pipeline is the
+    // only local pipeline.
     for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
         let engine = FlakyEmbeddings::new(0, false);
         let items: Vec<_> = pipeline_embeddings(local_pipeline, engine.clone())
@@ -880,6 +900,8 @@ async fn pipeline_embeddings_answers_the_same_on_both_local_pipelines() {
 #[tokio::test]
 async fn pipeline_embeddings_returns_its_terminals_eager_error_on_both_local_pipelines() {
     let mut errors = Vec::new();
+    // Transition: remove the Dynamo case and keep the gdl assertions when the gdl pipeline is the
+    // only local pipeline.
     for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
         let engine = FlakyEmbeddings::new(1, false);
         let error = match pipeline_embeddings(local_pipeline, engine.clone())
@@ -940,6 +962,8 @@ impl AsyncEngine<SingleIn<PreprocessedEmbeddingRequest>, EmbedOut, Error> for Ha
 #[tokio::test]
 async fn a_kill_during_dispatch_ends_pipeline_embeddings_on_both_local_pipelines() {
     let mut outcomes = Vec::new();
+    // Transition: remove the Dynamo case and keep the gdl assertions when the gdl pipeline is the
+    // only local pipeline.
     for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
         let pipeline = pipeline_embeddings(local_pipeline, Arc::new(HangingEmbeddings));
         outcomes.push(kill_during_dispatch(pipeline, embedding_request()).await);
@@ -974,6 +998,8 @@ async fn pipeline_a(
 #[tokio::test]
 async fn pipeline_a_streams_the_same_chat_on_both_local_pipelines() {
     let mut runs = Vec::new();
+    // Transition: remove the Dynamo case and keep the gdl assertions when the gdl pipeline is the
+    // only local pipeline.
     for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
         let engine = Flaky::new(0, false);
         let items: Vec<_> = pipeline_a(local_pipeline, engine.clone())
@@ -1000,6 +1026,8 @@ async fn pipeline_a_streams_the_same_chat_on_both_local_pipelines() {
 #[tokio::test]
 async fn pipeline_a_returns_its_terminals_eager_error_on_both_local_pipelines() {
     let mut errors = Vec::new();
+    // Transition: remove the Dynamo case and keep the gdl assertions when the gdl pipeline is the
+    // only local pipeline.
     for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
         let engine = Flaky::new(1, false);
         let error = match pipeline_a(local_pipeline, engine.clone())
@@ -1051,6 +1079,8 @@ async fn a_stop_and_a_kill_reach_the_terminal_through_pipeline_a_on_gdl() {
 #[tokio::test]
 async fn a_kill_during_dispatch_ends_pipeline_a_on_both_local_pipelines() {
     let mut outcomes = Vec::new();
+    // Transition: remove the Dynamo case and keep the gdl assertions when the gdl pipeline is the
+    // only local pipeline.
     for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
         let pipeline = pipeline_a(local_pipeline, Arc::new(Hanging)).await;
         outcomes.push(kill_during_dispatch(pipeline, chat_request()).await);
@@ -1236,6 +1266,8 @@ const REFUSED: &str = "refused: Duplicate in-flight request id: req-1";
 #[tokio::test]
 async fn a_duplicate_request_id_tells_the_compositions_of_pipeline_a_apart() {
     let mut outcomes = Vec::new();
+    // Transition: remove the Dynamo case and keep the gdl assertions when the gdl pipeline is the
+    // only local pipeline.
     for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
         let (engine, started) = DispatchProbe::new();
         let pipeline = pipeline_a(local_pipeline, engine).await;
@@ -1247,6 +1279,8 @@ async fn a_duplicate_request_id_tells_the_compositions_of_pipeline_a_apart() {
 #[tokio::test]
 async fn a_duplicate_request_id_tells_the_compositions_of_pipeline_b_apart() {
     let mut outcomes = Vec::new();
+    // Transition: remove the Dynamo case and keep the gdl assertions when the gdl pipeline is the
+    // only local pipeline.
     for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
         let (engine, started) = DispatchProbe::new();
         let pipeline = pipeline_b(local_pipeline, engine, 0);
@@ -1258,6 +1292,8 @@ async fn a_duplicate_request_id_tells_the_compositions_of_pipeline_b_apart() {
 #[tokio::test]
 async fn a_duplicate_request_id_tells_the_compositions_of_pipeline_c_apart() {
     let mut outcomes = Vec::new();
+    // Transition: remove the Dynamo case and keep the gdl assertions when the gdl pipeline is the
+    // only local pipeline.
     for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
         let (engine, started) = DispatchProbe::new();
         let pipeline = pipeline_c(local_pipeline, engine, 0);
@@ -1269,6 +1305,8 @@ async fn a_duplicate_request_id_tells_the_compositions_of_pipeline_c_apart() {
 #[tokio::test]
 async fn a_duplicate_request_id_tells_the_compositions_of_pipeline_embeddings_apart() {
     let mut outcomes = Vec::new();
+    // Transition: remove the Dynamo case and keep the gdl assertions when the gdl pipeline is the
+    // only local pipeline.
     for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
         let (engine, started) = DispatchProbe::new();
         let pipeline = pipeline_embeddings(local_pipeline, engine);
