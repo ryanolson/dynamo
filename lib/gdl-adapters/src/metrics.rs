@@ -9,7 +9,10 @@
 //! `dynamo_endpoint` and `worker_id` once each, with the values
 //! [`create_metric`](dynamo_runtime::metrics::create_metric) gives them for
 //! the same endpoint. `dynamo_endpoint` is the endpoint, as in Dynamo, not
-//! the gdl node.
+//! the gdl node. Dynamo assigns the three names by position in the hierarchy,
+//! so under a nested namespace `dynamo_component` is the inner namespace and
+//! `dynamo_endpoint` the component; the bridge does the same, so that a
+//! node's series and Dynamo's own on one endpoint agree.
 //!
 //! Only new node metrics use this. Dynamo's existing metrics stay where they
 //! are, on Dynamo's registries under their own names, so no dashboard,
