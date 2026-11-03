@@ -33,8 +33,21 @@ transform, through the stream layers between the stages.
   | stream layers (`futures` combinators, gdl boundaries) | 420 | 1.8% | 714 | 2.9% |
   | Backend's decoder stream, own code | 356 | 1.5% | 361 | 1.5% |
   | the preprocessor's response transform, own code | 264 | 1.1% | 286 | 1.2% |
-  | not attributed (tokenizer and serde internals, hashing, other futures) | 8,960 | 37.5% | 8,970 | 36.1% |
+  | not grouped above: | 8,960 | 37.5% | 8,970 | 36.1% |
+  | - oniguruma regex, from the tokenizer's `Replace` decoder (part of detokenizing) | 3,919 | 16.4% | | |
+  | - hashing (`RandomState`, SipHash) | 1,119 | 4.7% | | |
+  | - `Vec` growth (`RawVec::reserve`), mostly the tokenizer's `Strip` decoder | 1,084 | 4.5% | | |
+  | - many small functions | 2,838 | 11.9% | | |
   | **total** | **23,895** | 100% | **24,846** | 100% |
+
+  The profile depends on the tokenizer. The harness uses TinyLlama, whose decoder is
+  `Replace("▁" -> " ")`, `ByteFallback`, `Fuse`, `Strip`; the `Replace` step runs oniguruma on
+  every decode step, so detokenizing is about 12.5% + 16.4% of the per-item cost here. ByteLevel
+  tokenizers (the Llama 3.1 and DeepSeek sample models) have no regex in their decoder.
+
+  The 34.2 allocations per item are not attributed yet: the harness pauses callgrind inside its
+  counting allocator, so callgrind does not see their callers. The tokenizer's C regex also calls
+  `malloc` about 14 times per item, which the harness does not count.
 
   The items are large: `Annotated<LLMEngineOutput>` is 1,112 bytes, `Annotated<BackendOutput>`
   1,008 and `Annotated<NvCreateChatCompletionStreamResponse>` 768. gdl's own boundaries copy no
