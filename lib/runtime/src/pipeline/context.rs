@@ -402,6 +402,10 @@ impl Controller {
     /// Move to `state`, unless the context is already killed. A kill is
     /// final: a stop that lands after it, or races it, must not turn it back
     /// into a stop, or `killed()` would wait again.
+    ///
+    /// Called before the children are told, never after: a child linked
+    /// while they are being told is then either among them, or linked after
+    /// the state changed, so a check after `link_child` sees it.
     fn publish(&self, state: State) {
         self.tx.send_if_modified(|current| {
             if *current == State::Killed || *current == state {
@@ -454,6 +458,7 @@ impl AsyncEngineContext for Controller {
     }
 
     fn stop_generating(&self) {
+        self.publish(State::Stopped);
         // Clone child Arcs to avoid deadlock if parent is accidentally linked under child
         let children = self
             .child_context
@@ -465,11 +470,10 @@ impl AsyncEngineContext for Controller {
         for child in children {
             child.stop_generating();
         }
-
-        self.publish(State::Stopped);
     }
 
     fn stop(&self) {
+        self.publish(State::Stopped);
         // Clone child Arcs to avoid deadlock if parent is accidentally linked under child
         let children = self
             .child_context
@@ -481,11 +485,10 @@ impl AsyncEngineContext for Controller {
         for child in children {
             child.stop();
         }
-
-        self.publish(State::Stopped);
     }
 
     fn kill(&self) {
+        self.publish(State::Killed);
         // Clone child Arcs to avoid deadlock if parent is accidentally linked under child
         let children = self
             .child_context
@@ -497,8 +500,6 @@ impl AsyncEngineContext for Controller {
         for child in children {
             child.kill();
         }
-
-        self.publish(State::Killed);
     }
 
     fn link_child(&self, child: Arc<dyn AsyncEngineContext>) {
@@ -753,8 +754,8 @@ mod tests {
         }
     }
 
-    /// A kill that lands while a stop is telling the children wins, even
-    /// though the stop publishes its own state afterwards.
+    /// A kill that lands while a stop is telling the children wins: the stop
+    /// has published its state already, and a kill is final.
     #[test]
     fn a_stop_does_not_replace_a_kill_made_during_it() {
         for stop in [Signal::StopGenerating, Signal::Stop] {
@@ -766,6 +767,44 @@ mod tests {
             stop.send(controller.as_ref());
 
             assert!(controller.is_killed(), "{stop:?} replaced the kill");
+        }
+    }
+
+    /// A child linked while a signal is telling the children, then checked as
+    /// Migration does (`link_child`, then the parent's state), is not missed:
+    /// it is either told, or it reads the parent's new state.
+    #[test]
+    fn a_child_linked_during_a_signal_is_not_missed() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        for signal in [Signal::StopGenerating, Signal::Stop, Signal::Kill] {
+            let controller = Arc::new(Controller::default());
+            let (entered, on_enter) = mpsc::channel();
+            let (release, on_release) = mpsc::channel::<()>();
+            controller.link_child(OnSignal::new(move || {
+                entered.send(()).unwrap();
+                on_release.recv_timeout(Duration::from_secs(5)).unwrap();
+            }));
+
+            let sender = controller.clone();
+            let signaller = std::thread::spawn(move || signal.send(sender.as_ref()));
+            on_enter.recv_timeout(Duration::from_secs(5)).unwrap();
+
+            let late = Arc::new(Controller::default());
+            controller.link_child(late.clone());
+            let seen = match signal {
+                Signal::Kill => controller.is_killed(),
+                _ => controller.is_stopped(),
+            };
+            release.send(()).unwrap();
+            signaller.join().unwrap();
+
+            let told = match signal {
+                Signal::Kill => late.is_killed(),
+                _ => late.is_stopped(),
+            };
+            assert!(seen || told, "a child linked during {signal:?} missed it");
         }
     }
 }
