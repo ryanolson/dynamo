@@ -114,40 +114,129 @@ tool-call metadata recording across increasing numbers of calls.
 cargo bench --bench request_trace_finish_metadata -p dynamo-llm --features request-trace-bench
 ```
 
-## callgrind.sh
+## callgrind.sh and hotpath.sh
 
-Counts instructions per request through the frontend pipelines (A, B, C, embeddings) with
-callgrind. It runs the
-`tests/allocations.rs` binary, which builds those pipelines with a test engine at the end, and
-reports `(Ir(2N) - Ir(N)) / N`. Needs `valgrind` and `jq`.
+`hotpath.sh` prints the hot-path table: allocations and instructions per request, for each
+pipeline (A, B, C, embeddings, and the worker's `Ingress`) in both forms. The dynamo form is the
+default path (`DYN_LOCAL_PIPELINE` unset); the gdl form is `DYN_LOCAL_PIPELINE=gdl`. The engine
+rows are the test engines alone, so a pipeline's own cost is its row minus its engine's row.
+Needs `valgrind` and `jq`.
+
+```bash
+lib/llm/benches/hotpath.sh > table.txt              # the table
+lib/llm/benches/hotpath.sh --base table.txt         # the table, and each row's change
+```
+
+Per request, `allocs` and `instr` are at 1 item, and `allocs/item` and `instr/item` are the
+cost of each item after the first: `(count at 16 items - count at 1 item) / 15`. For the
+embeddings rows, an item is an input.
+
+With `--base`, the script marks a row `RISE` when the default path got worse and `WORSE` when a
+gdl row did, and exits 1 if it marked any row. A row gets worse when its allocations rise at
+all, or when its instructions rise by more than the tolerance (see below).
+
+`callgrind.sh` measures single rows, one run each, and prints raw counts:
 
 ```bash
 lib/llm/benches/callgrind.sh            # every row at 1 and 16 items
 lib/llm/benches/callgrind.sh b 1 b 16   # selected rows
 ```
 
-The same binary checks allocations per request: `cargo test -p dynamo-llm --test allocations`.
+### How it counts
 
-The script fails, naming the row and the valgrind log, when valgrind exits non-zero or its log
-says the program died by a signal. A run that dies still writes an instruction total, so the
-script checks the run before it reads the total. `callgrind-test.sh` tests this with stand-ins
-for `cargo` and `valgrind`, so it needs neither a build nor valgrind:
+The pipeline rows run the `tests/allocations.rs` binary; the `ingress` row runs
+`lib/runtime/tests/ingress_allocations.rs`. Each builds its path with a test engine at the end
+and runs warm-up requests, then N measured requests (`CALLGRIND_REQUESTS`, default 200). The
+binary asks callgrind for a dump before and after the measured requests. The script reads the
+second dump, the window, and divides its instructions by N. Setup and teardown are not in it.
+Allocations are the binary's own count, from the same run.
+
+The window leaves out work whose cost changed from run to run but is not the code under test:
+
+- **The system allocator.** Glibc malloc's cost follows its heap state, which follows how the
+  threads interleave. The allocations column counts its calls instead.
+- **The runtime thread while it is parked.** How often it parks and wakes depends on when the
+  other threads run. The harness's wait at the end of each window is left out too.
+- **The stand-in frontend's thread** in the `ingress` row.
+
+The window also reads no clock and sets no timer. Callgrind's `--toggle-collect=<function>` and
+its zero request are not used: on this code the first gave counts that changed by 10x between
+runs, and the second left about 4 million instructions in a window that did not grow with N.
+
+The same binaries check allocations without valgrind:
+`cargo test -p dynamo-llm --test allocations` and
+`cargo test -p dynamo-runtime --test ingress_allocations`.
+
+### Spread and tolerance
+
+Allocations do not vary: every run gives the same count. Instructions vary a little, and only
+upwards: a thread that spins or parks once more adds instructions. Two builds of unchanged
+request-path code (one with an extra log line in setup code, built from another path) give the
+same lowest count within 0.25% for every row.
+
+Instructions per request over 5 runs of one build, N = 200, on a 20-core aarch64 host with
+other valgrind runs beside it: highest minus lowest, the larger of two builds.
+
+| Rows | 1 item | 16 items |
+|---|---:|---:|
+| `c`, `c-gdl` | 49 (0.07%) | 43 (0.04%) |
+| `a`, `a-gdl`, `b`, `b-gdl` | 496 (0.27%) | 3,438 (0.59%) |
+| `engine`, `embed-engine` | 77 | 120 |
+| `ingress` | 283 (0.58%) | 243 (0.27%) |
+| `embed` | 549 (0.56%) | 5,900 (0.48%) |
+| `embeddings-gdl` | 1,282 (1.19%) | 22,408 (1.81%) |
+
+The embeddings rows vary most: their batch encode runs on rayon, whose idle threads spin a
+varying number of times.
+
+So `hotpath.sh` counts an instruction rise only above the row's tolerance, the larger of a
+share of the base and a floor:
+
+| Rows | Per request | Per item |
+|---|---|---|
+| all but embeddings | 1%, at least 300 | 2%, at least 50 |
+| `embed`, `embeddings-gdl` | 3%, at least 300 | 6%, at least 50 |
+
+`HOTPATH_FLOOR` and `HOTPATH_ITEM_FLOOR` set the floors. For a merge gate, run with
+`HOTPATH_RUNS=3`: the script keeps each row's lowest count. A rise smaller than the tolerance
+is shown but not marked.
+
+### Running it on the bench host
+
+Build with the `profiling` profile (the default; release with symbols). Debug counts mean
+little.
+
+Under valgrind, the gdl rows die with SIGSEGV unless built with `--cfg rustix_use_libc`: gdl's
+`Cx` reads the clock through rustix's vDSO path (`rustix::backend::param::auxv::check_elf_base`),
+and valgrind does not map the vDSO. `RUSTFLAGS` replaces the flags in `.cargo/config.toml`,
+including `--cfg tokio_unstable`, so copy your target's list from that file and add the cfg.
+Changing `RUSTFLAGS` rebuilds every dependency, so give the valgrind build its own
+`CARGO_TARGET_DIR`, and one per checkout: cargo can take a binary built from another checkout
+in the same target directory as up to date, and the table then measures that checkout's code.
+
+On x86_64:
+
+```bash
+RUSTFLAGS="-C target-cpu=x86-64-v3 -C force-frame-pointers=yes --cfg tokio_unstable --cfg rustix_use_libc" \
+  CARGO_TARGET_DIR=$PWD/target/valgrind HOTPATH_RUNS=3 lib/llm/benches/hotpath.sh > table.txt
+```
+
+On aarch64 (valgrind 3.28 or newer; 3.25 cannot decode `neoverse-n1` code):
+
+```bash
+RUSTFLAGS="-C target-cpu=neoverse-n1 -C force-frame-pointers=yes --cfg tokio_unstable --cfg rustix_use_libc" \
+  CARGO_TARGET_DIR=$PWD/target/valgrind HOTPATH_RUNS=3 lib/llm/benches/hotpath.sh > table.txt
+```
+
+The first build takes about 30 minutes. The rows run in parallel, `CALLGRIND_JOBS` at a time
+(default: the number of CPUs); each takes 2 to 6 minutes under valgrind.
+
+The scripts fail, naming the row and the valgrind log, when valgrind exits non-zero, its log
+says the program died by a signal, or the run has no window dump (for example, when the client
+requests did nothing). A run that dies still writes counts, and a run with no window writes the
+count of the whole run, so a number from either would be wrong. `callgrind-test.sh` tests both
+scripts with stand-ins for `cargo` and `valgrind`, so it needs neither a build nor valgrind:
 
 ```bash
 lib/llm/benches/callgrind-test.sh
 ```
-
-Under valgrind, the gdl rows (`a-gdl`, `b-gdl`, `c-gdl`, `embeddings-gdl`) die with SIGSEGV:
-gdl's `Cx` reads the clock through rustix's vDSO path (`rustix::backend::param::auxv::check_elf_base`),
-and valgrind does not map the vDSO. Building with `--cfg rustix_use_libc` fixes it (measured on
-aarch64). `RUSTFLAGS` replaces the flags in
-`.cargo/config.toml`, including `--cfg tokio_unstable`, so copy your target's list from that
-file and add the cfg. On x86_64:
-
-```bash
-RUSTFLAGS="-C target-cpu=x86-64-v3 -C force-frame-pointers=yes --cfg tokio_unstable --cfg rustix_use_libc" \
-  CARGO_TARGET_DIR=$PWD/target/valgrind lib/llm/benches/callgrind.sh
-```
-
-Changing `RUSTFLAGS` rebuilds every dependency, so give the valgrind build its own
-`CARGO_TARGET_DIR`.
