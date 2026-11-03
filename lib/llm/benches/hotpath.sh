@@ -256,7 +256,9 @@ awk -v table_rows="$table_rows" -v base_prov="# base format=$base_format arch=$b
     -v floor="${HOTPATH_FLOOR:-300}" -v item_floor="${HOTPATH_ITEM_FLOOR:-50}" '
 # 100 times the tolerance of a base count b, so the comparison stays in whole numbers.
 function tolerance100(b, pct, least) { t = b * pct; return t > least * 100 ? t : least * 100 }
-function change(now, was) { d = now - was; return (d > 0 ? "+" : "") d }
+# `diff` is a parameter so that it stays local: awk makes every other name global, and a global
+# here would overwrite the per-item delta `d` of the row being printed.
+function change(now, was,    diff) { diff = now - was; return (diff > 0 ? "+" : "") diff }
 BEGIN {
     n = split(table_rows, lines, "\n")
     for (i = 1; i <= n; i++) {

@@ -6146,6 +6146,7 @@ impl OpenAIPreprocessor {
         )
     }
 
+    // hot path: per-item-response
     #[allow(clippy::too_many_arguments)]
     fn transform_postprocessor_stream_with_image_tokens<S, Resp>(
         stream: S,

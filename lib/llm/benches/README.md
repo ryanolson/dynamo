@@ -116,11 +116,14 @@ cargo bench --bench request_trace_finish_metadata -p dynamo-llm --features reque
 
 ## callgrind.sh and hotpath.sh
 
+The paths these scripts guard, and the profiles that found them, are in
+[hot-paths.md](hot-paths.md).
+
 `hotpath.sh` prints the hot-path table: allocations, instructions and `memcpy` calls per
-request, for each pipeline (A, B, C, embeddings, and the worker's `Ingress`) in both forms. The dynamo form is the
-default path (`DYN_LOCAL_PIPELINE` unset); the gdl form is `DYN_LOCAL_PIPELINE=gdl`. The engine
-rows are the test engines alone, so a pipeline's own cost is its row minus its engine's row.
-Needs `valgrind` and `jq`.
+request, for each pipeline (A, B, C, embeddings, and the worker's `Ingress`) in both forms. The
+dynamo form is the default path (`DYN_LOCAL_PIPELINE` unset); the gdl form is
+`DYN_LOCAL_PIPELINE=gdl`. The engine rows are the test engines alone, so a pipeline's own cost
+is its row minus its engine's row. Needs `valgrind` and `jq`.
 
 ```bash
 lib/llm/benches/hotpath.sh > table.txt              # the table
