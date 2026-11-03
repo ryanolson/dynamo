@@ -126,8 +126,9 @@ where
 
     fn engine(&self) -> Arc<dyn AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, Error>> {
         // Each call derives a fresh root `Cx`: the request's `cx` is cancelled once its
-        // response ends.
-        Arc::new(PipelineEngine::new(self.next.clone()))
+        // response ends. The stages below are Dynamo's, so a kill reaches them through the
+        // request's context, not a cancel that would drop a call one is still finishing.
+        Arc::new(PipelineEngine::for_dynamo_stages(self.next.clone()))
     }
 
     type Response<U: Data> = gdl::Items<Annotated<U>>;

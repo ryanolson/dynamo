@@ -98,14 +98,15 @@ fn native<O, Req, H>(op: Arc<O>, next: H) -> Hop<(), OperatorStage<GdlOperator<O
     )
 }
 
-/// A gdl pipeline as the Dynamo engine HTTP calls.
+/// A gdl pipeline as the Dynamo engine HTTP calls, rooted as the frontend roots one whose
+/// stages include Dynamo operators and engines.
 fn pipeline<N, Req, T>(next: N) -> Engine<Req, T>
 where
     N: gdl::Next<SingleIn<Req>, Annotated<T>>,
     Req: Data,
     T: Data,
 {
-    Arc::new(PipelineEngine::<_, Req, T>::new(Source::new(next)))
+    Arc::new(PipelineEngine::<_, Req, T>::for_dynamo_stages(Source::new(next)))
 }
 
 /// What one call of [`Script`] saw.
@@ -755,7 +756,6 @@ impl
 /// Backend is in its handoff: the operator must still see the kill through its context and
 /// clean up. Its eager future must not be dropped by a gdl cancel first.
 #[tokio::test]
-#[ignore = "kill during a handoff below native stages: PipelineEngine maps the kill to a gdl cancel, and the hop drops the operator's future before its cleanup runs; fixed by the stop-only Cx for compositions of Dynamo operators"]
 async fn a_kill_during_a_handoff_below_the_native_stages_lets_it_clean_up() {
     let fixture = Fixture::load();
     for (way, at) in [("dynamo", 0), ("gdl", 1)] {
