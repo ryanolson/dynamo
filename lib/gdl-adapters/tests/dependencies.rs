@@ -8,6 +8,7 @@
 //! incompatible crates. So this crate may depend on the `gdl` crate, which
 //! links no velo, and nothing else from gdl that brings velo.
 
+use std::path::Path;
 use std::process::Command;
 
 /// Packages this crate must never build, by name, from any source.
@@ -29,19 +30,18 @@ fn forbidden(line: &str) -> bool {
     is_velo && fields.any(|field| field.contains("://"))
 }
 
-/// Normal and build edges, on every target and with every feature: a
-/// generator enters through `[build-dependencies]`, and a transport may sit
-/// behind a `cfg` or an optional dependency. Not `--offline`: a cache filled
-/// by a host build lacks the packages only other targets use, and cargo tree
-/// must fetch them.
-#[test]
-fn links_no_git_velo_and_no_gdl_runtime() {
+/// The packages `package` builds, one per line, over normal and build edges,
+/// on every target and with every feature: a generator enters through
+/// `[build-dependencies]`, and a transport may sit behind a `cfg` or an
+/// optional dependency. Not `--offline`: a cache filled by a host build lacks
+/// the packages only other targets use, and cargo tree must fetch them.
+fn tree(package: &str, dir: &Path) -> String {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let output = Command::new(cargo)
         .args([
             "tree",
             "--package",
-            "dynamo-gdl-adapters",
+            package,
             "--edges",
             "no-dev",
             "--target",
@@ -51,7 +51,7 @@ fn links_no_git_velo_and_no_gdl_runtime() {
             "none",
             "--locked",
         ])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .current_dir(dir)
         .output()
         .expect("run cargo tree");
     assert!(
@@ -59,7 +59,12 @@ fn links_no_git_velo_and_no_gdl_runtime() {
         "cargo tree failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let tree = String::from_utf8(output.stdout).expect("utf-8");
+    String::from_utf8(output.stdout).expect("utf-8")
+}
+
+#[test]
+fn links_no_git_velo_and_no_gdl_runtime() {
+    let tree = tree("dynamo-gdl-adapters", Path::new(env!("CARGO_MANIFEST_DIR")));
     // An empty or truncated tree would pass the check below.
     assert!(
         tree.lines().any(|line| line.starts_with("gdl v")),
@@ -67,6 +72,18 @@ fn links_no_git_velo_and_no_gdl_runtime() {
     );
     let found: Vec<&str> = tree.lines().filter(|line| forbidden(line)).collect();
     assert!(found.is_empty(), "dynamo-gdl-adapters links {found:?}");
+}
+
+/// The fixture reaches a package named `gdl-runtime` only through an optional
+/// dependency that no default feature enables.
+#[test]
+fn tree_sees_optional_dependencies() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/optional-runtime");
+    let tree = tree("optional-runtime", &dir);
+    assert!(
+        tree.lines().any(forbidden),
+        "the optional gdl-runtime is not in the tree:\n{tree}"
+    );
 }
 
 #[test]

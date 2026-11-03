@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# A crate that reaches a forbidden package only through an optional
+# dependency, so the guard's cargo tree must look at every feature.
+# Its own workspace, so it builds apart from Dynamo's.
+[workspace]
+
+[package]
+name = "optional-runtime"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+gdl-runtime = { path = "runtime", optional = true }
