@@ -42,8 +42,11 @@ impl StdError for Entered {
     }
 }
 
-/// A Dynamo error entering gdl.
-pub(crate) fn enter(error: anyhow::Error) -> gdl::Error {
+/// A Dynamo error entering gdl: a [`gdl::Error`] whose source owns `error`.
+/// It leaves gdl, through [`PipelineEngine`](crate::PipelineEngine), as
+/// `error` itself, so Migration's walk of the chain and the HTTP handler's
+/// downcast still find what they look for.
+pub fn enter(error: anyhow::Error) -> gdl::Error {
     gdl::Error::node(error.to_string()).with_source(Entered(Arc::new(error)))
 }
 

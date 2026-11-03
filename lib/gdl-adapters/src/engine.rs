@@ -60,11 +60,7 @@ where
         let root = cx.clone();
         match self.next.generate(cx, request).await {
             Ok(items) => Ok(ResponseStream::new(
-                Box::pin(Exit {
-                    items: Some(items),
-                    root,
-                    context: Arc::clone(&context),
-                }),
+                Box::pin(AnnotatedItems::new(items, root, Arc::clone(&context))),
                 context,
             )),
             Err(error) => Err(exit(error)),
@@ -72,16 +68,52 @@ where
     }
 }
 
-/// gdl items leaving as Dynamo items.
-struct Exit<T> {
+/// gdl items read as a Dynamo stream of `Annotated<T>`, by the rule
+/// [`PipelineEngine`] gives: a gdl `Err` item ends the stream, as a last error
+/// item, or with no item when it is a cancel of a request that was killed.
+///
+/// A native gdl operator over Dynamo items reads its downstream through it,
+/// so it sees what a Dynamo operator sees from the same stages.
+pub struct AnnotatedItems<T> {
     items: Option<Items<Annotated<T>>>,
-    /// The `Cx` derived from `context`. Only a kill of `context` cancels it,
-    /// and both stay so after a later stop.
     root: gdl::Cx,
     context: Arc<dyn AsyncEngineContext>,
 }
 
-impl<T: Data> Stream for Exit<T> {
+impl<T> AnnotatedItems<T> {
+    /// Read `items`. `root` is the `Cx` the request was sent with and
+    /// `context` its Dynamo context: a cancel of either one is a kill.
+    pub fn new(
+        items: Items<Annotated<T>>,
+        root: gdl::Cx,
+        context: Arc<dyn AsyncEngineContext>,
+    ) -> Self {
+        Self {
+            items: Some(items),
+            root,
+            context,
+        }
+    }
+}
+
+impl<T> std::fmt::Debug for AnnotatedItems<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnnotatedItems")
+            .field("ended", &self.items.is_none())
+            .field("root", &self.root)
+            .field("context", &self.context.id())
+            .finish()
+    }
+}
+
+/// The request's Dynamo context, as a Dynamo response stream gives it.
+impl<T: Data> AsyncEngineContextProvider for AnnotatedItems<T> {
+    fn context(&self) -> Arc<dyn AsyncEngineContext> {
+        Arc::clone(&self.context)
+    }
+}
+
+impl<T: Data> Stream for AnnotatedItems<T> {
     type Item = Annotated<T>;
 
     fn poll_next(mut self: Pin<&mut Self>, task: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {

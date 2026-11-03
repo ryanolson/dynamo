@@ -10,6 +10,10 @@
 //! - [`EngineSink`]: a Dynamo engine as a gdl `Sink`.
 //! - [`PipelineEngine`]: a gdl `Next` as a Dynamo `AsyncEngine`.
 //! - [`DynOperatorStage`]: a Dynamo `Operator` as the inner end of a gdl `Hop`.
+//! - [`AnnotatedItems`] and [`enter`]: what a native gdl operator over Dynamo
+//!   items uses to read its downstream and to raise an eager error, so it
+//!   behaves at its edges as the adapters do. `dynamo_llm::operator` builds
+//!   Backend and the preprocessor this way.
 //! - [`metrics`]: a gdl node's metrics on a Dynamo endpoint.
 //! - [`config`]: how a gdl node in Dynamo gets its configuration.
 //!
@@ -42,6 +46,7 @@ mod sink;
 mod stage;
 
 pub use bridge::{CxBridge, REQUEST_ID};
-pub use engine::PipelineEngine;
+pub use engine::{AnnotatedItems, PipelineEngine};
+pub use error::enter;
 pub use sink::EngineSink;
 pub use stage::DynOperatorStage;
