@@ -65,8 +65,9 @@ pub struct PreprocessedRouting {
     local_pipeline: LocalPipeline,
 }
 
-/// How [`PreprocessedRouting::build_pipeline`] composes its stages. The stages and
-/// what they do are the same either way.
+/// How [`PreprocessedRouting::build_pipeline`] and
+/// [`PreprocessedRouting::build_preprocessed_pipeline`] compose their stages. The stages
+/// and what they do are the same either way.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LocalPipeline {
     /// Dynamo's `link` chain.
@@ -523,13 +524,15 @@ impl PreprocessedRouting {
         }
     }
 
-    /// Compose [`build_pipeline`](Self::build_pipeline) on `local_pipeline`.
+    /// Compose [`build_pipeline`](Self::build_pipeline) and
+    /// [`build_preprocessed_pipeline`](Self::build_preprocessed_pipeline) on `local_pipeline`.
     pub fn with_local_pipeline(mut self, local_pipeline: LocalPipeline) -> Self {
         self.local_pipeline = local_pipeline;
         self
     }
 
-    /// The local pipeline [`build_pipeline`](Self::build_pipeline) composes on.
+    /// The local pipeline [`build_pipeline`](Self::build_pipeline) and
+    /// [`build_preprocessed_pipeline`](Self::build_preprocessed_pipeline) compose on.
     pub fn local_pipeline(&self) -> LocalPipeline {
         self.local_pipeline
     }
@@ -608,22 +611,13 @@ impl PreprocessedRouting {
                 Pin<Box<dyn AsyncEngineStream<Annotated<BackendOutput>>>>,
             >,
     {
-        use gdl::{Hop, SinkStage};
+        use gdl::Hop;
         type Pre = PreprocessedRequest;
         type Out = LLMEngineOutput;
 
-        let routing = SinkStage::new(Arc::new(EngineSink::new(self.backend_engine.clone())));
-        let prefill = DynOperatorStage::<_, Pre, Out, Pre, Out>::new(
-            self.prefill_router.clone(),
-            Hop::new((), routing, ()),
-        );
-        let encoder = DynOperatorStage::<_, Pre, Out, Pre, Out>::new(
-            self.encoder_router.clone(),
-            Hop::new((), prefill, ()),
-        );
         let token_backend = DynOperatorStage::<_, Pre, BackendOutput, Pre, Out>::new(
             token_backend,
-            Hop::new((), encoder, ()),
+            Hop::new((), self.gdl_routers(), ()),
         );
         let migration = DynOperatorStage::<_, Pre, BackendOutput, Pre, BackendOutput>::new(
             migration,
@@ -638,8 +632,32 @@ impl PreprocessedRouting {
         )))
     }
 
+    /// The encoder router, the prefill router and the backend engine as gdl stages: the tail
+    /// that [`compose_gdl_pipeline`](Self::compose_gdl_pipeline) and
+    /// [`compose_gdl_preprocessed_pipeline`](Self::compose_gdl_preprocessed_pipeline) share.
+    fn gdl_routers(
+        &self,
+    ) -> DynOperatorStage<
+        EncoderRouter,
+        PreprocessedRequest,
+        LLMEngineOutput,
+        PreprocessedRequest,
+        LLMEngineOutput,
+    > {
+        use gdl::{Hop, SinkStage};
+        type Pre = PreprocessedRequest;
+        type Out = LLMEngineOutput;
+
+        let routing = SinkStage::new(Arc::new(EngineSink::new(self.backend_engine.clone())));
+        let prefill = DynOperatorStage::<_, Pre, Out, Pre, Out>::new(
+            self.prefill_router.clone(),
+            Hop::new((), routing, ()),
+        );
+        DynOperatorStage::new(self.encoder_router.clone(), Hop::new((), prefill, ()))
+    }
+
     /// Bring your own pre/post processor. Used when frontend has `--dyn-chat-processor
-    /// vllm|sglang`.
+    /// vllm|sglang`, and by the Generate engine.
     pub fn build_preprocessed_pipeline(
         &self,
         card: &ModelDeploymentCard,
@@ -649,12 +667,16 @@ impl PreprocessedRouting {
     ) -> anyhow::Result<
         ServiceEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>>,
     > {
+        let migration = Migration::from_mdc(card, migration_limit, migration_max_seq_len, metrics);
+        if self.local_pipeline == LocalPipeline::Gdl {
+            return Ok(self.compose_gdl_preprocessed_pipeline(migration));
+        }
+
         let frontend = SegmentSource::<
             SingleIn<PreprocessedRequest>,
             ManyOut<Annotated<LLMEngineOutput>>,
         >::new();
-        let migration = Migration::from_mdc(card, migration_limit, migration_max_seq_len, metrics)
-            .into_operator_for::<LLMEngineOutput>();
+        let migration = migration.into_operator_for::<LLMEngineOutput>();
         let prefill_op = self.prefill_router.into_operator();
         let encoder_op = self.encoder_router.into_operator();
         let backend = ServiceBackend::from_engine(self.backend_engine.clone());
@@ -670,6 +692,26 @@ impl PreprocessedRouting {
             .link_terminal(frontend)?;
 
         Ok(engine)
+    }
+
+    /// [`build_preprocessed_pipeline`](Self::build_preprocessed_pipeline)'s chain as a gdl
+    /// local pipeline, built as [`compose_gdl_pipeline`](Self::compose_gdl_pipeline) builds
+    /// its own.
+    fn compose_gdl_preprocessed_pipeline(
+        &self,
+        migration: Arc<Migration>,
+    ) -> ServiceEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>> {
+        use gdl::Hop;
+        type Pre = PreprocessedRequest;
+        type Out = LLMEngineOutput;
+
+        let migration = DynOperatorStage::<_, Pre, Out, Pre, Out>::new(
+            migration,
+            Hop::new((), self.gdl_routers(), ()),
+        );
+        Arc::new(PipelineEngine::<_, Pre, Out>::new(gdl::Source::new(
+            Hop::new((), migration, ()),
+        )))
     }
 }
 

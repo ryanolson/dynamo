@@ -14,6 +14,7 @@
 //! | `b` | `PreprocessedRouting::build_pipeline`: preprocessor, migration, backend, encoder router, prefill router | test LLM engine, in place of `RoutingHost` |
 //! | `b-gdl` | `b` composed as a gdl local pipeline (`LocalPipeline::Gdl`, what `DYN_LOCAL_PIPELINE=gdl` selects) | test LLM engine, in place of `RoutingHost` |
 //! | `c` | `PreprocessedRouting::build_preprocessed_pipeline`: migration, encoder router, prefill router | test LLM engine, in place of `RoutingHost` |
+//! | `c-gdl` | `c` composed as a gdl local pipeline | test LLM engine, in place of `RoutingHost` |
 //! | `embed-engine` | the test embeddings engine, called directly | itself |
 //! | `embed` | `build_embeddings_pipeline`: preprocessor, backend | test embeddings engine, in place of `PushRouter` |
 //!
@@ -51,6 +52,7 @@
 //! | `b` | 402 | 227,025 | 915 | 248,513 |
 //! | `b-gdl` | 455 | 223,943 | 968 | 245,431 |
 //! | `c` | 71 | 144,683 | 86 | 144,743 |
+//! | `c-gdl` | 106 | 142,495 | 121 | 142,555 |
 //! | `embed-engine` | 8 | 6,548 | 23 | 88,868 |
 //! | `embed` | 199 | 44,406 | 2,283 | 529,854 |
 //!
@@ -58,6 +60,12 @@
 //! the adapters' cost in `lib/gdl-adapters/tests/allocations.rs`: 23 allocations per adapted
 //! operator against 14 for a `link` stage, 5 operators, and 8 more at the boundary
 //! (`PipelineEngine` above, `EngineSink` below): 5 × 9 + 8 = 53. Native gdl operators remove it.
+//!
+//! `c-gdl` costs 35 allocations more than `c` at both item counts: 3 adapted operators × 9 + 8
+//! at the boundary, as for `b-gdl`. It asks for 2,188 fewer bytes. By size, the `link` chain's
+//! 16 boxed futures of 2.2 to 4.4 KB (54,936 bytes) give way to one boxed future of about
+//! 11.7 KB per `PipelineEngine`, one at the boundary and one below each operator (46,800 bytes);
+//! the 35 extra allocations are small and add 5,948 bytes.
 //!
 //! Most of `c`'s bytes are two boxed futures of 59,592 bytes each, allocated by the edge that
 //! carries the request from Migration (`RetryManager::new_stream`) to the next stage.
@@ -115,6 +123,8 @@ const BASELINE: &[Row] = &[
     row("b-gdl", 16, 968, 245431),
     row("c", 1, 71, 144683),
     row("c", 16, 86, 144743),
+    row("c-gdl", 1, 106, 142495),
+    row("c-gdl", 16, 121, 142555),
     row("embed-engine", 1, 8, 6548),
     row("embed-engine", 16, 23, 88868),
     row("embed", 1, 199, 44406),
@@ -578,12 +588,19 @@ async fn measure_b(
     .await
 }
 
-async fn measure_c(fixture: &Fixture, items: usize, requests: usize) -> Measured {
+async fn measure_c(
+    fixture: &Fixture,
+    name: &'static str,
+    local_pipeline: LocalPipeline,
+    items: usize,
+    requests: usize,
+) -> Measured {
     let pipeline = fixture
         .routing(items)
+        .with_local_pipeline(local_pipeline)
         .build_preprocessed_pipeline(&fixture.card, 0, None, Arc::new(Metrics::new()))
         .expect("pipeline c");
-    measure("c", items, requests, || {
+    measure(name, items, requests, || {
         let pipeline = pipeline.clone();
         let request = preprocessed_request(fixture);
         async move { drain(pipeline.generate(Context::new(request)).await.unwrap()).await }
@@ -639,7 +656,8 @@ async fn measure_row(fixture: &Fixture, name: &str, items: usize, requests: usiz
         "a" => measure_a(fixture, items, requests).await,
         "b" => measure_b(fixture, "b", LocalPipeline::Dynamo, items, requests).await,
         "b-gdl" => measure_b(fixture, "b-gdl", LocalPipeline::Gdl, items, requests).await,
-        "c" => measure_c(fixture, items, requests).await,
+        "c" => measure_c(fixture, "c", LocalPipeline::Dynamo, items, requests).await,
+        "c-gdl" => measure_c(fixture, "c-gdl", LocalPipeline::Gdl, items, requests).await,
         "embed-engine" => measure_embed_engine(fixture, items, requests).await,
         "embed" => measure_embed(fixture, items, requests).await,
         other => panic!("unknown row {other}"),
@@ -732,6 +750,8 @@ const ROWS: &[(&str, usize)] = &[
     ("b-gdl", 16),
     ("c", 1),
     ("c", 16),
+    ("c-gdl", 1),
+    ("c-gdl", 16),
     ("embed-engine", 1),
     ("embed-engine", 16),
     ("embed", 1),

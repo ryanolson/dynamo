@@ -616,3 +616,128 @@ async fn a_kill_during_dispatch_ends_pipeline_b_on_both_local_pipelines() {
     }
     assert_eq!(outcomes, ["ok, 0 items", "error Cancelled"]);
 }
+
+/// What a kill while the terminal is still dispatching does to `pipeline`'s call. Dynamo's
+/// `link` chain lets the operators see the kill and end with their own outcome; with gdl, the
+/// kill cancels the hop and fails the call as `Cancelled`. So the outcome also shows which
+/// composition a builder chose.
+async fn kill_during_dispatch<Req: Data, T: Data>(
+    pipeline: Arc<dyn AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, Error>>,
+    request: SingleIn<Req>,
+) -> String {
+    let context = request.context();
+    let call = tokio::spawn(async move { pipeline.generate(request).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    context.kill();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), call)
+        .await
+        .expect("the call ends after the kill")
+        .unwrap();
+    match outcome {
+        Ok(stream) => format!("ok, {} items", stream.collect::<Vec<_>>().await.len()),
+        Err(error) => match error.downcast_ref::<DynamoError>() {
+            Some(error) => format!("error {:?}", error.class()),
+            None => format!("error {error:#}"),
+        },
+    }
+}
+
+/// The routed pipeline for callers that bring their own pre- and post-processing (the Generate
+/// engine and the Python `chat_engine_factory`), over `engine`, on the given local pipeline.
+fn pipeline_c(local_pipeline: LocalPipeline, engine: Engine, migration_limit: u32) -> Engine {
+    let card = ModelDeploymentCard::load_from_disk(SAMPLE_MODEL, None).unwrap();
+    PreprocessedRouting::new(
+        engine,
+        PrefillRouter::disabled(Arc::new(ModelManager::new()), RouterMode::KV, None),
+        EncoderRouter::disabled(),
+    )
+    .with_local_pipeline(local_pipeline)
+    .build_preprocessed_pipeline(&card, migration_limit, None, Arc::new(Metrics::new()))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn pipeline_c_streams_the_same_tokens_on_both_local_pipelines() {
+    let mut runs = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        let engine = Flaky::new(0, false);
+        let items: Vec<_> = pipeline_c(local_pipeline, engine.clone(), 0)
+            .generate(request())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(
+            items.iter().all(|item| !item.is_error()),
+            "{local_pipeline:?}: {items:?}"
+        );
+        runs.push((tokens(&items), calls(&engine)));
+    }
+    assert_eq!(runs[0], runs[1]);
+    assert_eq!(runs[1].0, [vec![10], vec![11]]);
+    assert_eq!(
+        runs[1].1,
+        [("req-1".to_string(), Some("session-123".to_string()))]
+    );
+}
+
+/// The terminal's eager error crosses the prefill and encoder routers, two adapter round
+/// trips, before Migration sees it.
+#[tokio::test]
+async fn pipeline_c_retries_an_eager_worker_unavailable_from_its_terminal() {
+    let mut runs = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        let engine = Flaky::new(1, false);
+        let items: Vec<_> = pipeline_c(local_pipeline, engine.clone(), 3)
+            .generate(request())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(
+            items.iter().all(|item| !item.is_error()),
+            "{local_pipeline:?}: {items:?}"
+        );
+        let calls = calls(&engine);
+        assert_eq!(calls.len(), 2, "{local_pipeline:?}: retried once");
+        runs.push((tokens(&items), calls));
+    }
+    assert_eq!(runs[0], runs[1]);
+}
+
+/// A stop and a kill of the caller's context reach the terminal engine's context through the
+/// three adapted stages.
+#[tokio::test]
+async fn a_stop_and_a_kill_reach_the_terminal_through_pipeline_c_on_gdl() {
+    let engine = Flaky::new(0, true);
+    let pipeline = pipeline_c(LocalPipeline::Gdl, engine.clone(), 0);
+    let request = request();
+    let context = request.context();
+    let mut stream = pipeline.generate(request).await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("the first item arrives")
+        .unwrap();
+    assert_eq!(tokens(&[first]), [vec![10]]);
+
+    let terminal = engine.calls.lock().unwrap()[0].context.clone();
+    context.stop_generating();
+    assert!(terminal.is_stopped());
+    assert!(!terminal.is_killed());
+    context.kill();
+    assert!(terminal.is_killed());
+    let rest: Vec<_> = tokio::time::timeout(Duration::from_secs(5), stream.collect())
+        .await
+        .expect("the stream ends after the kill");
+    assert!(rest.iter().all(|item| !item.is_error()), "{rest:?}");
+}
+
+#[tokio::test]
+async fn a_kill_during_dispatch_ends_pipeline_c_on_both_local_pipelines() {
+    let mut outcomes = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        let pipeline = pipeline_c(local_pipeline, Arc::new(Hanging), 3);
+        outcomes.push(kill_during_dispatch(pipeline, request()).await);
+    }
+    assert_eq!(outcomes, ["ok, 0 items", "error Cancelled"]);
+}
