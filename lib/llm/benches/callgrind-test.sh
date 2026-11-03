@@ -304,6 +304,17 @@ else
     echo "ok hotpath.sh base-duplicate"
 fi
 
+# A nonnumeric instruction count cannot establish the per-item tolerance.
+awk '$1 == "B" && $2 == "dynamo" { $8 = "999999junk" } { print }' "$work/base" \
+    >"$work/nonnumeric-instructions-base"
+FAKE_RISE_ROW=b FAKE_RISE_ITEMS=16 FAKE_RISE_INSTR=751 \
+    run "$here/hotpath.sh" --base "$work/nonnumeric-instructions-base"
+if [[ $status -eq 0 ]]; then
+    fail base-nonnumeric-instructions "accepted a nonnumeric instr@16 and hid an instruction rise of 751/15 above the floor of 50 per item"
+else
+    echo "ok hotpath.sh base-nonnumeric-instructions"
+fi
+
 if ((failures > 0)); then
     echo "$failures failed" >&2
     exit 1
