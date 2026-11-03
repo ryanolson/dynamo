@@ -146,6 +146,16 @@ impl OAIChatLikeRequest for SpeculativePrefillRequest {
 /// If preprocessing admission is full, the optional warmup is skipped.
 ///
 /// When the flag is not set, returns the stream unmodified with zero overhead.
+/// Whether `request` asks for a speculative next-turn prefill.
+pub(super) fn enabled(request: &NvCreateChatCompletionRequest) -> bool {
+    request
+        .nvext
+        .as_ref()
+        .and_then(|ext| ext.agent_hints.as_ref())
+        .and_then(|hints| hints.speculative_prefill)
+        .unwrap_or(false)
+}
+
 pub(super) fn maybe_wrap_stream(
     stream: Pin<Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>>,
     request: &NvCreateChatCompletionRequest,
@@ -157,14 +167,7 @@ pub(super) fn maybe_wrap_stream(
     tokenizer: &Arc<dyn Tokenizer>,
     tasks: &PrefillTasks,
 ) -> Pin<Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>> {
-    let enabled = request
-        .nvext
-        .as_ref()
-        .and_then(|ext| ext.agent_hints.as_ref())
-        .and_then(|hints| hints.speculative_prefill)
-        .unwrap_or(false);
-
-    if !enabled {
+    if !enabled(request) {
         return stream;
     }
 

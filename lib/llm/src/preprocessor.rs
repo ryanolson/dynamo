@@ -36,8 +36,8 @@ use dynamo_runtime::config::{
 use dynamo_runtime::error::{DynamoError, ErrorType, PublicDetails};
 use dynamo_runtime::telemetry::{LIFECYCLE_TRACE_CONTEXT_KEY, LifecycleStage, LifecycleTrace};
 use either::Either;
-use futures::Stream;
 use futures::stream::{self, StreamExt};
+use futures::{FutureExt, Stream};
 use std::borrow::Cow;
 use std::time::Instant;
 
@@ -68,6 +68,7 @@ use crate::local_model::runtime_config::{
 #[cfg(feature = "mm-routing")]
 use crate::model_card::ModelInfoType;
 use crate::model_card::{ModelDeploymentCard, ModelInfo, PromptFormatterArtifact};
+use crate::operator::{Downstream, DynamoDownstream, GdlDownstream, GdlOperator, native};
 #[cfg(feature = "mm-routing")]
 use crate::preprocessor::media::MediaFetcher;
 use crate::preprocessor::media::{MediaDecoder, MediaLoader, max_data_url_bytes};
@@ -81,9 +82,9 @@ use dynamo_parsers::{
     ReasoningParser, ReasoningParserType, reasoning::ParserResult,
     tool_calling::parsers::get_tool_parser_map,
 };
-use dynamo_runtime::engine::{AsyncEngine, AsyncEngineContextProvider, ResponseStream};
+use dynamo_runtime::engine::{AsyncEngine, AsyncEngineContextProvider};
 use dynamo_runtime::pipeline::{
-    AsyncEngineContext, Context as PipelineContext, Error, ManyOut, Operator, SingleIn, async_trait,
+    AsyncEngineContext, Context as PipelineContext, Error, ManyOut, Operator, SingleIn,
 };
 use dynamo_runtime::protocols::annotated::{Annotated, AnnotationsProvider};
 
@@ -8374,7 +8375,6 @@ fn preprocessing_lifecycle(context: &PipelineContext<()>) -> LifecycleTrace {
 // any prompt template that does not support this should return an error
 // oob - we should update any prompt template that does not support this to support it
 
-#[async_trait]
 impl
     Operator<
         SingleIn<NvCreateChatCompletionRequest>,
@@ -8383,13 +8383,65 @@ impl
         ManyOut<Annotated<BackendOutput>>,
     > for OpenAIPreprocessor
 {
-    async fn generate(
-        &self,
+    fn generate<'life0, 'async_trait>(
+        &'life0 self,
         request: SingleIn<NvCreateChatCompletionRequest>,
         next: Arc<
             dyn AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>,
         >,
-    ) -> Result<ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>, Error> {
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>,
+                        Error,
+                    >,
+                > + Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(self.generate_chat(request, DynamoDownstream(next)))
+    }
+}
+
+impl gdl::Operator for GdlOperator<OpenAIPreprocessor, NvCreateChatCompletionRequest> {
+    type UpReq = SingleIn<NvCreateChatCompletionRequest>;
+    type UpItem = Annotated<NvCreateChatCompletionStreamResponse>;
+    type DownReq = SingleIn<PreprocessedRequest>;
+    type DownItem = Annotated<BackendOutput>;
+
+    fn generate<N>(
+        &self,
+        cx: gdl::Cx,
+        request: SingleIn<NvCreateChatCompletionRequest>,
+        next: N,
+    ) -> impl Future<
+        Output = gdl::Result<gdl::Items<Annotated<NvCreateChatCompletionStreamResponse>>>,
+    > + Send
+    where
+        N: gdl::Next<SingleIn<PreprocessedRequest>, Annotated<BackendOutput>>,
+    {
+        self.op
+            .generate_chat(request, GdlDownstream::new(cx, next))
+            .map(native)
+    }
+}
+
+impl OpenAIPreprocessor {
+    /// Preprocess a chat request, send it on, and postprocess the response: the body of the
+    /// chat preprocessor's Dynamo and gdl operators.
+    async fn generate_chat<D>(
+        &self,
+        request: SingleIn<NvCreateChatCompletionRequest>,
+        next: D,
+    ) -> Result<D::Response<NvCreateChatCompletionStreamResponse>, Error>
+    where
+        D: Downstream<PreprocessedRequest, BackendOutput>,
+    {
         // unpack the request
         let (mut request, context) = request.into_parts();
         let lifecycle = preprocessing_lifecycle(&context);
@@ -8569,7 +8621,7 @@ impl
         drop(preprocessing);
 
         // forward the common completion request to the next operator
-        let response_stream = next.generate(common_request).await?;
+        let response_stream = next.send(common_request).await?;
         // Extract context once
         let context = response_stream.context();
 
@@ -8626,16 +8678,21 @@ impl
             Box::pin(transformed_stream)
         };
 
-        // Step 5: Speculative next-turn prefill
-        let final_stream = speculative_prefill::maybe_wrap_stream(
-            final_stream,
-            &request,
-            &request_id,
-            &next,
-            &self.formatter,
-            &self.tokenizer,
-            &self.speculative_prefill_tasks,
-        );
+        // Step 5: Speculative next-turn prefill. A native operator builds the engine for it
+        // only when the request asks for it.
+        let final_stream = if speculative_prefill::enabled(&request) {
+            speculative_prefill::maybe_wrap_stream(
+                final_stream,
+                &request,
+                &request_id,
+                &next.engine(),
+                &self.formatter,
+                &self.tokenizer,
+                &self.speculative_prefill_tasks,
+            )
+        } else {
+            final_stream
+        };
 
         let final_stream =
             crate::request_trace::wrap_chat_request_end_stream(final_stream, trace_state);
@@ -8643,12 +8700,11 @@ impl
         // prepend the annotations to the response stream
         let stream = annotations_stream.chain(final_stream);
 
-        // return the response stream - single boxing at the end
-        Ok(ResponseStream::new(Box::pin(stream), context))
+        // box the response stream once
+        Ok(D::respond(stream, context))
     }
 }
 
-#[async_trait]
 impl
     Operator<
         SingleIn<NvCreateCompletionRequest>,
@@ -8657,13 +8713,59 @@ impl
         ManyOut<Annotated<BackendOutput>>,
     > for OpenAIPreprocessor
 {
-    async fn generate(
-        &self,
+    fn generate<'life0, 'async_trait>(
+        &'life0 self,
         request: SingleIn<NvCreateCompletionRequest>,
         next: Arc<
             dyn AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>,
         >,
-    ) -> Result<ManyOut<Annotated<NvCreateCompletionResponse>>, Error> {
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<ManyOut<Annotated<NvCreateCompletionResponse>>, Error>>
+                + Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(self.generate_completion(request, DynamoDownstream(next)))
+    }
+}
+
+impl gdl::Operator for GdlOperator<OpenAIPreprocessor, NvCreateCompletionRequest> {
+    type UpReq = SingleIn<NvCreateCompletionRequest>;
+    type UpItem = Annotated<NvCreateCompletionResponse>;
+    type DownReq = SingleIn<PreprocessedRequest>;
+    type DownItem = Annotated<BackendOutput>;
+
+    fn generate<N>(
+        &self,
+        cx: gdl::Cx,
+        request: SingleIn<NvCreateCompletionRequest>,
+        next: N,
+    ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<NvCreateCompletionResponse>>>> + Send
+    where
+        N: gdl::Next<SingleIn<PreprocessedRequest>, Annotated<BackendOutput>>,
+    {
+        self.op
+            .generate_completion(request, GdlDownstream::new(cx, next))
+            .map(native)
+    }
+}
+
+impl OpenAIPreprocessor {
+    /// Preprocess a completions request, send it on, and postprocess the response: the body
+    /// of the completions preprocessor's Dynamo and gdl operators.
+    async fn generate_completion<D>(
+        &self,
+        request: SingleIn<NvCreateCompletionRequest>,
+        next: D,
+    ) -> Result<D::Response<NvCreateCompletionResponse>, Error>
+    where
+        D: Downstream<PreprocessedRequest, BackendOutput>,
+    {
         let _stage_guard = StageGuard::new(STAGE_PREPROCESS, "");
 
         // unpack the request
@@ -8777,7 +8879,7 @@ impl
         drop(_stage_guard);
 
         // forward the common completion request to the next operator
-        let response_stream = next.generate(common_request).await?;
+        let response_stream = next.send(common_request).await?;
 
         // Extract context once
         let context = response_stream.context();
@@ -8800,12 +8902,10 @@ impl
         // prepend the annotations to the response stream
         let stream = annotations_stream.chain(stream);
 
-        // return the response stream
-        Ok(ResponseStream::new(Box::pin(stream), context))
+        Ok(D::respond(stream, context))
     }
 }
 
-#[async_trait]
 impl
     Operator<
         SingleIn<NvCreateEmbeddingRequest>,
@@ -8814,8 +8914,8 @@ impl
         ManyOut<Annotated<EmbeddingsEngineOutput>>,
     > for OpenAIPreprocessor
 {
-    async fn generate(
-        &self,
+    fn generate<'life0, 'async_trait>(
+        &'life0 self,
         request: SingleIn<NvCreateEmbeddingRequest>,
         next: Arc<
             dyn AsyncEngine<
@@ -8824,7 +8924,53 @@ impl
                     Error,
                 >,
         >,
-    ) -> Result<ManyOut<Annotated<NvCreateEmbeddingResponse>>, Error> {
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<ManyOut<Annotated<NvCreateEmbeddingResponse>>, Error>>
+                + Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(self.generate_embedding(request, DynamoDownstream(next)))
+    }
+}
+
+impl gdl::Operator for GdlOperator<OpenAIPreprocessor, NvCreateEmbeddingRequest> {
+    type UpReq = SingleIn<NvCreateEmbeddingRequest>;
+    type UpItem = Annotated<NvCreateEmbeddingResponse>;
+    type DownReq = SingleIn<PreprocessedEmbeddingRequest>;
+    type DownItem = Annotated<EmbeddingsEngineOutput>;
+
+    fn generate<N>(
+        &self,
+        cx: gdl::Cx,
+        request: SingleIn<NvCreateEmbeddingRequest>,
+        next: N,
+    ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<NvCreateEmbeddingResponse>>>> + Send
+    where
+        N: gdl::Next<SingleIn<PreprocessedEmbeddingRequest>, Annotated<EmbeddingsEngineOutput>>,
+    {
+        self.op
+            .generate_embedding(request, GdlDownstream::new(cx, next))
+            .map(native)
+    }
+}
+
+impl OpenAIPreprocessor {
+    /// Preprocess an embeddings request, send it on, and postprocess the response: the body of
+    /// the embeddings preprocessor's Dynamo and gdl operators.
+    async fn generate_embedding<D>(
+        &self,
+        request: SingleIn<NvCreateEmbeddingRequest>,
+        next: D,
+    ) -> Result<D::Response<NvCreateEmbeddingResponse>, Error>
+    where
+        D: Downstream<PreprocessedEmbeddingRequest, EmbeddingsEngineOutput>,
+    {
         // Unpack request
         let (request, context) = request.into_parts();
 
@@ -8837,7 +8983,7 @@ impl
 
         // Forward to next stage
         let preprocessed_request = context.map(|_| preprocessed_request);
-        let response_stream = next.generate(preprocessed_request).await?;
+        let response_stream = next.send(preprocessed_request).await?;
 
         // Extract context once
         let context = response_stream.context();
@@ -8854,7 +9000,7 @@ impl
         );
 
         let combined_stream = annotations_stream.chain(stream);
-        Ok(ResponseStream::new(Box::pin(combined_stream), context))
+        Ok(D::respond(combined_stream, context))
     }
 }
 
@@ -8865,6 +9011,8 @@ mod token_data_tests {
     use super::*;
     use crate::common::checked_file::CheckedFile;
     use crate::model_card::{ModelDeploymentCard, ModelInfoType, TokenizerKind};
+    use dynamo_runtime::engine::ResponseStream;
+    use dynamo_runtime::pipeline::async_trait;
 
     /// `config.json` has `vocab_size` 128256; the mock tokenizer is smaller.
     const LLAMA_DIR: &str = "tests/data/sample-models/mock-llama-3.1-8b-instruct";
@@ -9496,6 +9644,7 @@ mod tests {
         ChatChoiceStream, ChatCompletionStreamResponseDelta, CreateChatCompletionStreamResponse,
         FinishReason, Role,
     };
+    use dynamo_runtime::pipeline::async_trait;
     use std::path::PathBuf;
 
     #[test]
