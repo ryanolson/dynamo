@@ -21,8 +21,8 @@
 //! inputs.
 //!
 //! The terminal stands in for everything behind it: in `b` and `c`, `RoutingHost` (worker
-//! selection, `PushRouter`, the request plane and the worker). The `engine` rows give the stand-in's
-//! own cost, so a pipeline's cost is its row minus the `engine` row.
+//! selection, `PushRouter`, the request plane and the worker). The `engine` rows give the
+//! stand-in's own cost, so a pipeline's cost is its row minus the `engine` row.
 //!
 //! Setup, chosen to match the frontend's defaults: router mode round-robin, migration limit 0,
 //! prefill and encoder routers disabled (aggregated serving), the TinyLlama sample model, a
@@ -32,14 +32,16 @@
 //!
 //! Counting: a global allocator counts calls to `alloc`, `alloc_zeroed` and `realloc`, and the
 //! bytes they ask for, on every thread while a window is open. Tokenization runs on tokio's
-//! blocking pool, so the rows count all threads. The runtime is current-thread, so the preprocessor renders the template inline
-//! where the multi-thread frontend uses `block_in_place`, and it has one blocking thread, so a
-//! window can wait for the blocking work a request leaves. No tracing subscriber is installed.
-//! `main` removes every `DYN_` variable and `TOKENIZERS_PARALLELISM`, and sets
-//! `RAYON_NUM_THREADS=4`, so neither the shell nor the host's core count changes the counts.
+//! blocking pool, so the rows count all threads. The runtime is current-thread, so the
+//! preprocessor renders the template inline where the multi-thread frontend uses
+//! `block_in_place`. It has one blocking thread, so a window can wait for the blocking work a
+//! request leaves. No tracing subscriber is installed. `main` removes every `DYN_` variable and
+//! `TOKENIZERS_PARALLELISM`, and sets `RAYON_NUM_THREADS=4`, so neither the shell nor the host's
+//! core count changes the counts. A pipeline that an environment variable selects must be
+//! selected in code here.
 //!
-//! Measured on a 20-core Linux host, Rust 1.99.0, 200 requests after 50 of warm-up, for the
-//! typical request. Debug and release builds give the same numbers:
+//! Measured on a 20-core aarch64 Linux host, Rust 1.99.0, 200 requests after 50 of warm-up,
+//! for the typical request. Debug and release builds give the same numbers:
 //!
 //! | Row | Allocations, 1 item | Bytes, 1 item | Allocations, 16 items | Bytes, 16 items |
 //! |---|---:|---:|---:|---:|
@@ -54,7 +56,8 @@
 //! carries the request from Migration (`RetryManager::new_stream`) to the next stage.
 //!
 //! Run: `cargo test -p dynamo-llm --test allocations`. For instructions per request, see
-//! `lib/llm/benches/callgrind.sh`, which runs this binary as `allocations row <row> <items> <requests>`.
+//! `lib/llm/benches/callgrind.sh`, which runs this binary as
+//! `allocations row <row> <items> <requests>`.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -197,7 +200,7 @@ struct Row {
     items: usize,
     allocs: u64,
     /// Reported, not gated: it follows the size of every boxed future on the path, which
-    /// changes with unrelated edits and with the build profile.
+    /// changes with unrelated edits.
     bytes: u64,
 }
 
@@ -257,16 +260,14 @@ async fn window<F: std::future::Future>(body: F) -> (Counts, F::Output) {
         // `num_alive_tasks` does not see blocking jobs. The runtime has one blocking thread, so
         // a no-op job finishes only after every job queued before it. Spawning it allocates on
         // this thread; that is the harness's cost, not the request's.
+        // Await it rather than poll it, so the wait costs the same instructions every time.
         HARNESS.with(|h| h.set(true));
         let barrier = tokio::task::spawn_blocking(|| ());
         HARNESS.with(|h| h.set(false));
-        while !barrier.is_finished() {
-            assert!(settled(), "a request left blocking work running");
-            tokio::task::yield_now().await;
-        }
-        HARNESS.with(|h| h.set(true));
-        drop(barrier);
-        HARNESS.with(|h| h.set(false));
+        tokio::time::timeout(std::time::Duration::from_secs(5), barrier)
+            .await
+            .expect("a request left blocking work running")
+            .expect("barrier");
         if total() == before {
             break;
         }
@@ -452,10 +453,10 @@ impl Measured {
 
     /// The most common (allocations, bytes) of a request, and how many requests had it.
     ///
-    /// A few requests cost more than the rest, by a margin that depends on thread timing: when
-    /// tokio's blocking pool has no idle thread at the moment the tokenizer is offloaded, it
-    /// starts one. A real regression moves every request, so the typical request is the number
-    /// to guard.
+    /// A few requests can cost more than the rest. With 16 embeddings inputs, about 4 requests
+    /// in 200 make one more allocation off the runtime thread, where rayon splits the batch
+    /// encode; the cause is not traced further. A real regression moves every request, so the
+    /// typical request is the number to guard.
     fn typical(&self) -> ((u64, u64), usize) {
         let mut seen: Vec<((u64, u64), usize)> = Vec::new();
         for c in &self.counts {
