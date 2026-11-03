@@ -152,6 +152,7 @@ pub struct GdlOperator<O, Req> {
 }
 
 impl<O, Req> GdlOperator<O, Req> {
+    /// `op` as a gdl operator for `Req`, for an `OperatorStage`.
     pub fn new(op: Arc<O>) -> Self {
         Self {
             op,
