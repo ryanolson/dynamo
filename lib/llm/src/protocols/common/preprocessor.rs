@@ -695,7 +695,9 @@ where
                     "packed token_ids byte length is not a multiple of 4",
                 ));
             }
-            Ok(v.chunks_exact(4)
+            Ok(v.as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| TokenIdType::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect())
         }

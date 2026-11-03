@@ -181,6 +181,7 @@ impl TrtllmClient {
     /// unset rather than substituting its `max_input_len` default (measured
     /// against TensorRT-LLM main at 8bbaf66bd5), so `None` here means "the
     /// server did not say", and `--context-length` supplies it instead.
+    #[allow(clippy::result_large_err)]
     async fn get_model_info(&self, model: &str) -> Result<ModelInfo, tonic::Status> {
         let info = self
             .control()

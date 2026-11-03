@@ -56,6 +56,7 @@ pub struct ExtendedNvCreateTensorResponse {
 ///
 /// Note: For all requests, streaming or non-streaming, we always call the engine with streaming enabled. For
 /// non-streaming requests, we will fold the stream into a single response as part of this handler.
+#[allow(clippy::result_large_err)]
 pub async fn tensor_response_stream(
     state: Arc<kserve::State>,
     request: NvCreateTensorRequest,
@@ -456,23 +457,34 @@ impl tensor::Tensor {
                 raw_input.iter().map(|&b| b != 0).collect(),
             )),
             tensor::DataType::Uint8 => Ok(tensor::FlattenTensor::Uint8(
-                raw_input.chunks_exact(1).map(|chunk| chunk[0]).collect(),
+                raw_input
+                    .as_chunks::<1>()
+                    .0
+                    .iter()
+                    .map(|chunk| chunk[0])
+                    .collect(),
             )),
             tensor::DataType::Uint16 => Ok(tensor::FlattenTensor::Uint16(
                 raw_input
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
                     .collect(),
             )),
             tensor::DataType::Uint32 => Ok(tensor::FlattenTensor::Uint32(
                 raw_input
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                     .collect(),
             )),
             tensor::DataType::Uint64 => Ok(tensor::FlattenTensor::Uint64(
                 raw_input
-                    .chunks_exact(8)
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
                     .map(|chunk| {
                         u64::from_le_bytes([
                             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
@@ -483,25 +495,33 @@ impl tensor::Tensor {
             )),
             tensor::DataType::Int8 => Ok(tensor::FlattenTensor::Int8(
                 raw_input
-                    .chunks_exact(1)
+                    .as_chunks::<1>()
+                    .0
+                    .iter()
                     .map(|chunk| chunk[0] as i8)
                     .collect(),
             )),
             tensor::DataType::Int16 => Ok(tensor::FlattenTensor::Int16(
                 raw_input
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
                     .collect(),
             )),
             tensor::DataType::Int32 => Ok(tensor::FlattenTensor::Int32(
                 raw_input
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                     .collect(),
             )),
             tensor::DataType::Int64 => Ok(tensor::FlattenTensor::Int64(
                 raw_input
-                    .chunks_exact(8)
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
                     .map(|chunk| {
                         i64::from_le_bytes([
                             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
@@ -512,25 +532,33 @@ impl tensor::Tensor {
             )),
             tensor::DataType::Float16 => Ok(tensor::FlattenTensor::Float16(
                 raw_input
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|chunk| f16::from_le_bytes([chunk[0], chunk[1]]))
                     .collect(),
             )),
             tensor::DataType::BFloat16 => Ok(tensor::FlattenTensor::BFloat16(
                 raw_input
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|chunk| bf16::from_le_bytes([chunk[0], chunk[1]]))
                     .collect(),
             )),
             tensor::DataType::Float32 => Ok(tensor::FlattenTensor::Float32(
                 raw_input
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                     .collect(),
             )),
             tensor::DataType::Float64 => Ok(tensor::FlattenTensor::Float64(
                 raw_input
-                    .chunks_exact(8)
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
                     .map(|chunk| {
                         f64::from_le_bytes([
                             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],

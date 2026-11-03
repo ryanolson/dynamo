@@ -324,6 +324,7 @@ impl TrtllmMockerService {
         self.engine.shutdown().await
     }
 
+    #[allow(clippy::result_large_err)]
     async fn start_generation(
         &self,
         request: Request<pb::GenerateRequest>,
@@ -403,6 +404,7 @@ impl TrtllmMockerService {
         Ok((prepared, live, permit, guard, claimed))
     }
 
+    #[allow(clippy::result_large_err)]
     async fn abort_uuid(&self, request_id: &str) -> Result<pb::AbortStatus, Status> {
         // The DashMap guard is a temporary of this `let`, so it is released
         // before the `.await` below. Do not restructure this into an `if let`

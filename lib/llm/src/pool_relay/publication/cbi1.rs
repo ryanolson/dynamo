@@ -414,7 +414,9 @@ fn decode_snapshot_chunk(
         });
     }
     let words = words_bytes
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .map(|chunk| {
             let mut value = [0; 8];
             value.copy_from_slice(chunk);

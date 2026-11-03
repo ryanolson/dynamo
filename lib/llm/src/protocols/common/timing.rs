@@ -508,7 +508,7 @@ impl RequestTracker {
         // u128 -> u64 is safe because max u64 in nanos is over 500 years
         let delta_ns = u64::try_from(l.as_nanos()).unwrap_or(u64::MAX);
         // On an x86 system these atomics are very cheap
-        let _ = self.detokenize_total_ns.fetch_update(
+        let _ = self.detokenize_total_ns.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             // Saturating add to avoid wrapping to a nonsensical average on overflow.

@@ -1494,7 +1494,7 @@ mod tests {
             self.release.acquire().await.unwrap().forget();
             if self
                 .failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok()
@@ -1514,7 +1514,7 @@ mod tests {
             let Prepared(_build) = prepared;
             if self
                 .commit_failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok()
@@ -1543,7 +1543,7 @@ mod tests {
         ) -> anyhow::Result<()> {
             if self
                 .replace_failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok()

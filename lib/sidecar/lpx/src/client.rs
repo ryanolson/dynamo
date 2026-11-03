@@ -85,6 +85,7 @@ impl OpenEngineClient {
     /// engine reads into its request tracing and the LPU-only engine ignores.
     /// No routing metadata is sent: the sidecar rejects nonzero data-parallel
     /// ranks and priorities before dispatch.
+    #[allow(clippy::result_large_err)]
     pub(crate) async fn generate(
         &self,
         request: pb::GenerateRequest,
@@ -157,6 +158,7 @@ impl OpenEngineClient {
     /// An LPX engine serves one model and accepts an empty model name. The
     /// sidecar does not know the name until this call returns it, so it asks
     /// for none.
+    #[allow(clippy::result_large_err)]
     async fn get_model_info(&self) -> Result<pb::ModelInfo, tonic::Status> {
         self.control()
             .get_model_info(pb::GetModelInfoRequest {
