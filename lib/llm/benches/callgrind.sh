@@ -148,6 +148,13 @@ measure() {
         echo "callgrind.sh: $what: could not count memcpy calls in $window; see $out.log" >&2
         return 1
     fi
+    # Every request of a row makes the same copies, so the window's count divides by N. A
+    # remainder is a copy that not every request makes; dividing would round it away, and a
+    # rise hidden that way would pass the zero tolerance of hotpath.sh.
+    if (( memcpy % n != 0 )); then
+        echo "callgrind.sh: $what: $memcpy memcpy calls in $n requests is not a whole number per request; see $window" >&2
+        return 1
+    fi
     local allocs range
     allocs=$(grep -o 'allocs=[0-9]*' "$out.stdout" | head -n 1 | cut -d= -f2) || true
     if [[ ! $allocs =~ ^[0-9]+$ ]]; then
