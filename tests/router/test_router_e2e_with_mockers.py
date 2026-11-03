@@ -640,12 +640,15 @@ def test_mocker_session_affinity(
 
 
 @pytest.mark.parametrize("local_pipeline", LOCAL_PIPELINES)
+# The frontend subscribes to KV events over NATS; the mockers must publish there.
+@pytest.mark.parametrize("event_plane", ["nats"], indirect=True)
 @pytest.mark.timeout(180)
 def test_mocker_repeated_prompt_cache_hit(
     request,
     runtime_services_dynamic_ports,
     predownload_tokenizers,
     file_storage_backend,
+    event_plane,
     local_pipeline,
 ):
     """The same chat prompt twice through the HTTP frontend's routed pipeline:

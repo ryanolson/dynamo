@@ -554,11 +554,13 @@ def _test_router_two_routers(
 def local_pipeline_env(local_pipeline: str | None) -> dict[str, str | None]:
     """Frontend environment that selects ``local_pipeline`` (``None`` removes
     ``DYN_LOCAL_PIPELINE``, so an inherited value cannot select gdl) and logs
-    JSONL, so the pipeline the frontend built can be read back."""
+    JSONL, so the pipeline the frontend built can be read back. The console
+    format is set, not the legacy ``DYN_LOGGING_JSONL``, which an inherited
+    ``DYN_LOGGING_CONSOLE_FORMAT`` would override."""
 
     return {
         "DYN_LOCAL_PIPELINE": local_pipeline,
-        "DYN_LOGGING_JSONL": "1",
+        "DYN_LOGGING_CONSOLE_FORMAT": "jsonl",
         "DYN_LOG": "info",
     }
 
@@ -773,9 +775,10 @@ def _test_repeated_prompt_cache_hit(
     local_pipeline: str | None = None,
 ):
     """Send the same chat prompt twice through the HTTP frontend with KV routing.
-    Both requests stream content, and the second reports a prefix-cache hit
-    (``usage.prompt_tokens_details.cached_tokens`` above 0) on the worker that
-    served the first."""
+    Both requests stream content. The second must be routed by its KV overlap
+    (``nvext.timing.kv_hit_rate`` above 0) to the worker that served the first,
+    and report a prefix-cache hit there
+    (``usage.prompt_tokens_details.cached_tokens`` above 0)."""
     with FrontendRouterProcess(
         request,
         block_size,
@@ -812,7 +815,7 @@ def _test_repeated_prompt_cache_hit(
                     "max_tokens": 8,
                     "nvext": {
                         "annotations": ["query_instance_id:"] if query_only else [],
-                        "extra_fields": ["worker_id"],
+                        "extra_fields": ["worker_id", "timing"],
                     },
                 }
 
@@ -822,11 +825,15 @@ def _test_repeated_prompt_cache_hit(
                 async with client.post(url, json=request_payload) as response:
                     body = await response.text()
                     assert response.status == 200, body
-                text, worker, cached = "", None, None
+                text, worker, cached, kv_hit_rate = "", None, None, None
                 for chunk in parse_sse_json_chunks(body):
                     for choice in chunk.get("choices") or []:
                         text += (choice.get("delta") or {}).get("content") or ""
-                    worker = chunk.get("nvext", {}).get("worker_id") or worker
+                    nvext = chunk.get("nvext", {})
+                    worker = nvext.get("worker_id") or worker
+                    timing = nvext.get("timing") or {}
+                    if timing.get("kv_hit_rate") is not None:
+                        kv_hit_rate = timing["kv_hit_rate"]
                     details = (chunk.get("usage") or {}).get(
                         "prompt_tokens_details"
                     ) or {}
@@ -837,6 +844,7 @@ def _test_repeated_prompt_cache_hit(
                     "text": text,
                     "worker": (worker["decode_worker_id"], worker["decode_dp_rank"]),
                     "cached_tokens": cached,
+                    "kv_hit_rate": kv_hit_rate,
                     "body": body,
                 }
 
@@ -858,13 +866,18 @@ def _test_repeated_prompt_cache_hit(
 
                 second = await send(client, payload())
                 assert second["text"], second["body"]
+                # Without this, the same worker can be a tie-break and the
+                # cache hit the worker's own, with the router blind to events.
+                assert (second["kv_hit_rate"] or 0) > 0, second["body"]
                 assert second["worker"] == first["worker"], (first, second)
                 assert (second["cached_tokens"] or 0) > 0, second["body"]
                 logger.info(
-                    "local_pipeline=%s cached_tokens first=%s second=%s worker=%s",
+                    "local_pipeline=%s cached_tokens first=%s second=%s "
+                    "kv_hit_rate second=%s worker=%s",
                     local_pipeline or "dynamo",
                     first["cached_tokens"],
                     second["cached_tokens"],
+                    second["kv_hit_rate"],
                     second["worker"],
                 )
 
