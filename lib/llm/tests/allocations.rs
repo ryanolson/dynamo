@@ -17,8 +17,9 @@
 //! | `c-gdl` | `c` composed as a gdl local pipeline | test LLM engine, in place of `RoutingHost` |
 //! | `embed-engine` | the test embeddings engine, called directly | itself |
 //! | `embed` | `build_embeddings_pipeline`: preprocessor, backend | test embeddings engine, in place of `PushRouter` |
+//! | `embeddings-gdl` | `embed` composed as a gdl local pipeline | test embeddings engine, in place of `PushRouter` |
 //!
-//! The second number of a row is stream items: 1 and 16. For `embed` and `embed-engine` it is
+//! The second number of a row is stream items: 1 and 16. For the embeddings rows it is
 //! inputs per request instead, because an embeddings stream carries one item for any number of
 //! inputs.
 //!
@@ -55,6 +56,7 @@
 //! | `c-gdl` | 106 | 142,495 | 121 | 142,555 |
 //! | `embed-engine` | 8 | 6,548 | 23 | 88,868 |
 //! | `embed` | 199 | 44,406 | 2,283 | 529,854 |
+//! | `embeddings-gdl` | 225 | 49,729 | 2,309 | 535,177 |
 //!
 //! `b-gdl` costs 53 allocations more than `b` at both item counts, so nothing per item. That is
 //! the adapters' cost in `lib/gdl-adapters/tests/allocations.rs`: 23 allocations per adapted
@@ -66,6 +68,11 @@
 //! 16 boxed futures of 2.2 to 4.4 KB (54,936 bytes) give way to one boxed future of about
 //! 11.7 KB per `PipelineEngine`, one at the boundary and one below each operator (46,800 bytes);
 //! the 35 extra allocations are small and add 5,948 bytes.
+//!
+//! `embeddings-gdl` costs 26 allocations and 5,323 bytes more than `embed` at both input counts:
+//! 2 adapted operators × 9 + 8 at the boundary. Its three `PipelineEngine`s box one future of
+//! 2.4 KB each (7,200 bytes); the rest are small and take 1,877 bytes fewer than the `link`
+//! chain's.
 //!
 //! Most of `c`'s bytes are two boxed futures of 59,592 bytes each, allocated by the edge that
 //! carries the request from Migration (`RetryManager::new_stream`) to the next stage.
@@ -129,6 +136,8 @@ const BASELINE: &[Row] = &[
     row("embed-engine", 16, 23, 88868),
     row("embed", 1, 199, 44406),
     row("embed", 16, 2283, 529854),
+    row("embeddings-gdl", 1, 225, 49729),
+    row("embeddings-gdl", 16, 2309, 535177),
 ];
 
 #[global_allocator]
@@ -635,14 +644,21 @@ async fn measure_embed_engine(fixture: &Fixture, inputs: usize, requests: usize)
     .await
 }
 
-async fn measure_embed(fixture: &Fixture, inputs: usize, requests: usize) -> Measured {
+async fn measure_embed(
+    fixture: &Fixture,
+    name: &'static str,
+    local_pipeline: LocalPipeline,
+    inputs: usize,
+    requests: usize,
+) -> Measured {
     let mut card = fixture.card.clone();
     card.model_type = ModelType::Embedding;
     let preprocessor =
         OpenAIPreprocessor::new_for_embeddings(card.clone()).expect("embeddings preprocessor");
-    let pipeline = build_embeddings_pipeline(&card, preprocessor, embeddings_engine())
-        .expect("pipeline embed");
-    measure("embed", inputs, requests, || {
+    let pipeline =
+        build_embeddings_pipeline(&card, preprocessor, embeddings_engine(), local_pipeline)
+            .expect("pipeline embed");
+    measure(name, inputs, requests, || {
         let pipeline = pipeline.clone();
         let request = embedding_request(inputs);
         async move { drain(pipeline.generate(Context::new(request)).await.unwrap()).await }
@@ -659,7 +675,17 @@ async fn measure_row(fixture: &Fixture, name: &str, items: usize, requests: usiz
         "c" => measure_c(fixture, "c", LocalPipeline::Dynamo, items, requests).await,
         "c-gdl" => measure_c(fixture, "c-gdl", LocalPipeline::Gdl, items, requests).await,
         "embed-engine" => measure_embed_engine(fixture, items, requests).await,
-        "embed" => measure_embed(fixture, items, requests).await,
+        "embed" => measure_embed(fixture, "embed", LocalPipeline::Dynamo, items, requests).await,
+        "embeddings-gdl" => {
+            measure_embed(
+                fixture,
+                "embeddings-gdl",
+                LocalPipeline::Gdl,
+                items,
+                requests,
+            )
+            .await
+        }
         other => panic!("unknown row {other}"),
     }
 }
@@ -756,6 +782,8 @@ const ROWS: &[(&str, usize)] = &[
     ("embed-engine", 16),
     ("embed", 1),
     ("embed", 16),
+    ("embeddings-gdl", 1),
+    ("embeddings-gdl", 16),
 ];
 
 fn main() {

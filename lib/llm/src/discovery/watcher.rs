@@ -1034,9 +1034,10 @@ impl ModelWatcher {
             worker_set.set_load_context(load_context);
         } else if card.model_input == ModelInput::Tokens && card.model_type.supports_embedding() {
             // Case 4: Tokens + Embeddings
-            // Build the preprocessor first: a router started for a card that fails here would
-            // leave its discovery watch running.
+            // Build the preprocessor and read the local pipeline first: a router started for a
+            // card that fails here would leave its discovery watch running.
             let preprocessor = OpenAIPreprocessor::new_for_embeddings(card.clone())?;
+            let local_pipeline = entrypoint::input::LocalPipeline::configured()?;
             let router = PushRouter::<
                 PreprocessedEmbeddingRequest,
                 Annotated<EmbeddingsEngineOutput>,
@@ -1046,8 +1047,17 @@ impl ModelWatcher {
             .await?;
 
             // Note: Embeddings don't need KV routing complexity or load monitoring
-            let embedding_engine =
-                entrypoint::input::build_embeddings_pipeline(card, preprocessor, Arc::new(router))?;
+            let embedding_engine = entrypoint::input::build_embeddings_pipeline(
+                card,
+                preprocessor,
+                Arc::new(router),
+                local_pipeline,
+            )?;
+            tracing::info!(
+                model = card.name(),
+                local_pipeline = local_pipeline.as_str(),
+                "Built the embeddings local pipeline"
+            );
 
             worker_set.embeddings_engine = Some(embedding_engine);
         } else if card.model_input == ModelInput::Tensor && card.model_type.supports_tensor() {

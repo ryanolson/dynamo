@@ -9,7 +9,8 @@
 #
 # Usage: lib/llm/benches/callgrind.sh [ROW ITEMS]...
 #   With no arguments it measures every row at 1 and 16 items.
-#   ROW is engine, a, b, b-gdl, c, c-gdl, embed-engine or embed (see tests/allocations.rs).
+#   ROW is engine, a, b, b-gdl, c, c-gdl, embed-engine, embed or embeddings-gdl (see
+#   tests/allocations.rs).
 #   CALLGRIND_REQUESTS sets N (default 20). CALLGRIND_PROFILE sets the cargo profile
 #   (default profiling). CARGO_TARGET_DIR is honored.
 #
@@ -39,7 +40,7 @@ fi
 
 if [[ $# -eq 0 ]]; then
     set -- engine 1 engine 16 a 1 a 16 b 1 b 16 b-gdl 1 b-gdl 16 c 1 c 16 c-gdl 1 c-gdl 16 \
-        embed-engine 1 embed-engine 16 embed 1 embed 16
+        embed-engine 1 embed-engine 16 embed 1 embed 16 embeddings-gdl 1 embeddings-gdl 16
 fi
 if (( $# % 2 != 0 )); then
     echo "callgrind.sh: arguments must be ROW ITEMS pairs" >&2

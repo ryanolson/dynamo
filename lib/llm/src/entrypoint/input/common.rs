@@ -472,7 +472,8 @@ where
         .link_terminal(frontend)?)
 }
 
-/// Build the embeddings pipeline: preprocessor, then backend, then `engine`.
+/// Build the embeddings pipeline: preprocessor, then backend, then `engine`, composed on
+/// `local_pipeline`.
 ///
 /// The caller builds `preprocessor` (`OpenAIPreprocessor::new_for_embeddings`), so a card it
 /// cannot serve fails before the caller creates `engine`.
@@ -483,13 +484,23 @@ pub fn build_embeddings_pipeline(
         SingleIn<PreprocessedEmbeddingRequest>,
         ManyOut<Annotated<EmbeddingsEngineOutput>>,
     >,
+    local_pipeline: LocalPipeline,
 ) -> anyhow::Result<OpenAIEmbeddingsStreamingEngine> {
+    let backend = Backend::from_mdc(card);
+    if local_pipeline == LocalPipeline::Gdl {
+        return Ok(compose_gdl_embeddings_pipeline(
+            preprocessor,
+            backend,
+            engine,
+        ));
+    }
+
     let frontend = SegmentSource::<
         SingleIn<NvCreateEmbeddingRequest>,
         ManyOut<Annotated<NvCreateEmbeddingResponse>>,
     >::new();
     let preprocessor = preprocessor.into_operator();
-    let backend = Backend::from_mdc(card).into_operator();
+    let backend = backend.into_operator();
     let service_backend = ServiceBackend::from_engine(engine);
 
     Ok(frontend
@@ -499,6 +510,31 @@ pub fn build_embeddings_pipeline(
         .link(backend.backward_edge())?
         .link(preprocessor.backward_edge())?
         .link_terminal(frontend)?)
+}
+
+/// [`build_embeddings_pipeline`]'s chain as a gdl local pipeline, built from the terminal up
+/// as [`PreprocessedRouting::build_pipeline`]'s is.
+fn compose_gdl_embeddings_pipeline(
+    preprocessor: Arc<OpenAIPreprocessor>,
+    backend: Arc<Backend>,
+    engine: ServiceEngine<
+        SingleIn<PreprocessedEmbeddingRequest>,
+        ManyOut<Annotated<EmbeddingsEngineOutput>>,
+    >,
+) -> OpenAIEmbeddingsStreamingEngine {
+    use gdl::{Hop, SinkStage};
+    type Pre = PreprocessedEmbeddingRequest;
+    type Out = EmbeddingsEngineOutput;
+    type Req = NvCreateEmbeddingRequest;
+    type Resp = NvCreateEmbeddingResponse;
+
+    let router = SinkStage::new(Arc::new(EngineSink::new(engine)));
+    let backend = DynOperatorStage::<_, Pre, Out, Pre, Out>::new(backend, Hop::new((), router, ()));
+    let preprocessor =
+        DynOperatorStage::<_, Req, Resp, Pre, Out>::new(preprocessor, Hop::new((), backend, ()));
+    Arc::new(PipelineEngine::<_, Req, Resp>::new(gdl::Source::new(
+        Hop::new((), preprocessor, ()),
+    )))
 }
 
 impl PreprocessedRouting {

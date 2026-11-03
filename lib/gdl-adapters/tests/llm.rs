@@ -11,7 +11,9 @@ use std::time::Duration;
 
 use dynamo_gdl_adapters::{DynOperatorStage, EngineSink, PipelineEngine, REQUEST_ID};
 use dynamo_llm::discovery::ModelManager;
-use dynamo_llm::entrypoint::input::{LocalPipeline, PreprocessedRouting};
+use dynamo_llm::entrypoint::input::{
+    LocalPipeline, PreprocessedRouting, build_embeddings_pipeline,
+};
 use dynamo_llm::http::service::axum::http::HeaderMap;
 use dynamo_llm::http::service::error::HttpError;
 use dynamo_llm::http::service::metrics::Metrics;
@@ -19,15 +21,21 @@ use dynamo_llm::http::service::service_v2::HttpService;
 use dynamo_llm::kv_router::{EncoderRouter, PrefillRouter};
 use dynamo_llm::migration::Migration;
 use dynamo_llm::model_card::ModelDeploymentCard;
-use dynamo_llm::preprocessor::OpenAIPreprocessor;
+use dynamo_llm::model_type::ModelType;
 use dynamo_llm::preprocessor::prompt::prompt_formatter_from_mdc;
+use dynamo_llm::preprocessor::{OpenAIPreprocessor, PreprocessedEmbeddingRequest};
 use dynamo_llm::protocols::common::extensions::{
     SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId, session_affinity_from_headers,
 };
-use dynamo_llm::protocols::common::llm_backend::{LLMEngineOutput, PreprocessedRequest};
+use dynamo_llm::protocols::common::llm_backend::{
+    EmbeddingsEngineOutput, LLMEngineOutput, PreprocessedRequest,
+};
 use dynamo_llm::protocols::common::{OutputOptions, SamplingOptions, StopConditions};
 use dynamo_llm::protocols::openai::chat_completions::{
     NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse,
+};
+use dynamo_llm::protocols::openai::embeddings::{
+    NvCreateEmbeddingRequest, NvCreateEmbeddingResponse,
 };
 use dynamo_renderer::PromptFormatter;
 use dynamo_runtime::CancellationToken;
@@ -738,6 +746,214 @@ async fn a_kill_during_dispatch_ends_pipeline_c_on_both_local_pipelines() {
     for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
         let pipeline = pipeline_c(local_pipeline, Arc::new(Hanging), 3);
         outcomes.push(kill_during_dispatch(pipeline, request()).await);
+    }
+    assert_eq!(outcomes, ["ok, 0 items", "error Cancelled"]);
+}
+
+type EmbedOut = ManyOut<Annotated<EmbeddingsEngineOutput>>;
+type EmbedEngine = Arc<dyn AsyncEngine<SingleIn<PreprocessedEmbeddingRequest>, EmbedOut, Error>>;
+
+/// What one call of [`FlakyEmbeddings`] saw.
+struct EmbedCall {
+    id: String,
+    token_ids: Vec<Vec<u32>>,
+    context: Arc<dyn AsyncEngineContext>,
+}
+
+/// An embeddings worker that fails its first `failures` calls with `worker_unavailable()`,
+/// then answers with one vector per input. With `hold`, the answer waits for a kill.
+struct FlakyEmbeddings {
+    failures: usize,
+    hold: bool,
+    calls: Mutex<Vec<EmbedCall>>,
+}
+
+impl FlakyEmbeddings {
+    fn new(failures: usize, hold: bool) -> Arc<Self> {
+        Arc::new(Self {
+            failures,
+            hold,
+            calls: Mutex::default(),
+        })
+    }
+
+    fn calls(&self) -> Vec<(String, Vec<Vec<u32>>)> {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| (call.id.clone(), call.token_ids.clone()))
+            .collect()
+    }
+}
+
+#[async_trait]
+impl AsyncEngine<SingleIn<PreprocessedEmbeddingRequest>, EmbedOut, Error> for FlakyEmbeddings {
+    async fn generate(
+        &self,
+        request: SingleIn<PreprocessedEmbeddingRequest>,
+    ) -> Result<EmbedOut, Error> {
+        let context = request.context();
+        let call = {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(EmbedCall {
+                id: request.id().to_string(),
+                token_ids: request.token_ids.clone(),
+                context: context.clone(),
+            });
+            calls.len()
+        };
+        if call <= self.failures {
+            return Err(worker_unavailable());
+        }
+        let tokens: usize = request.token_ids.iter().map(Vec::len).sum();
+        let output = EmbeddingsEngineOutput {
+            // Two little-endian f32s per input, base64 as the worker sends them.
+            embeddings: vec!["AACAPwAAAEA=".to_string(); request.token_ids.len()],
+            prompt_tokens: tokens as u32,
+            total_tokens: tokens as u32,
+        };
+        let hold = self.hold;
+        let watched = context.clone();
+        let answer = stream::once(async move {
+            if hold {
+                watched.killed().await;
+            }
+            Annotated::from_data(output)
+        });
+        Ok(ResponseStream::new(Box::pin(answer), context))
+    }
+}
+
+/// The embeddings pipeline the model watcher builds for a token-input embeddings worker, over
+/// `engine` in place of its `PushRouter`, on the given local pipeline.
+fn pipeline_embeddings(
+    local_pipeline: LocalPipeline,
+    engine: EmbedEngine,
+) -> Arc<
+    dyn AsyncEngine<
+            SingleIn<NvCreateEmbeddingRequest>,
+            ManyOut<Annotated<NvCreateEmbeddingResponse>>,
+            Error,
+        >,
+> {
+    let mut card = ModelDeploymentCard::load_from_disk(SAMPLE_MODEL, None).unwrap();
+    card.model_type = ModelType::Embedding;
+    let preprocessor = OpenAIPreprocessor::new_for_embeddings(card.clone()).unwrap();
+    build_embeddings_pipeline(&card, preprocessor, engine, local_pipeline).unwrap()
+}
+
+fn embedding_request() -> SingleIn<NvCreateEmbeddingRequest> {
+    let embedding: NvCreateEmbeddingRequest = serde_json::from_value(serde_json::json!({
+        "model": "TinyLlama_v1.1",
+        "input": ["A fox crossed the river.", "It was cold."],
+    }))
+    .unwrap();
+    Context::with_id_and_metadata(embedding, "req-1".to_string(), BTreeMap::new())
+}
+
+#[tokio::test]
+async fn pipeline_embeddings_answers_the_same_on_both_local_pipelines() {
+    let mut runs = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        let engine = FlakyEmbeddings::new(0, false);
+        let items: Vec<_> = pipeline_embeddings(local_pipeline, engine.clone())
+            .generate(embedding_request())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(
+            items.iter().all(|item| !item.is_error()),
+            "{local_pipeline:?}: {items:?}"
+        );
+        let answers: Vec<_> = items
+            .iter()
+            .map(|item| serde_json::to_value(&item.data).unwrap())
+            .collect();
+        runs.push((answers, engine.calls()));
+    }
+    assert_eq!(runs[0], runs[1]);
+    let (answers, calls) = &runs[1];
+    assert_eq!(answers.len(), 1);
+    assert_eq!(
+        answers[0]["data"].as_array().unwrap().len(),
+        2,
+        "{answers:?}"
+    );
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "req-1");
+    assert_eq!(calls[0].1.len(), 2);
+}
+
+/// The embeddings pipeline has no Migration: the worker's eager error reaches the caller as
+/// it left the router, through the backend and the preprocessor.
+#[tokio::test]
+async fn pipeline_embeddings_returns_its_terminals_eager_error_on_both_local_pipelines() {
+    let mut errors = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        let engine = FlakyEmbeddings::new(1, false);
+        let error = match pipeline_embeddings(local_pipeline, engine.clone())
+            .generate(embedding_request())
+            .await
+        {
+            Ok(_) => panic!("{local_pipeline:?}: the eager error was lost"),
+            Err(error) => error,
+        };
+        let error_type = error
+            .downcast_ref::<DynamoError>()
+            .map(DynamoError::error_type)
+            .unwrap_or_else(|| panic!("{local_pipeline:?}: {error:#}"));
+        errors.push((error_type, error.to_string(), engine.calls().len()));
+    }
+    assert_eq!(errors[0], errors[1]);
+    assert_eq!(errors[1].0, ErrorClass::WorkerUnavailable);
+    assert_eq!(errors[1].2, 1);
+}
+
+/// A stop and a kill of the HTTP handler's context reach the worker's context through both
+/// adapted stages, while the worker holds its answer.
+#[tokio::test]
+async fn a_stop_and_a_kill_reach_the_terminal_through_pipeline_embeddings_on_gdl() {
+    let engine = FlakyEmbeddings::new(0, true);
+    let pipeline = pipeline_embeddings(LocalPipeline::Gdl, engine.clone());
+    let request = embedding_request();
+    let context = request.context();
+    let stream = pipeline.generate(request).await.unwrap();
+
+    let terminal = engine.calls.lock().unwrap()[0].context.clone();
+    context.stop_generating();
+    assert!(terminal.is_stopped());
+    assert!(!terminal.is_killed());
+    context.kill();
+    assert!(terminal.is_killed());
+    let rest: Vec<_> = tokio::time::timeout(Duration::from_secs(5), stream.collect())
+        .await
+        .expect("the stream ends after the kill");
+    assert!(rest.iter().all(|item| !item.is_error()), "{rest:?}");
+}
+
+/// An embeddings worker that waits in its eager phase until the request is killed.
+struct HangingEmbeddings;
+
+#[async_trait]
+impl AsyncEngine<SingleIn<PreprocessedEmbeddingRequest>, EmbedOut, Error> for HangingEmbeddings {
+    async fn generate(
+        &self,
+        request: SingleIn<PreprocessedEmbeddingRequest>,
+    ) -> Result<EmbedOut, Error> {
+        let context = request.context();
+        context.killed().await;
+        Ok(ResponseStream::new(Box::pin(stream::empty()), context))
+    }
+}
+
+#[tokio::test]
+async fn a_kill_during_dispatch_ends_pipeline_embeddings_on_both_local_pipelines() {
+    let mut outcomes = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        let pipeline = pipeline_embeddings(local_pipeline, Arc::new(HangingEmbeddings));
+        outcomes.push(kill_during_dispatch(pipeline, embedding_request()).await);
     }
     assert_eq!(outcomes, ["ok, 0 items", "error Cancelled"]);
 }
