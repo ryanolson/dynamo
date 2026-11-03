@@ -77,6 +77,21 @@ impl Drop for Pause {
     }
 }
 
+thread_local! {
+    /// The pause a runtime thread holds while it is parked.
+    static PARKED: Cell<Option<Pause>> = const { Cell::new(None) };
+}
+
+/// Pauses counting on the runtime's threads while they are parked. How often a thread parks and
+/// wakes depends on when the other threads run: inside a request that waits for the blocking
+/// thread, the parks moved row `a` by about 1,000 instructions per request between batches of
+/// runs.
+pub fn uncount_parked(builder: &mut tokio::runtime::Builder) -> &mut tokio::runtime::Builder {
+    builder
+        .on_thread_park(|| PARKED.set(Some(pause())))
+        .on_thread_unpark(|| PARKED.set(None))
+}
+
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn request(code: usize, arg: usize) {

@@ -182,10 +182,9 @@ async fn allocations_per_request(items: usize, requests: usize) -> (u64, u64) {
 }
 
 fn main() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let mut builder = tokio::runtime::Builder::new_current_thread();
+    builder.enable_all();
+    let runtime = callgrind::uncount_parked(&mut builder).build().unwrap();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("row") {
         assert_eq!(

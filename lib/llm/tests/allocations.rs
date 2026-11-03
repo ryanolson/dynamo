@@ -848,10 +848,12 @@ fn main() {
     let fixture = Fixture::load();
     // One blocking thread, so a window can wait for the blocking work a request leaves. It must
     // not exit when idle: starting a new one allocates.
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let mut builder = tokio::runtime::Builder::new_current_thread();
+    builder
         .enable_all()
         .max_blocking_threads(1)
-        .thread_keep_alive(std::time::Duration::from_secs(24 * 3600))
+        .thread_keep_alive(std::time::Duration::from_secs(24 * 3600));
+    let rt = callgrind::uncount_parked(&mut builder)
         .build()
         .expect("runtime");
     rt.block_on(run(&fixture, &args));
