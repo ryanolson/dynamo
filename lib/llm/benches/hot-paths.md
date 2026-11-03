@@ -10,14 +10,17 @@ per item grows with every token of every stream. A cost per request is paid once
 
 ## per-item-response
 
-The per-item path of a chat response: Backend's decoder stream, then the preprocessor's response
-transform, through the stream layers between the stages.
+The per-item path of a chat response: Migration's response stream (pipelines B and C), Backend's
+decoder stream, then the preprocessor's response transform, through the stream layers between
+the stages.
 
 - **Entry points:** `DecoderStream::poll_next` in `lib/llm/src/backend.rs` (Backend's stream over
   the engine's stream, built by `Backend::generate_tokens`), and
   `transform_postprocessor_stream_with_image_tokens` in `lib/llm/src/preprocessor.rs`, with the
-  in-place edits of `lib/llm/src/preprocessor/edit.rs` after the parsers.
-- **Guard:** `lib/llm/benches/hotpath.sh`, rows `A dynamo` and `A gdl`: the `memcpy/item` and
+  in-place edits of `lib/llm/src/preprocessor/edit.rs` after the parsers, and
+  `Migrated::poll_next` in `lib/llm/src/migration.rs` (Migration's stream over the active
+  attempt, built by `Migration::migrate`).
+- **Guard:** `lib/llm/benches/hotpath.sh`, rows A, B and C in both forms: the `memcpy/item` and
   `memcpy@16` columns, with no tolerance (the count is the same in every run of one build), and
   the `instr/item` column, tolerance 2% per item, at least 50 instructions. Two builds of the
   same tree agree within 0.25% per row (aarch64). One more move of an item costs about 100 to
