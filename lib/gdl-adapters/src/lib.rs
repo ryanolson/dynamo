@@ -11,3 +11,5 @@
 //! `tests/dependencies.rs` keeps them out.
 
 use gdl as _;
+
+pub mod metrics;
