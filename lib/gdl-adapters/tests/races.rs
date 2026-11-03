@@ -198,3 +198,152 @@ async fn forwarding_a_stop_does_not_replace_a_concurrent_kill() {
     assert!(context.is_stopped());
     assert!(context.is_killed(), "the forwarded stop replaced the kill");
 }
+
+#[derive(Debug)]
+struct PauseReplayedKill {
+    calls: std::sync::atomic::AtomicUsize,
+    entered: Mutex<Option<oneshot::Sender<()>>>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+#[async_trait]
+impl AsyncEngineContext for PauseReplayedKill {
+    fn id(&self) -> &str {
+        "pause-replayed-kill"
+    }
+
+    fn is_stopped(&self) -> bool {
+        false
+    }
+
+    fn is_killed(&self) -> bool {
+        false
+    }
+
+    async fn stopped(&self) {
+        std::future::pending().await
+    }
+
+    async fn killed(&self) {
+        std::future::pending().await
+    }
+
+    fn stop_generating(&self) {}
+
+    fn stop(&self) {}
+
+    fn kill(&self) {
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            // Hold the replay so the consumer can poll before it republishes Killed.
+            self.entered
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(())
+                .unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+        }
+    }
+
+    fn link_child(&self, _: Arc<dyn AsyncEngineContext>) {}
+}
+
+/// Discards buffered data on kill and drains it on stop.
+struct DrainOnStop;
+
+#[async_trait]
+impl
+    dynamo_runtime::engine::AsyncEngine<
+        dynamo_runtime::pipeline::SingleIn<u32>,
+        dynamo_runtime::pipeline::ManyOut<dynamo_runtime::protocols::annotated::Annotated<u32>>,
+        anyhow::Error,
+    > for DrainOnStop
+{
+    async fn generate(
+        &self,
+        request: Context<u32>,
+    ) -> anyhow::Result<
+        dynamo_runtime::pipeline::ManyOut<dynamo_runtime::protocols::annotated::Annotated<u32>>,
+    > {
+        use dynamo_runtime::protocols::annotated::Annotated;
+        let context = request.context();
+        let watched = context.clone();
+        let stream = futures::stream::once(async move {
+            watched.stopped().await;
+            (!watched.is_killed()).then(|| Annotated::from_data(1))
+        });
+        let stream = futures::StreamExt::filter_map(stream, futures::future::ready);
+        Ok(dynamo_runtime::engine::ResponseStream::new(
+            Box::pin(stream),
+            context,
+        ))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forwarded_stop_does_not_revive_a_killed_workers_buffered_output() {
+    use dynamo_gdl_adapters::EngineSink;
+    use futures::StreamExt;
+    use gdl::{Hop, SinkStage, Source};
+
+    let pipeline = Source::new(Hop::new(
+        (),
+        SinkStage::new(Arc::new(EngineSink::new(Arc::new(DrainOnStop)))),
+        (),
+    ));
+
+    let cx = Cx::new();
+    let request = CxBridge::context(&cx, 0);
+    let context = request.context();
+    let mut items = pipeline.call(cx, request).await.unwrap();
+    context.kill();
+    assert!(
+        items.next().await.is_none(),
+        "control: a kill discards output"
+    );
+
+    let cx = Cx::new();
+    let request = CxBridge::context(&cx, 0);
+    let context = request.context();
+    let mut items = pipeline.call(cx.clone(), request).await.unwrap();
+    let (finished, on_finish) = oneshot::channel();
+    context.link_child(Arc::new(KillDuringStop {
+        target: Arc::downgrade(&context),
+        finished: Mutex::new(Some(finished)),
+    }));
+    let (entered, on_enter) = oneshot::channel();
+    let (release, on_release) = mpsc::channel();
+    context.link_child(Arc::new(PauseReplayedKill {
+        calls: Default::default(),
+        entered: Mutex::new(Some(entered)),
+        release: Mutex::new(on_release),
+    }));
+
+    cx.request_stop();
+    tokio::time::timeout(Duration::from_secs(5), on_finish)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), on_enter)
+        .await
+        .unwrap()
+        .unwrap();
+    let item = items.next().await;
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !context.is_killed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        item.is_none(),
+        "the completed kill lost its discard semantics: {item:?}"
+    );
+}
