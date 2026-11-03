@@ -116,8 +116,8 @@ cargo bench --bench request_trace_finish_metadata -p dynamo-llm --features reque
 
 ## callgrind.sh and hotpath.sh
 
-`hotpath.sh` prints the hot-path table: allocations and instructions per request, for each
-pipeline (A, B, C, embeddings, and the worker's `Ingress`) in both forms. The dynamo form is the
+`hotpath.sh` prints the hot-path table: allocations, instructions and `memcpy` calls per
+request, for each pipeline (A, B, C, embeddings, and the worker's `Ingress`) in both forms. The dynamo form is the
 default path (`DYN_LOCAL_PIPELINE` unset); the gdl form is `DYN_LOCAL_PIPELINE=gdl`. The engine
 rows are the test engines alone, so a pipeline's own cost is its row minus its engine's row.
 Needs `valgrind` and `jq`.
@@ -127,21 +127,30 @@ lib/llm/benches/hotpath.sh > table.txt              # the table
 lib/llm/benches/hotpath.sh --base table.txt         # the table, and each row's change
 ```
 
-Per request, `allocs` and `instr` are at 1 item, and `allocs/item` and `instr/item` are the
-cost of each item after the first: `(count at 16 items - count at 1 item) / 15`. `allocs@16`
-and `instr@16` are the counts at 16 items, and `range` is the lowest and highest allocations
-of one request, at 1 and at 16 items. For the embeddings rows, an item is an input.
+Per request, `allocs`, `instr` and `memcpy` are at 1 item, and `allocs/item`, `instr/item` and
+`memcpy/item` are the cost of each item after the first:
+`(count at 16 items - count at 1 item) / 15`. `allocs@16`, `instr@16` and `memcpy@16` are the
+counts at 16 items, and `range` is the lowest and highest allocations of one request, at 1 and
+at 16 items. For the embeddings rows, an item is an input.
+
+`memcpy` counts the calls to glibc's `memcpy` and `memmove` (any of their names, such as
+`__GI_memcpy` on aarch64 or `__memmove_avx_unaligned_erms` on x86_64) from functions that are
+not themselves one. Each call is a move of a large value that the compiler did not elide: a
+stream item is about 1 KB, and a stage that takes it by value and returns it moves it two or
+three times. One such move costs 100 to 200 instructions, less than the per-item instruction
+tolerance, so this column, not `instr/item`, is the guard against moves coming back. The count
+is the same in every run of one build.
 
 A dynamo row's allocations are its typical request's. A gdl row's are its highest request's:
 at gdl `79bcc11d`, under CPU load, some gdl requests make 2 allocations fewer in their window,
 so the typical count moves between runs. `range` shows how far.
 
 With `--base`, the script marks a row `RISE` when the default path got worse and `WORSE` when a
-gdl row did, and exits 1 if it marked any row. A row gets worse when its allocations at 1 or at
-16 items rise at all, or when its instructions rise by more than the tolerance (see below). It
-compares the raw counts, not the rounded per-item figures.
+gdl row did, and exits 1 if it marked any row. A row gets worse when its allocations or `memcpy`
+calls at 1 or at 16 items rise at all, or when its instructions rise by more than the tolerance
+(see below). It compares the raw counts, not the rounded per-item figures.
 
-The table's first line is its provenance: `# hotpath format=2 arch=x86_64 gdl=<rev>
+The table's first line is its provenance: `# hotpath format=3 arch=x86_64 gdl=<rev>
 commit=<rev>`. One strict parser reads the base and the new table, and fails the run before
 any valgrind run on any line it cannot read in full: a stray line, a non-number in a count, a
 missing, extra or repeated row, or a base with another table format or arch. A base it could
@@ -182,7 +191,8 @@ The same binaries check allocations without valgrind:
 
 ### Spread and tolerance
 
-Allocations do not vary: every run gives the same count. Instructions vary a little, and only
+Allocations and `memcpy` calls do not vary: every run gives the same count (for `memcpy`, two
+runs each of `a`, `a-gdl` and `b-gdl` at 1 and 16 items on aarch64). Instructions vary a little, and only
 upwards: a thread that spins or parks once more adds instructions. Two builds of unchanged
 request-path code (one with an extra log line in setup code, built from another path) give the
 same lowest count within 0.25% for every row.

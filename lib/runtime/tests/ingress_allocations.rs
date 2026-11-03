@@ -14,8 +14,8 @@
 //! counted. The test fails when a count rises above its ceiling.
 //!
 //! Run: `cargo test -p dynamo-runtime --test ingress_allocations`. For
-//! instructions per request, `lib/llm/benches/callgrind.sh` and `hotpath.sh`
-//! run this binary under callgrind as
+//! instructions and `memcpy` calls per request, `lib/llm/benches/callgrind.sh`
+//! and `hotpath.sh` run this binary under callgrind as
 //! `ingress_allocations row ingress <items> <requests>`. Callgrind counts only
 //! the measured requests, between two client requests, and not the system
 //! allocator or the peer's thread.

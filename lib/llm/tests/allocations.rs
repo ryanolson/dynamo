@@ -75,12 +75,13 @@
 //! request, the same on both local pipelines. `a` and `embed`, which have no Migration, do not
 //! make it.
 //!
-//! Run: `cargo test -p dynamo-llm --test allocations`. For instructions per request, see
-//! `lib/llm/benches/callgrind.sh` and `hotpath.sh`, which run this binary under callgrind as
-//! `allocations row <row> <items> <requests>`. Callgrind counts only the measured requests: the
-//! binary asks it for one dump after warm-up and one after the last measured request (see
-//! `lib/runtime/tests/common/callgrind.rs`). Callgrind does not count the system allocator,
-//! whose cost follows its heap state, nor this thread while it waits at the end of a window.
+//! Run: `cargo test -p dynamo-llm --test allocations`. For instructions and `memcpy` calls per
+//! request, see `lib/llm/benches/callgrind.sh` and `hotpath.sh`, which run this binary under
+//! callgrind as `allocations row <row> <items> <requests>`. Callgrind counts only the measured
+//! requests: the binary asks it for one dump after warm-up and one after the last measured
+//! request (see `lib/runtime/tests/common/callgrind.rs`). Callgrind does not count the system
+//! allocator, whose cost follows its heap state, nor this thread while it waits at the end of a
+//! window.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;

@@ -11,8 +11,8 @@
 #   row also shows its change, and the script marks
 #     RISE   a default-path row (form dynamo, or a stand-in engine) that got worse,
 #     WORSE  a gdl row that got worse,
-#   and exits 1 if it marked any row. "Worse" means any rise in allocations, or a rise in
-#   instructions above the row's tolerance (below).
+#   and exits 1 if it marked any row. "Worse" means any rise in allocations or memcpy calls, or
+#   a rise in instructions above the row's tolerance (below).
 #   The environment variables of callgrind.sh apply, and HOTPATH_RUNS (below).
 #
 # The table's first line is its provenance: "# hotpath format=N arch=A gdl=REV commit=REV".
@@ -24,9 +24,11 @@
 # not checked.
 #
 # Columns, per request:
-#   allocs, instr            at 1 item
-#   allocs/item, instr/item  each extra item: (count at 16 items - count at 1 item) / 15
-#   allocs@16, instr@16      at 16 items; the comparison uses these, not the rounded per-item
+#   allocs, instr, memcpy    at 1 item
+#   allocs/item, instr/item, memcpy/item
+#                            each extra item: (count at 16 items - count at 1 item) / 15
+#   allocs@16, instr@16, memcpy@16
+#                            at 16 items; the comparison uses these, not the rounded per-item
 #   range                    the lowest and highest allocations of a single request, at 1 and
 #                            at 16 items
 # For the embeddings rows, an item is an input; their stream has one item for any number.
@@ -34,14 +36,19 @@
 # a gdl request can lose an allocation or two from its window, so its typical count moves
 # between runs.
 #
+# memcpy is the calls to memcpy and memmove (see callgrind.sh): each one is a move of a large
+# value, such as a stream item, that the compiler did not elide. One more move per item costs
+# fewer instructions than the per-item tolerance, so this column is the guard against it.
+#
 # Instructions per request vary a little between runs of one binary (see the README). A rise
 # counts only above the row's tolerance: the larger of a share of the base (the table below,
 # per request and per item) and a floor, HOTPATH_FLOOR instructions per request (default 300)
-# and HOTPATH_ITEM_FLOOR per item (default 50). Allocations do not vary and have no tolerance.
+# and HOTPATH_ITEM_FLOOR per item (default 50). Allocations and memcpy calls do not vary and
+# have no tolerance.
 #
 # HOTPATH_RUNS runs every row that many times (default 1) and keeps the lowest instruction
-# count. The variation only adds instructions (a thread that spins or parks once more), so the
-# lowest of a few runs is the closest to the request's own cost.
+# count, and the highest memcpy count. The variation only adds instructions (a thread that spins
+# or parks once more), so the lowest of a few runs is the closest to the request's own cost.
 
 set -euo pipefail
 
@@ -81,7 +88,7 @@ ingress dynamo ingress 1 2"
 runs=${HOTPATH_RUNS:-1}
 
 # Provenance of this run. Bump `format` whenever a column changes.
-format=2
+format=3
 repo=$(cd "$(dirname "$0")/../../.." && pwd)
 arch=$(uname -m)
 commit=$(git -C "$repo" rev-parse --short=12 HEAD 2>/dev/null) || commit=unknown
@@ -99,7 +106,7 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/hotpath.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 
 # Reads one table strictly. Prints "prov FORMAT ARCH GDL COMMIT", then one
-# "row PIPELINE FORM ALLOCS ALLOCS@16 INSTR INSTR@16" per row. Fails, naming the file and line,
+# "row PIPELINE FORM ALLOCS ALLOCS@16 INSTR INSTR@16 MEMCPY MEMCPY@16" per row. Fails, naming the file and line,
 # on anything else. Every count it prints matched a whole-number pattern, so no count comes from
 # awk's reading of a number at the start of a field.
 parse_table() {
@@ -117,12 +124,14 @@ parse_table() {
         }
         num = "[0-9]+"; dec = "-?[0-9]+[.][0-9][0-9]"; whole = "-?[0-9]+"; chg = "[+-]?[0-9]+"
         range = num "[.][.]" num "," num "[.][.]" num
-        row = "^[^ ]+ +[^ ]+ +" num " +" dec " +" num " +" whole " +" num " +" num " +" range
-        row = row "( +" chg " +" chg " +" chg " +" chg "( +(RISE|WORSE))?)? *$"
+        row = "^[^ ]+ +[^ ]+ +" num " +" dec " +" num " +" whole " +" num " +" dec " +" num " +" num
+        row = row " +" num " +" range
+        row = row "( +" chg " +" chg " +" chg " +" chg " +" chg " +" chg "( +(RISE|WORSE))?)? *$"
         prov_re = "^# hotpath format=[0-9]+ arch=[^ ]+ gdl=[^ ]+ commit=[^ ]+$"
         base_re = "^# base format=[0-9]+ arch=[^ ]+ gdl=[^ ]+ commit=[^ ]+$"
-        header_re = "^pipeline +form +allocs +allocs/item +instr +instr/item +allocs@16 +instr@16 +range"
-        header_re = header_re "( +change +allocs@16 +instr +instr/item +mark)? *$"
+        header_re = "^pipeline +form +allocs +allocs/item +instr +instr/item +memcpy +memcpy/item"
+        header_re = header_re " +allocs@16 +instr@16 +memcpy@16 +range"
+        header_re = header_re "( +change +allocs@16 +instr +instr/item +memcpy +memcpy@16 +mark)? *$"
     }
     /^$/ { next }
     $0 ~ prov_re {
@@ -148,7 +157,7 @@ parse_table() {
         if (!(key in want)) bad("no such row in the table: " key)
         if (key in seen) bad("a second row for " key)
         seen[key] = 1
-        print "row", $1, $2, $3, $7, $5, $8
+        print "row", $1, $2, $3, $9, $5, $10, $7, $11
         next
     }
     { bad("not a line of the table: " $0) }
@@ -196,18 +205,19 @@ done
     function hi(r) { split(r, p, "[.][.]"); return p[2] + 0 }
     NR == 1 { next }
     # Over repeated runs: the highest typical allocations, the lowest and highest single
-    # request, and the lowest instructions.
+    # request, the lowest instructions and the highest memcpy calls.
     {
-        if ($0 !~ /^[^ ]+ +(1|16) +[0-9]+ +[0-9]+ +[0-9]+[.][.][0-9]+$/) bad("not a count line: " $0)
+        if ($0 !~ /^[^ ]+ +(1|16) +[0-9]+ +[0-9]+ +[0-9]+ +[0-9]+[.][.][0-9]+$/) bad("not a count line: " $0)
         k = $1 SUBSEP $2
         if (!(k in instr) || $4 + 0 < instr[k]) instr[k] = $4 + 0
         if (!(k in allocs) || $3 + 0 > allocs[k]) allocs[k] = $3 + 0
-        if (!(k in low) || lo($5) < low[k]) low[k] = lo($5)
-        if (!(k in high) || hi($5) > high[k]) high[k] = hi($5)
+        if (!(k in copies) || $5 + 0 > copies[k]) copies[k] = $5 + 0
+        if (!(k in low) || lo($6) < low[k]) low[k] = lo($6)
+        if (!(k in high) || hi($6) > high[k]) high[k] = hi($6)
     }
     END {
         if (failed) exit 1
-        printf "%-12s %-6s %7s %11s %9s %10s %9s %10s  %-19s\n", "pipeline", "form", "allocs", "allocs/item", "instr", "instr/item", "allocs@16", "instr@16", "range"
+        printf "%-12s %-6s %7s %11s %9s %10s %6s %11s %9s %10s %9s  %-19s\n", "pipeline", "form", "allocs", "allocs/item", "instr", "instr/item", "memcpy", "memcpy/item", "allocs@16", "instr@16", "memcpy@16", "range"
         nrows = split(table_rows, lines, "\n")
         for (i = 1; i <= nrows; i++) {
             split(lines[i], f, " ")
@@ -225,8 +235,9 @@ done
                 a = allocs[row, 1]; a16 = allocs[row, 16]
             }
             r = instr[row, 1]; r16 = instr[row, 16]
-            printf "%-12s %-6s %7d %11.2f %9d %10.0f %9d %10d  %-19s\n", pipeline, form,
-                a, (a16 - a) / 15, r, (r16 - r) / 15, a16, r16,
+            m = copies[row, 1]; m16 = copies[row, 16]
+            printf "%-12s %-6s %7d %11.2f %9d %10.0f %6d %11.2f %9d %10d %9d  %-19s\n", pipeline, form,
+                a, (a16 - a) / 15, r, (r16 - r) / 15, m, (m16 - m) / 15, a16, r16, m16,
                 low[row, 1] ".." high[row, 1] "," low[row, 16] ".." high[row, 16]
         }
         if (missing) exit 2
@@ -253,24 +264,31 @@ BEGIN {
         pct[f[1] " " f[2]] = f[4]; item_pct[f[1] " " f[2]] = f[5]
     }
 }
-FILENAME == ARGV[1] && $1 == "row" { key = $2 " " $3; ba[key] = $4; ba16[key] = $5; br[key] = $6; br16[key] = $7; next }
+FILENAME == ARGV[1] && $1 == "row" {
+    key = $2 " " $3; ba[key] = $4; ba16[key] = $5; br[key] = $6; br16[key] = $7
+    bm[key] = $8; bm16[key] = $9; next
+}
 FILENAME == ARGV[1] { next }
-FILENAME == ARGV[2] && $1 == "row" { key = $2 " " $3; ha[key] = $4; ha16[key] = $5; hr[key] = $6; hr16[key] = $7; next }
+FILENAME == ARGV[2] && $1 == "row" {
+    key = $2 " " $3; ha[key] = $4; ha16[key] = $5; hr[key] = $6; hr16[key] = $7
+    hm[key] = $8; hm16[key] = $9; next
+}
 FILENAME == ARGV[2] { next }
 /^# hotpath / { print; print base_prov; next }
-/^pipeline / { printf "%s  %6s %9s %8s %10s  %s\n", $0, "change", "allocs@16", "instr", "instr/item", "mark"; next }
+/^pipeline / { printf "%s  %6s %9s %8s %10s %6s %9s  %s\n", $0, "change", "allocs@16", "instr", "instr/item", "memcpy", "memcpy@16", "mark"; next }
 /^$/ { next }
 {
     key = $1 " " $2
-    a = ha[key]; a16 = ha16[key]; r = hr[key]; r16 = hr16[key]
+    a = ha[key]; a16 = ha16[key]; r = hr[key]; r16 = hr16[key]; m = hm[key]; m16 = hm16[key]
     # Per item in fifteenths: the per-item column is rounded for display.
     d = r16 - r; b_d = br16[key] - br[key]
-    worse = a > ba[key] || a16 > ba16[key] \
+    worse = a > ba[key] || a16 > ba16[key] || m > bm[key] || m16 > bm16[key] \
         || (r - br[key]) * 100 > tolerance100(br[key], pct[key], floor) \
         || (d - b_d) * 100 > tolerance100(b_d, item_pct[key], item_floor * 15)
     mark = ""
     if (worse) { mark = $2 == "gdl" ? "WORSE" : "RISE"; marked++ }
-    printf "%s  %6s %9s %8s %10s  %s\n", $0, change(a, ba[key]), change(a16, ba16[key]),
-        change(r, br[key]), sprintf("%+.0f", (d - b_d) / 15), mark
+    printf "%s  %6s %9s %8s %10s %6s %9s  %s\n", $0, change(a, ba[key]), change(a16, ba16[key]),
+        change(r, br[key]), sprintf("%+.0f", (d - b_d) / 15), change(m, bm[key]),
+        change(m16, bm16[key]), mark
 }
 END { if (marked) exit 1 }' "$work/base.parsed" "$work/head.parsed" "$work/head"
