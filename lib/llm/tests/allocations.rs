@@ -622,9 +622,7 @@ async fn measure_row(fixture: &Fixture, name: &str, items: usize, requests: usiz
 
 /// The counter itself: an empty window counts nothing, one `Box` counts one allocation.
 async fn check_counter() {
-    // The first yield inside this `block_on` allocates the runtime's deferred-waker list, and
-    // the blocking thread sets up its own state after its first job returns.
-    window(async {}).await;
+    // The first yield inside this `block_on` allocates the runtime's deferred-waker list.
     window(async {}).await;
     let (empty, ()) = window(async {}).await;
     assert_eq!(empty, Counts::default(), "an empty window allocated");
@@ -715,16 +713,25 @@ fn main() {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let fixture = Fixture::load();
-    // One blocking thread, so a window can wait for the blocking work a request leaves.
+    // One blocking thread, so a window can wait for the blocking work a request leaves. It must
+    // not exit when idle: starting a new one allocates.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .max_blocking_threads(1)
+        .thread_keep_alive(std::time::Duration::from_secs(24 * 3600))
         .build()
         .expect("runtime");
     rt.block_on(run(&fixture, &args));
 }
 
 async fn run(fixture: &Fixture, args: &[String]) {
+    // Start the blocking thread and let it go idle once. Its first wait sets up parking_lot's
+    // per-thread data, and that would land in whichever window is open at the time.
+    tokio::task::spawn_blocking(|| ())
+        .await
+        .expect("blocking pool");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
     if args.first().map(String::as_str) == Some("row") {
         let name = args.get(1).expect("row");
         let items: usize = args.get(2).expect("items").parse().expect("items");
