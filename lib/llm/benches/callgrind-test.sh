@@ -368,6 +368,24 @@ else
     fi
 fi
 
+# A tab inside a row token must not shift unchecked fields into the parsed counts.
+awk '
+    $1 == "B" && $2 == "dynamo" {
+        print "B\tdynamo 3 2 1010.00 1010 18 1160 1160 2..2,17..17"
+        next
+    }
+    { print }
+' "$work/base" >"$work/tab-row-base"
+FAKE_RISE_ROW=b FAKE_RISE_ALLOCS=1 \
+    run "$here/hotpath.sh" --base "$work/tab-row-base"
+if [[ $status -eq 0 ]]; then
+    fail base-tab-row "accepted a tabbed row and hid B dynamo allocation rises from 2 to 3 and 17 to 18"
+elif grep -q 'callgrind output:' "$work/stderr"; then
+    fail base-tab-row "ran callgrind before rejecting a row with shifted fields"
+else
+    echo "ok hotpath.sh base-tab-row"
+fi
+
 if ((failures > 0)); then
     echo "$failures failed" >&2
     exit 1
