@@ -51,7 +51,7 @@ instructions() {
     local row=$1 items=$2 n=$3
     local out="$out_dir/$row-$items-$n.out"
     valgrind --tool=callgrind --callgrind-out-file="$out" \
-        "$bin" callgrind "$row" "$items" "$n" >/dev/null 2>"$out.log"
+        "$bin" row "$row" "$items" "$n" >/dev/null 2>"$out.log"
     awk '/^(summary|totals):/ { print $2; exit }' "$out"
 }
 

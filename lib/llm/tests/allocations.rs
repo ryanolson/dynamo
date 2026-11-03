@@ -33,8 +33,10 @@
 //! Counting: a global allocator counts calls to `alloc`, `alloc_zeroed` and `realloc`, and the
 //! bytes they ask for, on every thread while a window is open. Tokenization runs on tokio's
 //! blocking pool, so the rows count all threads. The runtime is current-thread, so the preprocessor renders the template inline
-//! where the multi-thread frontend uses `block_in_place`. No tracing subscriber is installed,
-//! and `main` removes every `DYN_` variable so the shell cannot change the path.
+//! where the multi-thread frontend uses `block_in_place`, and it has one blocking thread, so a
+//! window can wait for the blocking work a request leaves. No tracing subscriber is installed.
+//! `main` removes every `DYN_` variable and `TOKENIZERS_PARALLELISM`, and sets
+//! `RAYON_NUM_THREADS=4`, so neither the shell nor the host's core count changes the counts.
 //!
 //! Measured on a 20-core Linux host, Rust 1.99.0, 200 requests after 50 of warm-up, for the
 //! typical request. Debug and release builds give the same numbers:
@@ -52,7 +54,7 @@
 //! carries the request from Migration (`RetryManager::new_stream`) to the next stage.
 //!
 //! Run: `cargo test -p dynamo-llm --test allocations`. For instructions per request, see
-//! `lib/llm/benches/callgrind.sh`, which runs this binary as `allocations callgrind <row> <items> <requests>`.
+//! `lib/llm/benches/callgrind.sh`, which runs this binary as `allocations row <row> <items> <requests>`.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -118,6 +120,8 @@ static OFF_THREAD_BYTES: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static MEASURING: Cell<bool> = const { Cell::new(false) };
+    /// Set while the window itself allocates on the measuring thread.
+    static HARNESS: Cell<bool> = const { Cell::new(false) };
 }
 
 struct Counting;
@@ -128,6 +132,9 @@ impl Counting {
             return;
         }
         // `try_with` because the allocator also runs while thread-locals are torn down.
+        if HARNESS.try_with(Cell::get).unwrap_or(false) {
+            return;
+        }
         let on_thread = MEASURING.try_with(Cell::get).unwrap_or(false);
         let (allocs, bytes) = if on_thread {
             (&ON_THREAD_ALLOCS, &ON_THREAD_BYTES)
@@ -227,18 +234,36 @@ async fn window<F: std::future::Future>(body: F) -> (Counts, F::Output) {
     OPEN.store(true, Ordering::SeqCst);
     let out = body.await;
     let settle_start = std::time::Instant::now();
+    let settled = || settle_start.elapsed() < std::time::Duration::from_secs(5);
     loop {
         // Each yield also polls the I/O driver, so tasks waiting on a socket make progress.
         tokio::task::yield_now().await;
         let alive = runtime.num_alive_tasks();
-        if alive <= tasks_before {
+        if alive > tasks_before {
+            assert!(
+                settled(),
+                "a request left {} tasks running",
+                alive - tasks_before
+            );
+            continue;
+        }
+        // `num_alive_tasks` does not see blocking jobs. The runtime has one blocking thread, so
+        // a no-op job finishes only after every job queued before it. Spawning it allocates on
+        // this thread; that is the harness's cost, not the request's.
+        HARNESS.with(|h| h.set(true));
+        let barrier = tokio::task::spawn_blocking(|| ());
+        HARNESS.with(|h| h.set(false));
+        while !barrier.is_finished() {
+            assert!(settled(), "a request left blocking work running");
+            tokio::task::yield_now().await;
+        }
+        HARNESS.with(|h| h.set(true));
+        drop(barrier);
+        HARNESS.with(|h| h.set(false));
+        // The blocking work may have spawned tasks of its own.
+        if runtime.num_alive_tasks() <= tasks_before {
             break;
         }
-        assert!(
-            settle_start.elapsed() < std::time::Duration::from_secs(5),
-            "a request left {} tasks running",
-            alive - tasks_before
-        );
     }
     OPEN.store(false, Ordering::SeqCst);
     MEASURING.with(|m| m.set(false));
@@ -597,7 +622,9 @@ async fn measure_row(fixture: &Fixture, name: &str, items: usize, requests: usiz
 
 /// The counter itself: an empty window counts nothing, one `Box` counts one allocation.
 async fn check_counter() {
-    // The first yield inside this `block_on` allocates the runtime's deferred-waker list.
+    // The first yield inside this `block_on` allocates the runtime's deferred-waker list, and
+    // the blocking thread sets up its own state after its first job returns.
+    window(async {}).await;
     window(async {}).await;
     let (empty, ()) = window(async {}).await;
     assert_eq!(empty, Counts::default(), "an empty window allocated");
@@ -609,6 +636,49 @@ async fn check_counter() {
         (one.on_allocs, one.on_bytes, one.off_allocs),
         (1, 8, 0),
         "one Box::new<u64> must count one allocation of 8 bytes"
+    );
+
+    // Blocking work a request leaves behind counts in that request's window.
+    let (detached, ()) = window(async {
+        drop(tokio::task::spawn_blocking(|| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::hint::black_box(Box::new(7u64));
+        }));
+    })
+    .await;
+    assert_eq!(
+        (detached.off_allocs, detached.off_bytes),
+        (1, 8),
+        "a detached blocking job's allocation must count in its window"
+    );
+}
+
+/// The counts must not depend on the caller's environment or on the host's core count: run one
+/// row in a child process with tokenizer parallelism set explicitly and an odd rayon thread
+/// count, and compare it with the record.
+fn check_environment() {
+    let (name, items) = ("embed", 16);
+    let output = std::process::Command::new(std::env::current_exe().expect("current exe"))
+        .args(["row", name, &items.to_string(), "50"])
+        .env("TOKENIZERS_PARALLELISM", "true")
+        .env("RAYON_NUM_THREADS", "3")
+        .output()
+        .expect("run child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "child failed: {stdout}");
+    let allocs: u64 = stdout
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix("allocs="))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no allocs= in child output: {stdout}"));
+    let row = BASELINE
+        .iter()
+        .find(|r| r.name == name && r.items == items)
+        .expect("recorded row");
+    assert_eq!(
+        allocs, row.allocs,
+        "{name} items={items} in another environment: {allocs} allocations, recorded {}",
+        row.allocs
     );
 }
 
@@ -628,26 +698,34 @@ const ROWS: &[(&str, usize)] = &[
 ];
 
 fn main() {
+    // Pin the environment that changes the path. `TOKENIZERS_PARALLELISM` unset is the
+    // frontend's default; spelling it out costs an allocation per encode, where the tokenizer
+    // reads it. A batch encode splits across rayon threads, and one thread splits it differently,
+    // so a fixed count keeps the embeddings rows the same on every host.
     // SAFETY: no other thread exists yet.
     for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("DYN_") {
+        let key_str = key.to_string_lossy();
+        if key_str.starts_with("DYN_") || key_str == "TOKENIZERS_PARALLELISM" {
             unsafe { std::env::remove_var(&key) };
         }
     }
+    unsafe { std::env::set_var("RAYON_NUM_THREADS", "4") };
     // The test runs from the crate directory; the callgrind script may not.
     std::env::set_current_dir(env!("CARGO_MANIFEST_DIR")).expect("crate dir");
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let fixture = Fixture::load();
+    // One blocking thread, so a window can wait for the blocking work a request leaves.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
+        .max_blocking_threads(1)
         .build()
         .expect("runtime");
     rt.block_on(run(&fixture, &args));
 }
 
 async fn run(fixture: &Fixture, args: &[String]) {
-    if args.first().map(String::as_str) == Some("callgrind") {
+    if args.first().map(String::as_str) == Some("row") {
         let name = args.get(1).expect("row");
         let items: usize = args.get(2).expect("items").parse().expect("items");
         let requests: usize = args.get(3).expect("requests").parse().expect("requests");
@@ -656,6 +734,7 @@ async fn run(fixture: &Fixture, args: &[String]) {
     }
 
     check_counter().await;
+    check_environment();
     let mut failures = Vec::new();
     for &(name, items) in ROWS {
         let measured = measure_row(fixture, name, items, REQUESTS).await;
