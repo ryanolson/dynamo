@@ -43,10 +43,9 @@ impl CxBridge {
         }));
         // `link_child` does not replay what already happened to `context`.
         // Checked after linking, so a signal that lands in between reaches
-        // the `Cx` one way or the other; both are idempotent. Except one under
-        // way: Dynamo's controller tells its children before it publishes the
-        // state, so a `Cx` linked in between misses it (`tests/races.rs`).
-        // Every `link_child` has this window, Migration's included.
+        // the `Cx` one way or the other; both are idempotent. A signal under
+        // way is seen too: Dynamo's controller publishes its state before it
+        // tells its children (`tests/races.rs`).
         if context.is_killed() {
             cx.cancel();
         } else if context.is_stopped() {
@@ -87,13 +86,11 @@ impl CxBridge {
 
 /// Forward `cx`'s stop and cancel to `target` until `released` resolves.
 ///
-/// Dynamo's controller lets a stop replace a kill, so a forwarded stop must
-/// not land after one. A kill can arrive from anywhere while the stop is
-/// being sent; `killed` is a child of `target`, which the controller tells
-/// before it publishes the kill, so a kill it saw is sent again after the
-/// stop. Until then the context reads as stopped, not killed
-/// (`tests/races.rs`); only a controller that keeps a kill once set closes
-/// that window.
+/// A kill can arrive from anywhere while the stop is being sent. Dynamo's
+/// controller keeps a kill once set, so the stop cannot replace it
+/// (`tests/races.rs`). `killed`, a child of `target`, still sends a kill it
+/// saw again after the stop; Dynamo's controller keeps its state and tells
+/// its children again.
 async fn forward(
     cx: Cx,
     target: Weak<dyn AsyncEngineContext>,
@@ -127,9 +124,9 @@ async fn forward(
     }
 }
 
-/// Whether a Dynamo controller has been killed, as a child it tells before
-/// it publishes the kill. A controller calls only a child's stop and kill, so
-/// the waits never resolve.
+/// Whether a Dynamo controller has been killed, as a child it tells of the
+/// kill. A controller calls only a child's stop and kill, so the waits never
+/// resolve.
 #[derive(Debug, Default)]
 struct KillLatch(AtomicBool);
 
@@ -295,10 +292,10 @@ mod tests {
         assert!(cx.is_cancelled());
         assert!(request.context().is_killed());
 
-        // Dynamo's controller lets a later stop replace its kill; the `Cx`
-        // keeps it.
+        // A later stop leaves the kill in place, in the controller and the `Cx`.
         request.context().stop_generating();
         assert!(cx.is_cancelled());
+        assert!(request.context().is_killed());
     }
 
     #[test]

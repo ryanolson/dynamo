@@ -155,8 +155,9 @@ pub trait AsyncEngineContext: Send + Sync + Debug {
 
     /// Links child AsyncEngineContext to this AsyncEngineContext. If the `stop_generating`, `stop`
     /// or `kill` on this AsyncEngineContext is called, the same method is called on all linked
-    /// child AsyncEngineContext, in the order they are linked, and then the method on this
-    /// AsyncEngineContext continues.
+    /// child AsyncEngineContext, in the order they are linked. Dynamo's `Controller` publishes its
+    /// own new state before it tells the children, so a child linked while a signal is under way
+    /// is either told, or reads the new state when it checks the Controller after linking.
     fn link_child(&self, child: Arc<dyn AsyncEngineContext>);
 
     /// Retain request-scoped state until the engine context is dropped.
