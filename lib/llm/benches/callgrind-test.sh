@@ -54,7 +54,8 @@ args=("$@")
 row=${args[$# - 3]} items=${args[$# - 2]}
 allocs=$((${#row} + items))
 per=$((1000 * ${#row} + 10 * items))
-if [[ $row == "${FAKE_RISE_ROW:-}" ]]; then
+if [[ $row == "${FAKE_RISE_ROW:-}" ]] \
+    && [[ -z ${FAKE_RISE_ITEMS:-} || $items == "$FAKE_RISE_ITEMS" ]]; then
     allocs=$((allocs + ${FAKE_RISE_ALLOCS:-0}))
     per=$((per + ${FAKE_RISE_INSTR:-0}))
 fi
@@ -203,6 +204,21 @@ if [[ $status -eq 0 ]]; then
     fail table-fail "exit status 0 with no window dumps"
 else
     echo "ok hotpath.sh table-fail"
+fi
+
+# A one-allocation rise at 16 items must survive the displayed slope's rounding.
+FAKE_RISE_ROW=b FAKE_RISE_ITEMS=16 FAKE_RISE_ALLOCS=1 run "$here/hotpath.sh"
+if [[ $status -ne 0 ]]; then
+    fail item-allocations-base "exit status $status, want 0"
+else
+    cp "$work/stdout" "$work/item-base"
+    FAKE_RISE_ROW=b FAKE_RISE_ITEMS=16 FAKE_RISE_ALLOCS=2 \
+        run "$here/hotpath.sh" --base "$work/item-base"
+    if [[ $status -ne 1 ]] || ! grep -Eq '^B +dynamo .* RISE$' "$work/stdout"; then
+        fail item-allocations "16-item allocations rose from 18 to 19, want exit 1 and RISE on B dynamo"
+    else
+        echo "ok hotpath.sh item-allocations"
+    fi
 fi
 
 if ((failures > 0)); then
