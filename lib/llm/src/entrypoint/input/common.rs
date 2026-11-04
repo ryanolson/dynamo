@@ -601,7 +601,7 @@ where
 }
 
 /// Build the embeddings pipeline: preprocessor, then backend, then `engine`, composed on
-/// `local_pipeline`.
+/// `local_pipeline`. The gdl pipeline has no backend (see [`compose_gdl_embeddings_pipeline`]).
 ///
 /// The caller builds `preprocessor` (`OpenAIPreprocessor::new_for_embeddings`), so a card it
 /// cannot serve fails before the caller creates `engine`.
@@ -615,13 +615,8 @@ pub fn build_embeddings_pipeline(
     // Transition: remove when the gdl pipeline is the only local pipeline.
     local_pipeline: LocalPipeline,
 ) -> anyhow::Result<OpenAIEmbeddingsStreamingEngine> {
-    let backend = Backend::from_mdc(card);
     if local_pipeline == LocalPipeline::Gdl {
-        return Ok(compose_gdl_embeddings_pipeline(
-            preprocessor,
-            backend,
-            engine,
-        ));
+        return Ok(compose_gdl_embeddings_pipeline(preprocessor, engine));
     }
 
     // Transition: remove when the gdl pipeline is the only local pipeline.
@@ -630,7 +625,7 @@ pub fn build_embeddings_pipeline(
         ManyOut<Annotated<NvCreateEmbeddingResponse>>,
     >::new();
     let preprocessor = preprocessor.into_operator();
-    let backend = backend.into_operator();
+    let backend = Backend::from_mdc(card).into_operator();
     let service_backend = ServiceBackend::from_engine(engine);
 
     Ok(frontend
@@ -642,30 +637,24 @@ pub fn build_embeddings_pipeline(
         .link_terminal(frontend)?)
 }
 
-/// [`build_embeddings_pipeline`]'s chain as a gdl local pipeline, built from the terminal up
-/// as [`PreprocessedRouting::build_pipeline`]'s is. The preprocessor and Backend are native
-/// gdl operators.
+/// [`build_embeddings_pipeline`]'s chain as a gdl local pipeline: the preprocessor, a native
+/// gdl operator, over `engine`. Backend passes an embeddings response through unchanged, so the
+/// gdl chain has none.
 fn compose_gdl_embeddings_pipeline(
     preprocessor: Arc<OpenAIPreprocessor>,
-    backend: Arc<Backend>,
     engine: ServiceEngine<
         SingleIn<PreprocessedEmbeddingRequest>,
         ManyOut<Annotated<EmbeddingsEngineOutput>>,
     >,
 ) -> OpenAIEmbeddingsStreamingEngine {
     use gdl::{Hop, OperatorStage, SinkStage};
-    type Pre = PreprocessedEmbeddingRequest;
     type Req = NvCreateEmbeddingRequest;
     type Resp = NvCreateEmbeddingResponse;
 
     let router = SinkStage::new(Arc::new(EngineSink::new(engine)));
-    let backend = OperatorStage::new(
-        Arc::new(GdlOperator::<_, Pre>::new(backend)),
-        Hop::new((), router, ()),
-    );
     let preprocessor = OperatorStage::new(
         Arc::new(GdlOperator::<_, Req>::new(preprocessor)),
-        Hop::new((), backend, ()),
+        Hop::new((), router, ()),
     );
     Arc::new(PipelineEngine::<_, Req, Resp>::for_dynamo_stages(
         gdl::Source::new(Hop::new((), preprocessor, ())),

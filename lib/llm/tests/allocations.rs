@@ -18,7 +18,7 @@
 //! | `c-gdl` | `c` composed as a gdl local pipeline | test LLM engine, in place of `RoutingHost`, through `EngineSink` |
 //! | `embed-engine` | the test embeddings engine, called directly | itself |
 //! | `embed` | `build_embeddings_pipeline`: preprocessor, backend | test embeddings engine, in place of `PushRouter` |
-//! | `embeddings-gdl` | `embed` composed as a gdl local pipeline | test embeddings engine, in place of `PushRouter` |
+//! | `embeddings-gdl` | `embed` composed as a gdl local pipeline, without the backend (a pass-through for embeddings) | test embeddings engine, in place of `PushRouter` |
 //!
 //! The second number of a row is stream items: 1 and 16. For the embeddings rows it is
 //! inputs per request instead, because an embeddings stream carries one item for any number of
@@ -58,19 +58,18 @@
 //! | `c-gdl` | 46 | 53,612 | 61 | 53,672 |
 //! | `embed-engine` | 8 | 6,548 | 23 | 88,868 |
 //! | `embed` | 199 | 44,438 | 2,283 | 529,886 |
-//! | `embeddings-gdl` | 184 | 44,431 | 2,268 | 529,879 |
+//! | `embeddings-gdl` | 180 | 42,407 | 2,264 | 527,855 |
 //!
 //! Each gdl row differs from its dynamo row by the same number of allocations at both item
-//! counts, so nothing per item: `a-gdl` −20, `b-gdl` −48, `c-gdl` −25, `embeddings-gdl` −15.
+//! counts, so nothing per item: `a-gdl` −20, `b-gdl` −48, `c-gdl` −25, `embeddings-gdl` −19.
 //! `lib/gdl-adapters/tests/allocations.rs` measures the parts in isolation: 14 allocations
 //! for a `link` stage, 5 for a native gdl operator, and 21 against 19 at the boundary
 //! (`PipelineEngine` above, `EngineSink` below). Every operator in the gdl rows is native, and
 //! Backend and the chat preprocessor are around nodes of the hop below them; the test engine
 //! at the terminal enters through `EngineSink`, where the frontend's `RoutingHost` is a gdl
 //! sink of its own.
-//! Each gdl row asks for fewer bytes than its dynamo row (the `link` chain boxes a future per
-//! edge, the gdl composition one per stage); `embeddings-gdl` only 7 fewer, because its `link`
-//! futures are small.
+//! Each gdl row asks for fewer bytes than its dynamo row: the `link` chain boxes a future per
+//! edge, the gdl composition one per stage, and `embeddings-gdl` has no backend stage.
 //!
 //! The largest allocation of `b` and `c` is Migration's boxed future, 59,592 bytes per request;
 //! the largest of `b-gdl` is 18,912 bytes and of `c-gdl` 16,496 (debug build). `a` and `embed`,
@@ -148,8 +147,8 @@ const BASELINE: &[Row] = &[
     // Transition: remove when the gdl pipeline is the only local pipeline.
     row("embed", 1, 199, 44438),
     row("embed", 16, 2283, 529886),
-    row("embeddings-gdl", 1, 184, 44431),
-    row("embeddings-gdl", 16, 2268, 529879),
+    row("embeddings-gdl", 1, 180, 42407),
+    row("embeddings-gdl", 16, 2264, 527855),
 ];
 
 #[global_allocator]

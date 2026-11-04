@@ -963,6 +963,8 @@ impl
     }
 }
 
+/// Embeddings give the same response on Dynamo's chain, with Backend, and on gdl's, without
+/// it: Backend passes an embeddings response through unchanged.
 #[tokio::test]
 async fn embeddings_are_the_same_both_ways() {
     let fixture = Fixture::load();
@@ -976,9 +978,10 @@ async fn embeddings_are_the_same_both_ways() {
         preprocessor.clone(),
         linked::<_, _, EmbeddingsEngineOutput, _, _>(backend.clone(), terminal.clone()),
     );
+    // The gdl chain has no Backend, a pass-through for embeddings, as the frontend composes it.
     let gdl = pipeline(native::<_, NvCreateEmbeddingRequest, _>(
         preprocessor,
-        native::<_, PreprocessedEmbeddingRequest, _>(backend, sink(terminal)),
+        sink(terminal),
     ));
     for format in [serde_json::json!("float"), serde_json::json!("base64")] {
         let make = || {

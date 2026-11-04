@@ -824,6 +824,7 @@ fn backend_output(output: Annotated<LLMEngineOutput>) -> Annotated<BackendOutput
     }
 }
 
+// A pass-through, so the gdl embeddings pipeline has no Backend.
 // Transition: remove when the gdl pipeline is the only local pipeline.
 #[async_trait]
 impl
@@ -852,26 +853,6 @@ impl
         // - Usage statistics validation
 
         Ok(response_stream)
-    }
-}
-
-/// As the Dynamo operator above, a pass-through: the response is the stage below's own.
-impl gdl::Operator for GdlOperator<Backend, PreprocessedEmbeddingRequest> {
-    type UpReq = SingleIn<PreprocessedEmbeddingRequest>;
-    type UpItem = Annotated<EmbeddingsEngineOutput>;
-    type DownReq = SingleIn<PreprocessedEmbeddingRequest>;
-    type DownItem = Annotated<EmbeddingsEngineOutput>;
-
-    async fn generate<N>(
-        &self,
-        cx: gdl::Cx,
-        request: SingleIn<PreprocessedEmbeddingRequest>,
-        next: N,
-    ) -> gdl::Result<gdl::Items<Annotated<EmbeddingsEngineOutput>>>
-    where
-        N: gdl::Next<SingleIn<PreprocessedEmbeddingRequest>, Annotated<EmbeddingsEngineOutput>>,
-    {
-        next.generate(cx, request).await
     }
 }
 
