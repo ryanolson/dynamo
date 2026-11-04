@@ -13,6 +13,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use dynamo_gdl_adapters::{Boxed, Carried};
 use dynamo_kv_router::{
     PrefillLoadEstimator, conditional_disagg::ConditionalDisaggPolicy,
     config::RouterConfigOverride, protocols::RoutingConstraints,
@@ -429,38 +430,42 @@ impl
 }
 
 impl gdl::Operator for GdlOperator<PrefillRouter, PreprocessedRequest> {
-    type UpReq = SingleIn<PreprocessedRequest>;
+    type UpReq = Boxed<PreprocessedRequest>;
     type UpItem = Annotated<LLMEngineOutput>;
-    type DownReq = SingleIn<PreprocessedRequest>;
+    type DownReq = Boxed<PreprocessedRequest>;
     type DownItem = Annotated<LLMEngineOutput>;
 
     fn generate<N>(
         &self,
         cx: gdl::Cx,
-        request: SingleIn<PreprocessedRequest>,
+        mut request: Boxed<PreprocessedRequest>,
         next: N,
     ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<LLMEngineOutput>>>> + Send
     where
-        N: gdl::Next<SingleIn<PreprocessedRequest>, Annotated<LLMEngineOutput>>,
+        N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<LLMEngineOutput>>,
     {
         let router = Arc::clone(&self.op);
-        let next = GdlDownstream::new(cx, next);
         async move {
             let query_only = request.get_annotation_value("query_instance_id").is_some();
             // Only the remote-prefill path runs the route, in a task of its own: a request
-            // that passes through goes on here, so this future does not hold the route.
+            // that passes through goes on here, in its box, so this future does not hold the
+            // route.
             match router.gate(query_only) {
                 PrefillGate::PassThrough => {
-                    let (mut req, context) = request.into_parts();
-                    remove_bypass_marker(&mut req);
-                    next.forward(context.map(|_| req)).await
+                    remove_bypass_marker(&mut request);
+                    GdlDownstream::<_, _, PreprocessedRequest>::new(cx, next)
+                        .forward_carried(request)
+                        .await
                 }
                 PrefillGate::Pending => Err(router.reject_while_activating(request.id())),
                 // Remote prefill stages KV on the prefill worker that only the decode leg
                 // releases, and gdl drops this future when a kill cancels the request's `cx`.
                 // So the route runs as a task that the drop detaches, and its decode leg runs
-                // under a cleanup `Cx` that the kill does not cancel (`send_cleanup`).
+                // under a cleanup `Cx` that the kill does not cancel (`send_cleanup`). The
+                // route's first send goes on in this request's box.
                 gate @ PrefillGate::Prefill => {
+                    let (request, spare) = request.take();
+                    let next = GdlDownstream::with_spare(cx, next, spare);
                     detached(async move { router.route(request, next, Some(gate)).await }).await
                 }
             }

@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use dynamo_gdl_adapters::enter;
+use dynamo_gdl_adapters::{Boxed, enter};
 use dynamo_kv_router::{
     protocols::{TokensWithHashes, WorkerConfigLike, WorkerWithDpRank},
     scheduling::{AbortCause, KvSchedulerError},
@@ -739,13 +739,13 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
 /// engine. The sink's `cx` does not: gdl cancels it whenever its attempt ends, also when the
 /// response ends normally. An eager error enters gdl with the host's error as its source.
 impl gdl::Sink for RoutingHost {
-    type Req = SingleIn<PreprocessedRequest>;
+    type Req = Boxed<PreprocessedRequest>;
     type Item = Annotated<LLMEngineOutput>;
 
     fn generate(
         &self,
         _cx: gdl::Cx,
-        request: SingleIn<PreprocessedRequest>,
+        request: Boxed<PreprocessedRequest>,
     ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<LLMEngineOutput>>>> + Send {
         // On the heap, as the host's Dynamo engine has it, for the same one allocation. Held
         // inline, the route's future is moved through each stage above it, and in a debug
@@ -754,7 +754,7 @@ impl gdl::Sink for RoutingHost {
         // Erased, it also ends the type the compiler walks to prove a routed pipeline `Send`,
         // which is deeper than the default recursion limit with the route inside it.
         let route: Pin<Box<dyn Future<Output = Result<RouteResponse, Error>> + Send + '_>> =
-            Box::pin(self.route(request));
+            Box::pin(self.route(*request));
         route.map(|result| match result {
             Ok(response) => Ok(response.into_items()),
             Err(error) => Err(enter(error)),

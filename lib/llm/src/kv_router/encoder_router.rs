@@ -29,6 +29,7 @@ use crate::protocols::common::{
     llm_backend::{LLMEngineOutput, PreprocessedRequest},
     preprocessor::TraceLink,
 };
+use dynamo_gdl_adapters::{Boxed, Carried};
 
 type EncodePushRouter = PushRouter<PreprocessedRequest, Annotated<LLMEngineOutput>>;
 
@@ -398,31 +399,35 @@ impl
 }
 
 impl gdl::Operator for GdlOperator<EncoderRouter, PreprocessedRequest> {
-    type UpReq = SingleIn<PreprocessedRequest>;
+    type UpReq = Boxed<PreprocessedRequest>;
     type UpItem = Annotated<LLMEngineOutput>;
-    type DownReq = SingleIn<PreprocessedRequest>;
+    type DownReq = Boxed<PreprocessedRequest>;
     type DownItem = Annotated<LLMEngineOutput>;
 
     fn generate<N>(
         &self,
         cx: gdl::Cx,
-        request: SingleIn<PreprocessedRequest>,
+        request: Boxed<PreprocessedRequest>,
         next: N,
     ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<LLMEngineOutput>>>> + Send
     where
-        N: gdl::Next<SingleIn<PreprocessedRequest>, Annotated<LLMEngineOutput>>,
+        N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<LLMEngineOutput>>,
     {
         let router = Arc::clone(&self.op);
-        let next = GdlDownstream::new(cx, next);
         async move {
-            // Decided once: a request this does not send to encode goes on at once, and not
-            // through the body, which would read the lifecycle again and could encode inline
-            // if the router turned active in between.
+            // Decided once: a request this does not send to encode goes on at once, in its box,
+            // and not through the body, which would read the lifecycle again and could encode
+            // inline if the router turned active in between.
             if router.lifecycle_state() != EncoderLifecycleState::Active
                 || !EncoderRouter::should_encode(&request)
             {
-                return next.forward(request).await;
+                return GdlDownstream::<_, _, PreprocessedRequest>::new(cx, next)
+                    .forward_carried(request)
+                    .await;
             }
+            // The body sends the request on in the box it came in.
+            let (request, spare) = request.take();
+            let next = GdlDownstream::with_spare(cx, next, spare);
             // The encode worker's transfer handle must reach the stage below, and gdl drops
             // this future when a kill cancels the request's `cx`. So the encode runs as a task
             // that the drop detaches, and the handle goes on under a cleanup `Cx`.
@@ -1296,7 +1301,7 @@ mod tests {
             let request = Context::new(multimodal_request());
             *caller.lock().unwrap() = Some(request.context());
             let cx = CxBridge::cx(request.controller());
-            if let Ok(items) = pipeline.generate(cx, request).await {
+            if let Ok(items) = pipeline.generate(cx, Box::new(request)).await {
                 let _: Vec<_> = items.collect().await;
             }
             if inline.load(Ordering::Acquire) {

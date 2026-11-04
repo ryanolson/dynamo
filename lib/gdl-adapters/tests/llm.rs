@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use dynamo_gdl_adapters::{CxBridge, EngineSink, PipelineEngine, REQUEST_ID};
+use dynamo_gdl_adapters::{Boxed, CxBridge, EngineSink, PipelineEngine, REQUEST_ID};
 use dynamo_llm::discovery::ModelManager;
 use dynamo_llm::entrypoint::input::{
     LocalPipeline, PreprocessedRouting, build_embeddings_pipeline, build_pipeline,
@@ -172,11 +172,12 @@ fn native_migration<H>(
 /// gdl-native nodes: a kill cancels the pipeline.
 fn gdl_migration(engine: Engine) -> Engine {
     let sink = Hop::new((), SinkStage::new(Arc::new(EngineSink::new(engine))), ());
-    Arc::new(
-        PipelineEngine::<_, PreprocessedRequest, LLMEngineOutput>::new(Source::new(
-            native_migration(sink),
-        )),
-    )
+    Arc::new(PipelineEngine::<
+        _,
+        PreprocessedRequest,
+        LLMEngineOutput,
+        Boxed<PreprocessedRequest>,
+    >::new(Source::new(native_migration(sink))))
 }
 
 /// Migration above `engine`, composed with Dynamo's `link` chain.
@@ -273,7 +274,10 @@ async fn each_attempt_is_a_child_of_the_requests_cx() {
     )));
     let request = request();
     let root = CxBridge::cx(request.context().as_ref());
-    let mut items = pipeline.call(root.clone(), request).await.unwrap();
+    let mut items = pipeline
+        .call(root.clone(), Box::new(request))
+        .await
+        .unwrap();
     assert_eq!(tokens(&[items.next().await.unwrap().unwrap()]), [vec![10]]);
 
     let seen = seen.lock().unwrap().clone();
@@ -294,18 +298,20 @@ async fn each_attempt_is_a_child_of_the_requests_cx() {
 
 /// A gdl sink that keeps each `Cx` it gets.
 struct Recorder {
-    sink: Arc<EngineSink<DynEngine, PreprocessedRequest, LLMEngineOutput>>,
+    sink: Arc<
+        EngineSink<DynEngine, PreprocessedRequest, LLMEngineOutput, Boxed<PreprocessedRequest>>,
+    >,
     seen: Arc<Mutex<Vec<gdl::Cx>>>,
 }
 
 impl gdl::Sink for Recorder {
-    type Req = SingleIn<PreprocessedRequest>;
+    type Req = Boxed<PreprocessedRequest>;
     type Item = Annotated<LLMEngineOutput>;
 
     fn generate(
         &self,
         cx: gdl::Cx,
-        req: SingleIn<PreprocessedRequest>,
+        req: Boxed<PreprocessedRequest>,
     ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<LLMEngineOutput>>>> + Send {
         self.seen.lock().unwrap().push(cx.clone());
         gdl::Sink::generate(&*self.sink, cx, req)

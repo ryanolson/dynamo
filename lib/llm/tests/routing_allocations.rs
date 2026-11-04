@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use dynamo_gdl_adapters::PipelineEngine;
+use dynamo_gdl_adapters::{Boxed, PipelineEngine};
 use dynamo_kv_router::config::KvRouterConfig;
 use dynamo_llm::discovery::LoadThresholdHandle;
 use dynamo_llm::kv_router::{
@@ -79,11 +79,13 @@ static GLOBAL: Counting = Counting;
 
 /// Recorded allocations of the typical request: the host as a Dynamo engine (`engine`), and as
 /// the sink of a one-hop gdl pipeline behind `PipelineEngine` (`gdl`), at 1 and 16 items.
+/// `gdl` includes the box `PipelineEngine` puts the request in, as the frontend's gdl pipelines
+/// carry it (`dynamo_gdl_adapters::Boxed`): one allocation, accepted for the copies it saves.
 const RECORDS: &[(&str, usize, u64)] = &[
     ("engine", 1, 26),
     ("engine", 16, 41),
-    ("gdl", 1, 40),
-    ("gdl", 16, 55),
+    ("gdl", 1, 41),
+    ("gdl", 16, 56),
 ];
 
 const WARMUP: usize = 20;
@@ -284,7 +286,12 @@ fn main() {
             let host = host(&dynamo_runtime, items, RouterMode::RoundRobin).await;
             let engine: Engine = host.clone();
             let sink = host.clone();
-            let gdl: Engine = Arc::new(PipelineEngine::<_, PreprocessedRequest, LLMEngineOutput>::new(
+            let gdl: Engine = Arc::new(PipelineEngine::<
+                _,
+                PreprocessedRequest,
+                LLMEngineOutput,
+                Boxed<PreprocessedRequest>,
+            >::new(
                 gdl::Source::new(gdl::Hop::new((), gdl::SinkStage::new(sink), ())),
             ));
             for (name, engine) in [("engine", &engine), ("gdl", &gdl)] {

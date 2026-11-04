@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine as _;
-use dynamo_gdl_adapters::{EngineSink, PipelineEngine};
+use dynamo_gdl_adapters::{Boxed, Carried, EngineSink, PipelineEngine};
 use dynamo_llm::backend::Backend;
 use dynamo_llm::discovery::ModelManager;
 use dynamo_llm::http::service::axum::http::HeaderMap;
@@ -97,16 +97,17 @@ where
 }
 
 type DynEngine<Req, T> = dyn AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, Error>;
-type SinkHop<Req, T> = Hop<(), SinkStage<EngineSink<DynEngine<Req, T>, Req, T>>, ()>;
+type SinkHop<Req, T, R> = Hop<(), SinkStage<EngineSink<DynEngine<Req, T>, Req, T, R>>, ()>;
 
-/// The terminal as the inner end of a gdl hop.
-fn sink<Req: Data, T: Data>(engine: Engine<Req, T>) -> SinkHop<Req, T> {
+/// The terminal as the inner end of a gdl hop, taking requests in the carrier `R`: boxed for
+/// LLM requests, as the frontend carries them.
+fn sink<Req: Data, T: Data, R: Carried<Req>>(engine: Engine<Req, T>) -> SinkHop<Req, T, R> {
     Hop::new((), sink_stage(engine), ())
 }
 
-fn sink_stage<Req: Data, T: Data>(
+fn sink_stage<Req: Data, T: Data, R: Carried<Req>>(
     engine: Engine<Req, T>,
-) -> SinkStage<EngineSink<DynEngine<Req, T>, Req, T>> {
+) -> SinkStage<EngineSink<DynEngine<Req, T>, Req, T, R>> {
     SinkStage::new(Arc::new(EngineSink::new(engine)))
 }
 
@@ -133,16 +134,17 @@ fn native<O, Req, H>(op: Arc<O>, next: H) -> Hop<(), OperatorStage<GdlOperator<O
 
 /// A gdl pipeline as the Dynamo engine HTTP calls, rooted as the frontend roots one whose
 /// stages include Dynamo operators and engines.
-fn pipeline<N, Req, T>(next: N) -> Engine<Req, T>
+fn pipeline<N, Req, T, R>(next: N) -> Engine<Req, T>
 where
-    N: gdl::Next<SingleIn<Req>, Annotated<T>>,
+    N: gdl::Next<R, Annotated<T>>,
     Req: Data,
     T: Data,
+    R: Carried<Req>,
 {
     // Transition: root with PipelineEngine::new when no Dynamo stage runs inside a gdl pipeline.
-    Arc::new(PipelineEngine::<_, Req, T>::for_dynamo_stages(Source::new(
-        next,
-    )))
+    Arc::new(PipelineEngine::<_, Req, T, R>::for_dynamo_stages(
+        Source::new(next),
+    ))
 }
 
 /// What one call of [`Script`] saw.
@@ -671,23 +673,24 @@ fn preprocessor_gdl<Req: Data, Resp: Data>(
 ) -> Engine<Req, Resp>
 where
     PreprocessorNode<Req>: gdl::Around<
-            UpReq = SingleIn<Req>,
+            UpReq = Boxed<Req>,
             UpItem = Annotated<Resp>,
-            DownReq = SingleIn<PreprocessedRequest>,
+            DownReq = Boxed<PreprocessedRequest>,
             DownItem = Annotated<BackendOutput>,
         >,
 {
     let terminal = sink_stage(terminal);
-    let below = Arc::new(
-        PipelineEngine::<_, PreprocessedRequest, BackendOutput>::for_dynamo_stages(around::<
-            _,
-            PreprocessedRequest,
-            _,
-        >(
-            backend.clone(),
-            terminal.clone(),
-        )),
-    );
+    let below = Arc::new(PipelineEngine::<
+        _,
+        PreprocessedRequest,
+        BackendOutput,
+        Boxed<PreprocessedRequest>,
+    >::for_dynamo_stages(
+        around::<_, PreprocessedRequest, _>(
+        backend.clone(),
+        terminal.clone(),
+    )
+    ));
     let (preprocessor_forward, preprocessor_backward) =
         gdl::around(Arc::new(PreprocessorNode::<Req>::new(preprocessor, below)));
     let (backend_forward, backend_backward) = gdl::around(Arc::new(GdlOperator::<
