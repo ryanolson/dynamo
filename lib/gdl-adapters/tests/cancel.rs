@@ -797,6 +797,43 @@ async fn a_failed_attempt_is_held_until_its_replacement_dispatch_returns_on_both
     );
 }
 
+/// A replacement whose dispatch fails: Migration returns the error that caused the retry and
+/// still holds the failed attempt's stream, which goes when the caller drops the response, on
+/// both local pipelines. Only a replacement's successful dispatch replaces the stream.
+#[tokio::test]
+async fn a_failed_attempt_is_held_after_a_failed_replacement_dispatch_on_both_local_pipelines() {
+    let mut outcomes = Vec::new();
+    for local_pipeline in BOTH {
+        let (worker, _) = Worker::new(vec![
+            Turn::Stream(vec![token(450), went_away()], Then::End),
+            Turn::Unavailable,
+        ]);
+        let mut stream = pipeline_c(local_pipeline, worker.clone(), 1)
+            .generate(preprocessed())
+            .await
+            .unwrap();
+        let first = next_within(&mut stream, Duration::from_secs(5))
+            .await
+            .expect("the first item arrives")
+            .expect("the stream is not over");
+        assert!(!first.is_error());
+        let failure = next_within(&mut stream, Duration::from_secs(5))
+            .await
+            .expect("replacement dispatch returns its error")
+            .expect("the triggering error reaches the caller");
+        assert!(failure.is_error());
+        assert_eq!(worker.calls(), 2);
+        let dropped_after_failed_dispatch = worker.call(0).1;
+        drop(stream);
+        outcomes.push((
+            local_pipeline.as_str(),
+            dropped_after_failed_dispatch,
+            worker.call(0).1,
+        ));
+    }
+    assert_eq!(outcomes, [("dynamo", false, true), ("gdl", false, true)]);
+}
+
 /// A slow client with the request plane between the pipeline and the worker: the transport
 /// reads ahead of the caller, the same on both local pipelines. So the local composition adds
 /// no read-ahead (`a_slow_client_holds_the_worker_back_on_both_local_pipelines`), and the
