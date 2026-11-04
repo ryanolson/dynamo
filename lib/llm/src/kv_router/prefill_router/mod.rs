@@ -2465,6 +2465,115 @@ mod tests {
         assert_eq!(seen, [("dynamo", 1, failed.clone()), ("gdl", 1, failed)]);
     }
 
+    /// Row 6a claims that a kill before the prefill handoff never reaches decode.
+    #[tokio::test]
+    #[ignore = "R2 row 6a: a successful handoff after the kill still sends decode cleanup on both pipelines"]
+    async fn review_row_6a_a_pre_handoff_kill_never_reaches_decode() {
+        use crate::entrypoint::input::LocalPipeline;
+        use crate::http::service::metrics::Metrics;
+        use crate::model_card::ModelDeploymentCard;
+        use dynamo_runtime::pipeline::AsyncEngineContext;
+        use dynamo_runtime::{DistributedRuntime, Runtime, distributed::DistributedConfig};
+        use std::time::Duration;
+
+        struct CompletesAfterRelease {
+            entered: tokio::sync::mpsc::UnboundedSender<Arc<dyn AsyncEngineContext>>,
+            release: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait]
+        impl
+            dynamo_runtime::pipeline::StreamingDispatch<
+                PreprocessedRequest,
+                Annotated<LLMEngineOutput>,
+            > for CompletesAfterRelease
+        {
+            async fn generate(
+                &self,
+                request: SingleIn<dynamo_runtime::pipeline::AddressedRequest<PreprocessedRequest>>,
+            ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+                self.entered.send(request.context()).unwrap();
+                self.release.notified().await;
+                let handoff = Annotated::from_data(LLMEngineOutput {
+                    token_ids: vec![11],
+                    finish_reason: Some(FinishReason::Length),
+                    disaggregated_params: Some(serde_json::json!({
+                        "request_type": "context_only",
+                        "ctx_request_id": "prefill-after-kill",
+                    })),
+                    ..Default::default()
+                });
+                Ok(ResponseStream::new(
+                    Box::pin(stream::iter([handoff])),
+                    request.context(),
+                ))
+            }
+
+            async fn generate_bidirectional(
+                &self,
+                _: dynamo_runtime::component::Instance,
+                _: String,
+                _: dynamo_runtime::pipeline::ManyIn<PreprocessedRequest>,
+            ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+                unreachable!("prefill dispatch takes a single request")
+            }
+        }
+
+        let runtime = Runtime::from_current().unwrap();
+        let distributed =
+            DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+                .await
+                .unwrap();
+        let card =
+            ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
+                .unwrap();
+        let mut seen = Vec::new();
+        for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+            let name = local_pipeline.as_str();
+            let (entered, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+            let release = Arc::new(tokio::sync::Notify::new());
+            let (routing, decode) = prefill_routing(
+                &distributed,
+                &format!("review-pre-handoff-success-{name}"),
+                Arc::new(CompletesAfterRelease {
+                    entered,
+                    release: release.clone(),
+                }),
+            )
+            .await;
+            let pipeline = routing
+                .with_local_pipeline(local_pipeline)
+                .build_preprocessed_pipeline(&card, 0, None, Arc::new(Metrics::new()))
+                .unwrap();
+            let request = Context::new(inference_request());
+            let caller = request.context();
+            let mut call = tokio::spawn(async move { outcome(pipeline.generate(request)).await });
+            let prefill = tokio::time::timeout(Duration::from_secs(5), arrivals.recv())
+                .await
+                .expect("prefill enters dispatch before the kill")
+                .unwrap();
+            caller.kill();
+            assert!(!prefill.is_killed());
+            if matches!(local_pipeline, LocalPipeline::Gdl) {
+                let result = tokio::time::timeout(Duration::from_secs(5), &mut call)
+                    .await
+                    .expect("the edge cancels before prefill finishes")
+                    .unwrap();
+                assert_eq!(result, "error Some(Cancelled), migratable false");
+            }
+            release.notify_one();
+            if matches!(local_pipeline, LocalPipeline::Dynamo) {
+                tokio::time::timeout(Duration::from_secs(5), &mut call)
+                    .await
+                    .expect("the caller ends after prefill finishes")
+                    .unwrap();
+            }
+            seen.push((name, decode_calls(&decode, 1).await));
+        }
+        runtime.shutdown();
+        assert_eq!(seen, [("dynamo", vec![]), ("gdl", vec![])]);
+    }
+
     /// A client disconnect while the prefill leg is still dispatching, before any handoff. The
     /// prefill leg runs under a context of its own that the kill does not reach, on both local
     /// pipelines, so its dispatch goes on. On Dynamo's chain the caller's call waits for it; on
