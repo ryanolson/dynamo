@@ -11,14 +11,16 @@
 //!
 //! The request stays Dynamo's `SingleIn<T>` on both paths: its context carries the id, the
 //! metadata and registry (session affinity, LoRA name, request metrics) and the stop and kill
-//! that the stages below read. Items stay `Annotated<T>`.
+//! that the stages below read. Items stay `Annotated<T>`; an operator that edits its items in
+//! place reads and answers them as [`Downstream::Item`], which on gdl leaves each item in its
+//! gdl `Result`, so it is not taken out and wrapped again at every stage.
 
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use dynamo_gdl_adapters::{AnnotatedItems, CxBridge, PipelineEngine, enter};
+use dynamo_gdl_adapters::{AnnotatedItems, CheckedItems, CxBridge, PipelineEngine, enter};
 use dynamo_runtime::engine::{AsyncEngine, AsyncEngineContext, Data, ResponseStream};
 use dynamo_runtime::pipeline::{AsyncEngineContextProvider, Error, ManyOut, SingleIn};
 use dynamo_runtime::protocols::annotated::Annotated;
@@ -87,6 +89,52 @@ pub(crate) trait Downstream<Req: Data, T: Data>: Send + Sync {
     ///
     /// Transition: remove when the gdl pipeline is the only local pipeline.
     fn adopt<U: Data>(stream: ManyOut<Annotated<U>>) -> Self::Response<U>;
+
+    /// A stream item as the stage below sends it, for an operator that edits its items in
+    /// place: `Annotated<U>` on Dynamo, and on gdl the gdl item, `gdl::Result<Annotated<U>>`.
+    /// Read and answered in this form, an item is never taken out of its `Result` and wrapped
+    /// again, which would move it (about 600 bytes) twice per stage.
+    ///
+    /// Transition: remove when the gdl pipeline is the only local pipeline.
+    type Item<U: Data>: Send + 'static;
+
+    /// The response stream of [`send_items`](Self::send_items). On gdl, gdl's `Err` rule is
+    /// already applied to it, as [`send`](Self::send) applies it, so every item is `Ok`.
+    type Items: Stream<Item = Self::Item<T>> + AsyncEngineContextProvider + Send + Unpin + 'static;
+
+    /// Send `request` on, as [`send`](Self::send) does, and read the response as
+    /// [`Item`](Self::Item)s.
+    fn send_items(
+        &self,
+        request: SingleIn<Req>,
+    ) -> impl Future<Output = anyhow::Result<Self::Items>> + Send;
+
+    /// The `Annotated` value of `item`.
+    fn item<U: Data>(item: &Self::Item<U>) -> &Annotated<U>;
+
+    /// The `Annotated` value of `item`, to edit in place.
+    fn item_mut<U: Data>(item: &mut Self::Item<U>) -> &mut Annotated<U>;
+
+    /// `item` as an `Annotated` value, for a rare path that takes it by value.
+    fn into_annotated<U: Data>(item: Self::Item<U>) -> Annotated<U>;
+
+    /// `item` as an [`Item`](Self::Item).
+    fn from_annotated<U: Data>(item: Annotated<U>) -> Self::Item<U>;
+
+    /// `item` with its `Annotated` value converted by `convert`.
+    fn map_item<U: Data, V: Data>(
+        item: Self::Item<U>,
+        convert: impl FnOnce(Annotated<U>) -> Annotated<V>,
+    ) -> Self::Item<V>;
+
+    /// Box a stream of [`Item`](Self::Item)s once, as the operator's response, as
+    /// [`respond`](Self::respond) does for `Annotated` items.
+    ///
+    /// Transition: remove when the gdl pipeline is the only local pipeline.
+    fn respond_items<U, S>(stream: S, context: Arc<dyn AsyncEngineContext>) -> Self::Response<U>
+    where
+        U: Data,
+        S: Stream<Item = Self::Item<U>> + Send + 'static;
 }
 
 /// Dynamo's `next`, as a Dynamo operator's body calls it.
@@ -146,6 +194,53 @@ impl<Req: Data, T: Data> Downstream<Req, T> for DynamoDownstream<Req, T> {
 
     fn adopt<U: Data>(stream: ManyOut<Annotated<U>>) -> ManyOut<Annotated<U>> {
         stream
+    }
+
+    type Item<U: Data> = Annotated<U>;
+
+    type Items = ManyOut<Annotated<T>>;
+
+    fn send_items(
+        &self,
+        request: SingleIn<Req>,
+    ) -> impl Future<Output = anyhow::Result<Self::Items>> + Send {
+        self.0.generate(request)
+    }
+
+    #[inline]
+    fn item<U: Data>(item: &Annotated<U>) -> &Annotated<U> {
+        item
+    }
+
+    #[inline]
+    fn item_mut<U: Data>(item: &mut Annotated<U>) -> &mut Annotated<U> {
+        item
+    }
+
+    #[inline]
+    fn into_annotated<U: Data>(item: Annotated<U>) -> Annotated<U> {
+        item
+    }
+
+    #[inline]
+    fn from_annotated<U: Data>(item: Annotated<U>) -> Annotated<U> {
+        item
+    }
+
+    #[inline]
+    fn map_item<U: Data, V: Data>(
+        item: Annotated<U>,
+        convert: impl FnOnce(Annotated<U>) -> Annotated<V>,
+    ) -> Annotated<V> {
+        convert(item)
+    }
+
+    fn respond_items<U, S>(stream: S, context: Arc<dyn AsyncEngineContext>) -> ManyOut<Annotated<U>>
+    where
+        U: Data,
+        S: Stream<Item = Annotated<U>> + Send + 'static,
+    {
+        ResponseStream::new(Box::pin(stream), context)
     }
 }
 
@@ -219,6 +314,73 @@ where
 
     fn adopt<U: Data>(stream: ManyOut<Annotated<U>>) -> gdl::Items<Annotated<U>> {
         gdl::items(stream.map(Ok))
+    }
+
+    type Item<U: Data> = gdl::Result<Annotated<U>>;
+
+    type Items = CheckedItems<T>;
+
+    fn send_items(
+        &self,
+        request: SingleIn<Req>,
+    ) -> impl Future<Output = anyhow::Result<Self::Items>> + Send {
+        let context = request.context();
+        let root = self.cx.clone();
+        self.next
+            .generate(self.cx.clone(), request)
+            .map(move |result| match result {
+                Ok(items) => Ok(CheckedItems::new(items, root, context)),
+                // Carried as itself, so `native` gives back the same `gdl::Error`.
+                Err(error) => Err(anyhow::Error::new(error)),
+            })
+    }
+
+    #[inline]
+    fn item<U: Data>(item: &gdl::Result<Annotated<U>>) -> &Annotated<U> {
+        match item {
+            Ok(item) => item,
+            Err(_) => unreachable!("checked items carry no `Err`"),
+        }
+    }
+
+    #[inline]
+    fn item_mut<U: Data>(item: &mut gdl::Result<Annotated<U>>) -> &mut Annotated<U> {
+        match item {
+            Ok(item) => item,
+            Err(_) => unreachable!("checked items carry no `Err`"),
+        }
+    }
+
+    #[inline]
+    fn into_annotated<U: Data>(item: gdl::Result<Annotated<U>>) -> Annotated<U> {
+        match item {
+            Ok(item) => item,
+            Err(_) => unreachable!("checked items carry no `Err`"),
+        }
+    }
+
+    #[inline]
+    fn from_annotated<U: Data>(item: Annotated<U>) -> gdl::Result<Annotated<U>> {
+        Ok(item)
+    }
+
+    #[inline]
+    fn map_item<U: Data, V: Data>(
+        item: gdl::Result<Annotated<U>>,
+        convert: impl FnOnce(Annotated<U>) -> Annotated<V>,
+    ) -> gdl::Result<Annotated<V>> {
+        item.map(convert)
+    }
+
+    fn respond_items<U, S>(
+        stream: S,
+        _context: Arc<dyn AsyncEngineContext>,
+    ) -> gdl::Items<Annotated<U>>
+    where
+        U: Data,
+        S: Stream<Item = gdl::Result<Annotated<U>>> + Send + 'static,
+    {
+        gdl::items(stream)
     }
 }
 

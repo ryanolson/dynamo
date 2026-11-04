@@ -72,8 +72,8 @@ pub struct Backend {
 ///
 /// Transition: make concrete when the gdl pipeline is the only local pipeline.
 #[allow(dead_code)]
-struct DecoderState<S> {
-    stream: S,
+struct DecoderState<D: Downstream<PreprocessedRequest, LLMEngineOutput>> {
+    stream: D::Items,
     decoders: HashMap<u32, Decoder>,
     finished_choices: HashSet<u32>,
     validate_engine_decode: bool,
@@ -207,7 +207,10 @@ impl Backend {
     }
 
     /// Transition: make concrete when the gdl pipeline is the only local pipeline.
-    fn decoder<S>(&self, stream: S, params: DecoderParams) -> anyhow::Result<DecoderState<S>> {
+    fn decoder<D>(&self, stream: D::Items, params: DecoderParams) -> anyhow::Result<DecoderState<D>>
+    where
+        D: Downstream<PreprocessedRequest, LLMEngineOutput>,
+    {
         let Some(tokenizer) = self.tokenizer.as_ref() else {
             anyhow::bail!("Backend built from blank ModelDeploymentCard, no tokenizer");
         };
@@ -294,16 +297,19 @@ impl Backend {
         next: D,
     ) -> Result<D::Response<BackendOutput>>
     where
-        D: Downstream<PreprocessedRequest, LLMEngineOutput>,
+        D: Downstream<PreprocessedRequest, LLMEngineOutput> + 'static,
     {
         let decoder_params = DecoderParams::from_request(&request);
 
-        let next_stream = next.send(request).await?;
+        let next_stream = next.send_items(request).await?;
 
         let context = next_stream.context();
-        let state = self.decoder(next_stream, decoder_params)?;
+        let state = self.decoder::<D>(next_stream, decoder_params)?;
 
-        Ok(D::respond(DecoderStream { state: Some(state) }, context))
+        Ok(D::respond_items(
+            DecoderStream { state: Some(state) },
+            context,
+        ))
     }
 }
 
@@ -316,17 +322,17 @@ impl Backend {
 /// moves only where it changes type.
 ///
 /// Transition: make concrete when the gdl pipeline is the only local pipeline.
-struct DecoderStream<S> {
+struct DecoderStream<D: Downstream<PreprocessedRequest, LLMEngineOutput>> {
     /// `None` once the stream has ended. That drops the stream below and the decoders when this
     /// stream ends, not when its caller drops it, as `unfold` did.
-    state: Option<DecoderState<S>>,
+    state: Option<DecoderState<D>>,
 }
 
-impl<S> Stream for DecoderStream<S>
+impl<D> Stream for DecoderStream<D>
 where
-    S: Stream<Item = Annotated<LLMEngineOutput>> + AsyncEngineContextProvider + Unpin,
+    D: Downstream<PreprocessedRequest, LLMEngineOutput>,
 {
-    type Item = Annotated<BackendOutput>;
+    type Item = D::Item<BackendOutput>;
 
     // hot path: per-item-response
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
@@ -334,7 +340,7 @@ where
             return Poll::Ready(None);
         };
         match ready!(state.poll_step(cx)) {
-            Some(output) => Poll::Ready(Some(backend_output(output))),
+            Some(output) => Poll::Ready(Some(D::map_item(output, backend_output))),
             None => {
                 self.state = None;
                 Poll::Ready(None)
@@ -343,12 +349,12 @@ where
     }
 }
 
-impl<S> DecoderState<S>
+impl<D> DecoderState<D>
 where
-    S: Stream<Item = Annotated<LLMEngineOutput>> + AsyncEngineContextProvider + Unpin,
+    D: Downstream<PreprocessedRequest, LLMEngineOutput>,
 {
     /// The next item, detokenized in place, or `None` when the stream has ended.
-    fn poll_step(&mut self, cx: &mut TaskContext<'_>) -> Poll<Option<Annotated<LLMEngineOutput>>> {
+    fn poll_step(&mut self, cx: &mut TaskContext<'_>) -> Poll<Option<D::Item<LLMEngineOutput>>> {
         // If we've already detected a local stop condition, end the stream
         if self.finished {
             return Poll::Ready(None);
@@ -357,12 +363,12 @@ where
         // `stream` already yielded `None` once; do not poll it again (unspecified
         // behavior for most `Stream` impls). Only drain the flush queue from here on.
         if self.stream_ended {
-            return Poll::Ready(self.pending_flush.pop());
+            return Poll::Ready(self.pending_flush.pop().map(D::from_annotated));
         }
 
         let output = loop {
             let output = ready!(self.stream.poll_next_unpin(cx));
-            let choice_already_finished = output.as_ref().is_some_and(|output| {
+            let choice_already_finished = output.as_ref().map(D::item).is_some_and(|output| {
                 !output.is_event()
                     && output.data.as_ref().is_some_and(|data| {
                         self.finished_choices
@@ -375,7 +381,8 @@ where
         };
 
         match output {
-            Some(mut output) => {
+            Some(mut item) => {
+                let output = D::item_mut(&mut item);
                 // move to state.process_output
                 // handle any error conditions / unwraps here
 
@@ -391,7 +398,7 @@ where
                     if output.is_error() {
                         self.finished_choices.extend(self.decoders.keys().copied());
                     }
-                    return Poll::Ready(Some(output));
+                    return Poll::Ready(Some(item));
                 }
 
                 // Top-logprob text is independent of the selected token text. An engine may
@@ -445,7 +452,7 @@ where
                         .class(ErrorClass::BackendProtocol)
                         .message("no_stop_trim requires backend token IDs through the matched stop; the backend omitted them (also required when a parser retains the model's stop token text)")
                         .build();
-                    return Poll::Ready(Some(Annotated::from_err(error)));
+                    return Poll::Ready(Some(D::from_annotated(Annotated::from_err(error))));
                 }
 
                 // if we have a data field without an event, then we might need to update the data
@@ -526,7 +533,7 @@ where
                             data.jailed_text = decoder.checkpoint();
                         }
                     }
-                    return Poll::Ready(Some(output));
+                    return Poll::Ready(Some(item));
                 }
 
                 let data = output.data.as_ref().unwrap();
@@ -547,7 +554,7 @@ where
                             "invalid choice index {choice_idx}"
                         )));
                     }
-                    return Poll::Ready(Some(output));
+                    return Poll::Ready(Some(item));
                 };
 
                 // Per-token text is read only with this chunk's logprobs (`create_logprobs`).
@@ -577,7 +584,7 @@ where
                             data.finish_reason =
                                 Some(FinishReason::Error(format!("decode error: {e}")));
                         }
-                        return Poll::Ready(Some(output));
+                        return Poll::Ready(Some(item));
                     }
                 };
 
@@ -668,7 +675,7 @@ where
                     data.jailed_text = decoder.checkpoint();
                 }
 
-                Poll::Ready(Some(output))
+                Poll::Ready(Some(item))
             }
 
             None => {
@@ -715,7 +722,7 @@ where
                     };
                     self.pending_flush.push(Annotated::from_data(data));
                 }
-                Poll::Ready(self.pending_flush.pop())
+                Poll::Ready(self.pending_flush.pop().map(D::from_annotated))
             }
         }
     }
