@@ -2462,4 +2462,117 @@ mod tests {
         let failure = "error None, migratable true".to_string();
         assert_eq!(seen, [("dynamo", 0, failure.clone()), ("gdl", 0, failure)]);
     }
+
+    /// Check the whole-tree cancellation claim before prefill produces a handoff.
+    #[tokio::test]
+    #[ignore = "review finding: the cancelled request edge detaches an independent prefill dispatch"]
+    async fn cancelling_the_request_edge_ends_an_inflight_prefill_dispatch() {
+        use crate::entrypoint::input::LocalPipeline;
+        use crate::http::service::metrics::Metrics;
+        use crate::model_card::ModelDeploymentCard;
+        use dynamo_runtime::pipeline::AsyncEngineContext;
+        use dynamo_runtime::{DistributedRuntime, Runtime, distributed::DistributedConfig};
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        struct Dropped(Arc<AtomicBool>);
+
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        struct WaitingPrefill {
+            entered: tokio::sync::mpsc::UnboundedSender<Arc<dyn AsyncEngineContext>>,
+            release: Arc<tokio::sync::Notify>,
+            dropped: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl
+            dynamo_runtime::pipeline::StreamingDispatch<
+                PreprocessedRequest,
+                Annotated<LLMEngineOutput>,
+            > for WaitingPrefill
+        {
+            async fn generate(
+                &self,
+                request: SingleIn<dynamo_runtime::pipeline::AddressedRequest<PreprocessedRequest>>,
+            ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+                let _guard = Dropped(self.dropped.clone());
+                self.entered.send(request.context()).unwrap();
+                self.release.notified().await;
+                Ok(ResponseStream::new(
+                    Box::pin(stream::empty()),
+                    request.context(),
+                ))
+            }
+
+            async fn generate_bidirectional(
+                &self,
+                _: dynamo_runtime::component::Instance,
+                _: String,
+                _: dynamo_runtime::pipeline::ManyIn<PreprocessedRequest>,
+            ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+                unreachable!("prefill dispatch takes a single request")
+            }
+        }
+
+        let runtime = Runtime::from_current().unwrap();
+        let distributed =
+            DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+                .await
+                .unwrap();
+        let card =
+            ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
+                .unwrap();
+        let (entered, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (routing, decode) = prefill_routing(
+            &distributed,
+            "review-cancel-before-handoff",
+            Arc::new(WaitingPrefill {
+                entered,
+                release: release.clone(),
+                dropped: dropped.clone(),
+            }),
+        )
+        .await;
+        let pipeline = routing
+            .with_local_pipeline(LocalPipeline::Gdl)
+            .build_preprocessed_pipeline(&card, 0, None, Arc::new(Metrics::new()))
+            .unwrap();
+        let request = Context::new(inference_request());
+        let caller = request.context();
+        let call = tokio::spawn(async move { pipeline.generate(request).await });
+        let prefill = tokio::time::timeout(Duration::from_secs(5), arrivals.recv())
+            .await
+            .expect("prefill enters dispatch")
+            .unwrap();
+        caller.kill();
+        let result = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .expect("the request edge ends")
+            .unwrap();
+        assert!(result.is_err());
+        let observed = (prefill.is_killed(), dropped.load(Ordering::Acquire));
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the released dispatch ends");
+        assert!(decode.requests.lock().is_empty());
+        runtime.shutdown();
+        assert!(
+            observed.0 || observed.1,
+            "prefill killed: {}, dispatch dropped: {}",
+            observed.0,
+            observed.1
+        );
+    }
 }
