@@ -53,15 +53,15 @@
 //! | `a` | 346 | 100,886 | 859 | 122,374 |
 //! | `a-gdl` | 328 | 65,567 | 841 | 87,055 |
 //! | `b` | 399 | 222,921 | 912 | 244,409 |
-//! | `b-gdl` | 353 | 84,586 | 866 | 106,074 |
+//! | `b-gdl` | 343 | 82,418 | 856 | 103,906 |
 //! | `c` | 71 | 140,547 | 86 | 140,607 |
-//! | `c-gdl` | 47 | 30,428 | 62 | 30,488 |
+//! | `c-gdl` | 38 | 28,196 | 53 | 28,256 |
 //! | `embed-engine` | 8 | 6,548 | 23 | 88,868 |
 //! | `embed` | 199 | 44,438 | 2,283 | 529,886 |
-//! | `embeddings-gdl` | 180 | 42,407 | 2,264 | 527,855 |
+//! | `embeddings-gdl` | 177 | 41,727 | 2,261 | 527,175 |
 //!
 //! Each gdl row differs from its dynamo row by the same number of allocations at both item
-//! counts, so nothing per item: `a-gdl` −18, `b-gdl` −46, `c-gdl` −24, `embeddings-gdl` −19.
+//! counts, so nothing per item: `a-gdl` −18, `b-gdl` −56, `c-gdl` −33, `embeddings-gdl` −22.
 //! The gdl rows carry the chat and preprocessed requests boxed (`dynamo_gdl_adapters::Boxed`),
 //! accepted at one allocation per box: `a-gdl` and `b-gdl` +2 (the chat request where it enters
 //! the pipeline, the preprocessed request where the preprocessor builds it; Migration sends its
@@ -72,7 +72,7 @@
 //! with nothing per item. Callgrind leaves out the system allocator; a `malloc` and `free` pair
 //! costs about 170 instructions.
 //! `lib/gdl-adapters/tests/allocations.rs` measures the parts in isolation: 14 allocations
-//! for a `link` stage, 5 for a native gdl operator, and 21 against 19 at the boundary
+//! for a `link` stage, 2 for a native gdl operator nested under the request's scope, and 21 against 19 at the boundary
 //! (`PipelineEngine` above, `EngineSink` below). Every operator in the gdl rows is native, and
 //! Backend and the chat preprocessor are around nodes of the hop below them; the test engine
 //! at the terminal enters through `EngineSink`, where the frontend's `RoutingHost` is a gdl
@@ -81,7 +81,7 @@
 //! edge, the gdl composition one per stage, and `embeddings-gdl` has no backend stage.
 //!
 //! The largest allocation of `b` and `c` is Migration's boxed future, 59,592 bytes per request;
-//! the largest of `b-gdl` is 13,376 bytes and of `c-gdl` 12,256 (debug build). `a` and `embed`,
+//! the largest of `b-gdl` was 13,376 bytes and of `c-gdl` 12,256 (debug build, gdl 165b166c). `a` and `embed`,
 //! which have no Migration, make neither.
 //!
 //! Run: `cargo test -p dynamo-llm --test allocations`. For instructions and `memcpy` calls per
@@ -146,21 +146,21 @@ const BASELINE: &[Row] = &[
     row("b", 1, 399, 222921),
     row("b", 16, 912, 244409),
     // +2 for the boxed chat and preprocessed requests (see the module docs).
-    row("b-gdl", 1, 353, 84586),
-    row("b-gdl", 16, 866, 106074),
+    row("b-gdl", 1, 343, 82418),
+    row("b-gdl", 16, 856, 103906),
     // Transition: remove when the gdl pipeline is the only local pipeline.
     row("c", 1, 71, 140547),
     row("c", 16, 86, 140607),
     // +1 for the boxed preprocessed request (see the module docs).
-    row("c-gdl", 1, 47, 30428),
-    row("c-gdl", 16, 62, 30488),
+    row("c-gdl", 1, 38, 28196),
+    row("c-gdl", 16, 53, 28256),
     row("embed-engine", 1, 8, 6548),
     row("embed-engine", 16, 23, 88868),
     // Transition: remove when the gdl pipeline is the only local pipeline.
     row("embed", 1, 199, 44438),
     row("embed", 16, 2283, 529886),
-    row("embeddings-gdl", 1, 180, 42407),
-    row("embeddings-gdl", 16, 2264, 527855),
+    row("embeddings-gdl", 1, 177, 41727),
+    row("embeddings-gdl", 16, 2261, 527175),
 ];
 
 #[global_allocator]
