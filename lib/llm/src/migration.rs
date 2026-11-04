@@ -389,7 +389,10 @@ impl Migration {
             session_affinity,
         )
         .await?;
-        Ok(D::respond(Migrated::Streaming(retry_manager), engine_ctx_))
+        Ok(D::respond_items(
+            Migrated::Streaming(retry_manager),
+            engine_ctx_,
+        ))
     }
 }
 
@@ -439,13 +442,13 @@ where
     Resp: Data + HasTokenIds,
     D: Downstream<PreprocessedRequest, Resp> + 'static,
 {
-    type Item = Annotated<Resp>;
+    type Item = D::Item<Resp>;
 
     // hot path: per-item-response
     fn poll_next(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> Poll<Option<Annotated<Resp>>> {
+    ) -> Poll<Option<D::Item<Resp>>> {
         let this = &mut *self;
         loop {
             match this {
@@ -462,7 +465,7 @@ where
                                 return poll;
                             }
                             Poll::Ready(Some(response)) => {
-                                if manager.accept(response) {
+                                if manager.accept(D::item_mut(response)) {
                                     return poll;
                                 }
                             }
@@ -470,6 +473,7 @@ where
                         let Poll::Ready(Some(response)) = poll else {
                             unreachable!("only a failure to migrate on gets here");
                         };
+                        let response = D::into_annotated(response);
                         let Migrated::Streaming(mut manager) =
                             std::mem::replace(this, Migrated::Ended)
                         else {
@@ -501,7 +505,7 @@ where
                         Some(_) => Migrated::Streaming(manager),
                         None => Migrated::Ended,
                     };
-                    return Poll::Ready(next);
+                    return Poll::Ready(next.map(D::from_annotated));
                 }
                 Migrated::Ended => return Poll::Ready(None),
             }
@@ -534,7 +538,7 @@ where
     request: PreprocessedRequest,
     session_affinity: Option<SessionAffinityId>,
     next_generate: D,
-    next_stream: Option<D::Stream>,
+    next_stream: Option<D::Items>,
     attempts: AttemptBudget,
     max_seq_len: Option<u32>,
     model_name: Arc<String>,
@@ -665,10 +669,10 @@ where
                 }
             };
             let mut response = response_stream.next().await?;
-            if self.accept(&mut response) {
-                return Some(response);
+            if self.accept(D::item_mut(&mut response)) {
+                return Some(D::into_annotated(response));
             }
-            if let Some(response) = self.migrate_on(response).await {
+            if let Some(response) = self.migrate_on(D::into_annotated(response)).await {
                 return Some(response);
             }
         }
@@ -858,7 +862,7 @@ where
             {
                 release.release().await;
             }
-            let response_stream = self.next_generate.send(request).await;
+            let response_stream = self.next_generate.send_items(request).await;
             match response_stream {
                 Ok(next_stream) => {
                     // A dispatch cancelled before its response prologue returns `Ok` empty,

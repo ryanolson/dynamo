@@ -482,3 +482,69 @@ async fn a_stop_after_a_kill_still_ends_the_stream_quietly() {
     let item = stream.next().await;
     assert!(item.is_none(), "a killed stream emitted {item:?}");
 }
+
+/// gdl items of `0..n` as data, then `last`, for the readers below.
+fn gdl_items(n: u32, last: Option<gdl::Error>) -> Items<Annotated<u32>> {
+    let items = (0..n).map(|i| Ok(Annotated::from_data(i)));
+    gdl::items(stream::iter(items.chain(last.map(Err))))
+}
+
+/// `CheckedItems` keeps each item in its `Result` and applies gdl's `Err` rule as
+/// `AnnotatedItems` does: an `Err` ends the stream as a last `Ok` error item, so every item
+/// it yields is `Ok`, and the stream stays ended.
+#[tokio::test]
+async fn checked_items_yield_ok_items_and_end_an_err_with_an_error_item() {
+    use dynamo_gdl_adapters::{AnnotatedItems, CheckedItems};
+    let context = make_request(0).context();
+    let failure = || {
+        Some(gdl::Error::new(
+            gdl::ErrorKind::Node,
+            "the stage below failed",
+        ))
+    };
+
+    let checked: Vec<_> = CheckedItems::new(gdl_items(2, failure()), Cx::new(), context.clone())
+        .collect()
+        .await;
+    assert_eq!(checked.len(), 3);
+    assert!(checked.iter().all(Result::is_ok), "{checked:?}");
+    let checked: Vec<Annotated<u32>> = checked.into_iter().map(Result::unwrap).collect();
+    assert_eq!(data(&checked), [Some(0), Some(1), None]);
+    assert!(checked[2].error.is_some(), "the Err became an error item");
+
+    let annotated: Vec<_> =
+        AnnotatedItems::new(gdl_items(2, failure()), Cx::new(), context.clone())
+            .collect()
+            .await;
+    assert_eq!(
+        serde_json::to_value(&annotated).unwrap(),
+        serde_json::to_value(&checked).unwrap(),
+        "AnnotatedItems reads the same items, out of their `Result`"
+    );
+
+    let mut checked = CheckedItems::new(gdl_items(0, failure()), Cx::new(), context);
+    assert!(checked.next().await.is_some_and(|item| item.is_ok()));
+    assert!(checked.next().await.is_none());
+    assert!(
+        checked.next().await.is_none(),
+        "an ended stream stays ended"
+    );
+}
+
+/// A cancel of a killed request ends `CheckedItems` with no item, as a killed Dynamo stream
+/// just ends.
+#[tokio::test]
+async fn checked_items_end_a_killed_requests_cancel_with_no_item() {
+    use dynamo_gdl_adapters::CheckedItems;
+    let context = make_request(0).context();
+    context.kill();
+    let checked: Vec<_> = CheckedItems::new(
+        gdl_items(1, Some(gdl::Error::cancelled())),
+        Cx::new(),
+        context,
+    )
+    .collect()
+    .await;
+    assert_eq!(checked.len(), 1, "{checked:?}");
+    assert_eq!(checked[0].as_ref().unwrap().data, Some(0));
+}

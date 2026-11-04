@@ -259,14 +259,14 @@ fn monitor_response_stream(
 fn into_monitored_response(
     response_stream: ManyOut<Annotated<LLMEngineOutput>>,
     guard: RequestGuard,
-) -> ManyOut<Annotated<LLMEngineOutput>> {
+) -> RouteResponse {
     let stream_context = response_stream.context();
     let wrapped_stream = Box::pin(monitor_response_stream(
         response_stream,
         stream_context.clone(),
         guard,
     ));
-    ResponseStream::new(wrapped_stream, stream_context)
+    RouteResponse::Parts(ResponseStream::from_parts(wrapped_stream, stream_context))
 }
 
 enum RoutingPolicy {
@@ -712,7 +712,7 @@ impl RoutingHost {
                     .await?;
                 Ok(PrefillDispatch {
                     metadata,
-                    stream,
+                    stream: stream.into_many_out(),
                     booking: None,
                 })
             }
@@ -729,7 +729,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
         &self,
         request: SingleIn<PreprocessedRequest>,
     ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
-        self.route(request).await
+        Ok(self.route(request).await?.into_many_out())
     }
 }
 
@@ -756,7 +756,7 @@ impl gdl::Sink for RoutingHost {
         let route: Pin<Box<dyn Future<Output = Result<RouteResponse, Error>> + Send + '_>> =
             Box::pin(self.route(request));
         route.map(|result| match result {
-            Ok(stream) => Ok(gdl::items(stream.map(Ok))),
+            Ok(response) => Ok(response.into_items()),
             Err(error) => Err(enter(error)),
         })
     }
@@ -787,10 +787,7 @@ impl RoutingHost {
     ///
     /// The router state updates include tracking active sequences and managing
     /// prefill/completion lifecycle for proper KV cache management.
-    async fn route(
-        &self,
-        request: SingleIn<PreprocessedRequest>,
-    ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+    async fn route(&self, request: SingleIn<PreprocessedRequest>) -> Result<RouteResponse, Error> {
         // One cleanup budget for this request's whole route through the host.
         let budget = CleanupBudget::default();
         if !matches!(&self.policy, RoutingPolicy::Kv(_)) {
@@ -847,7 +844,10 @@ impl RoutingHost {
             };
             let response = Annotated::from_data(output);
             let stream = stream::iter(vec![response]);
-            return Ok(ResponseStream::new(Box::pin(stream), stream_context));
+            return Ok(RouteResponse::Parts(ResponseStream::from_parts(
+                Box::pin(stream),
+                stream_context,
+            )));
         }
 
         let plan = self.plan_kv_route(&request, phase, None, budget).await?;
@@ -855,7 +855,41 @@ impl RoutingHost {
     }
 }
 
-type RouteResponse = ManyOut<Annotated<LLMEngineOutput>>;
+/// The host's response, as boxed as it has to be so far. The Dynamo engine and the gdl sink each
+/// take it in the form they need, so neither pays for a box the other needs.
+#[derive(Debug)]
+pub(crate) enum RouteResponse {
+    /// Not boxed yet: the Dynamo engine boxes it as a `ManyOut`, and the gdl sink takes its
+    /// stream out.
+    Parts(ResponseStream<Annotated<LLMEngineOutput>>),
+    /// Already a `ManyOut`, as the route span's wrapper returns it.
+    Boxed(ManyOut<Annotated<LLMEngineOutput>>),
+}
+
+impl RouteResponse {
+    /// The response as a Dynamo engine returns it.
+    pub(crate) fn into_many_out(self) -> ManyOut<Annotated<LLMEngineOutput>> {
+        match self {
+            Self::Parts(response) => Box::pin(response),
+            Self::Boxed(response) => response,
+        }
+    }
+
+    /// The response as gdl items. The context lives as long as the stream, as it does in the
+    /// boxed response.
+    fn into_items(self) -> gdl::Items<Annotated<LLMEngineOutput>> {
+        match self {
+            Self::Parts(response) => {
+                let (stream, context) = response.into_parts();
+                gdl::items(stream.map(move |item| {
+                    let _context = &context;
+                    Ok(item)
+                }))
+            }
+            Self::Boxed(response) => gdl::items(response.map(Ok)),
+        }
+    }
+}
 
 enum ResponseItemOutcome {
     /// The stream is healthy and must keep running.

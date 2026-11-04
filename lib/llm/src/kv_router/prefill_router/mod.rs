@@ -593,8 +593,11 @@ impl PrefillRouter {
                     let response_stream = decode_host
                         .dispatch_kv_plan(conditional_request, decision.plan)
                         .await?;
-                    return with_bypass_marker(response_stream, client_requested_bypass_marker)
-                        .map(D::adopt);
+                    return with_bypass_marker(
+                        response_stream.into_many_out(),
+                        client_requested_bypass_marker,
+                    )
+                    .map(D::adopt);
                 }
                 Ok(None) => {
                     (req, context) = conditional_request.into_parts();

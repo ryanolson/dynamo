@@ -100,7 +100,9 @@ where
 ///
 /// A native gdl operator over Dynamo items reads its downstream through it,
 /// so it sees what a Dynamo operator on Dynamo's `link` chain sees from the
-/// same stages.
+/// same stages. One that can work on the gdl item as it is reads through
+/// [`CheckedItems`] instead, and saves taking each item out of its `Result`.
+/// The two apply the same rule.
 pub struct AnnotatedItems<T> {
     items: Option<Items<Annotated<T>>>,
     root: gdl::Cx,
@@ -151,9 +153,7 @@ impl<T: Data> Stream for AnnotatedItems<T> {
             Poll::Ready(Some(Ok(item))) => Poll::Ready(Some(item)),
             Poll::Ready(Some(Err(error))) => {
                 self.items = None;
-                let killed = error.kind() == gdl::ErrorKind::Cancelled
-                    && (self.root.is_cancelled() || self.context.is_killed());
-                Poll::Ready((!killed).then(|| exit_item(error)))
+                Poll::Ready(last_item(error, &self.root, self.context.as_ref()))
             }
             Poll::Ready(None) => {
                 self.items = None;
@@ -161,5 +161,91 @@ impl<T: Data> Stream for AnnotatedItems<T> {
             }
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+/// gdl's `Err` rule, which [`AnnotatedItems`] and [`CheckedItems`] share: the
+/// last item of a stream that ended in `error`, or `None` when it is a cancel
+/// of a request that was killed, since a killed Dynamo stream just ends.
+fn last_item<T>(
+    error: gdl::Error,
+    root: &gdl::Cx,
+    context: &dyn AsyncEngineContext,
+) -> Option<Annotated<T>> {
+    let killed =
+        error.kind() == gdl::ErrorKind::Cancelled && (root.is_cancelled() || context.is_killed());
+    (!killed).then(|| exit_item(error))
+}
+
+/// gdl items with gdl's `Err` rule applied, as [`AnnotatedItems`] applies it,
+/// but each item left in its `Result`: an `Err` item ends the stream, as a
+/// last `Ok` error item, or with no item when it is a cancel of a request that
+/// was killed. So every item it yields is `Ok`.
+///
+/// An `Ok` item is returned in the `Poll` the items below returned, so reading
+/// through it moves no item. A native gdl operator that edits its items in
+/// place and answers with gdl items reads its downstream through it.
+pub struct CheckedItems<T> {
+    items: Option<Items<Annotated<T>>>,
+    root: gdl::Cx,
+    context: Arc<dyn AsyncEngineContext>,
+}
+
+impl<T> CheckedItems<T> {
+    /// Read `items`. `root` is the `Cx` the request was sent with and
+    /// `context` its Dynamo context: a cancel of either one is a kill.
+    pub fn new(
+        items: Items<Annotated<T>>,
+        root: gdl::Cx,
+        context: Arc<dyn AsyncEngineContext>,
+    ) -> Self {
+        Self {
+            items: Some(items),
+            root,
+            context,
+        }
+    }
+}
+
+impl<T> std::fmt::Debug for CheckedItems<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CheckedItems")
+            .field("ended", &self.items.is_none())
+            .field("root", &self.root)
+            .field("context", &self.context.id())
+            .finish()
+    }
+}
+
+/// The request's Dynamo context, as a Dynamo response stream gives it.
+impl<T: Data> AsyncEngineContextProvider for CheckedItems<T> {
+    fn context(&self) -> Arc<dyn AsyncEngineContext> {
+        Arc::clone(&self.context)
+    }
+}
+
+impl<T: Data> Stream for CheckedItems<T> {
+    type Item = gdl::Result<Annotated<T>>;
+
+    fn poll_next(mut self: Pin<&mut Self>, task: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        let Some(items) = self.items.as_mut() else {
+            return Poll::Ready(None);
+        };
+        // Every path returns this one value, so the compiler can build it where the caller
+        // reads it: an `Ok` item is not moved on its way through.
+        let mut poll = items.as_mut().poll_next(task);
+        match &mut poll {
+            Poll::Ready(Some(Ok(_))) | Poll::Pending => {}
+            Poll::Ready(Some(Err(_))) => {
+                self.items = None;
+                let Poll::Ready(Some(Err(error))) = std::mem::replace(&mut poll, Poll::Pending)
+                else {
+                    unreachable!("matched above");
+                };
+                poll = Poll::Ready(last_item(error, &self.root, self.context.as_ref()).map(Ok));
+            }
+            Poll::Ready(None) => self.items = None,
+        }
+        poll
     }
 }
