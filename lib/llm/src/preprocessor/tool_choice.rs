@@ -667,6 +667,7 @@ pub(crate) fn effective_tools(
         .map_err(|error| invalid_argument(error.to_string(), None))
 }
 
+#[inline]
 pub(crate) fn effective_tool_definitions(
     request: &NvCreateChatCompletionRequest,
 ) -> Result<Vec<ToolDefinition>, DynamoError> {

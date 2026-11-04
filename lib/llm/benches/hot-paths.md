@@ -15,7 +15,8 @@ decoder stream, then the preprocessor's response transform, through the stream l
 the stages.
 
 - **Entry points:** `DecoderStream::poll_next` in `lib/llm/src/backend.rs` (Backend's stream over
-  the engine's stream, built by `Backend::generate_tokens`), and
+  the engine's stream, built by `Backend::generate_tokens` on the Dynamo pipeline and by the
+  backward half of Backend's around node on gdl), and
   `transform_postprocessor_stream_with_image_tokens` in `lib/llm/src/preprocessor.rs`, with the
   in-place edits of `lib/llm/src/preprocessor/edit.rs` after the parsers, and
   `Migrated::poll_next` in `lib/llm/src/migration.rs` (Migration's stream over the active
@@ -116,6 +117,13 @@ the stages.
   Dynamo items (the `PipelineEngine` boundary, and the preprocessor reading Backend), the box
   `EngineSink` puts around a Dynamo engine's stream, and gdl's own `Bounded` layer (2). Backend
   and Migration read gdl items in their `Result` (`CheckedItems`), so they take no item out.
+
+  The preprocessor does not: measured with its response transform reading Backend's gdl items
+  in their `Result`, `a-gdl` and `b-gdl` each paid one more memcpy per item than through
+  `AnnotatedItems`, as the transform takes each item out of the `Result` to convert it, and the
+  same read with the item's fields taken in place paid two more per item on `a` and `b`. Reading
+  in place pays where a stage edits an item and passes it on, not where it converts it to a new
+  type.
 
 - **Not covered:** the window starts where the HTTP handler calls the engine. HTTP parsing, the
   handler's request metrics and SSE encoding are outside it, and the reasoning and tool-call

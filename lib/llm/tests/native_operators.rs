@@ -7,7 +7,8 @@
 //!
 //! Each test runs one request both ways and compares what comes out: the items, an eager
 //! error and what it downcasts to, and what the terminal saw. The gdl side is composed as
-//! the frontend composes it: `PipelineEngine` above, native stages, `EngineSink` below.
+//! the frontend composes it: `PipelineEngine` above, native stages (Backend and the chat and
+//! completions preprocessors as around nodes of the hop below them), `EngineSink` below.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -26,7 +27,9 @@ use dynamo_llm::model_card::ModelDeploymentCard;
 use dynamo_llm::model_type::ModelType;
 use dynamo_llm::operator::GdlOperator;
 use dynamo_llm::preprocessor::prompt::prompt_formatter_from_mdc;
-use dynamo_llm::preprocessor::{OpenAIPreprocessor, PreprocessedEmbeddingRequest};
+use dynamo_llm::preprocessor::{
+    OpenAIPreprocessor, PreprocessedEmbeddingRequest, PreprocessorNode,
+};
 use dynamo_llm::protocols::common::extensions::{
     SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId, session_affinity_from_headers,
 };
@@ -51,7 +54,7 @@ use dynamo_runtime::pipeline::{
 use dynamo_runtime::protocols::annotated::Annotated;
 use dynamo_runtime::protocols::maybe_error::MaybeError;
 use futures::{StreamExt, stream};
-use gdl::{Hop, OperatorStage, SinkStage, Source};
+use gdl::{BackwardHalf, ForwardHalf, Hop, OperatorStage, SinkStage, Source};
 use serde::Serialize;
 
 const MODEL_PATH: &str = "tests/data/sample-models/TinyLlama_v1.1";
@@ -98,7 +101,25 @@ type SinkHop<Req, T> = Hop<(), SinkStage<EngineSink<DynEngine<Req, T>, Req, T>>,
 
 /// The terminal as the inner end of a gdl hop.
 fn sink<Req: Data, T: Data>(engine: Engine<Req, T>) -> SinkHop<Req, T> {
-    Hop::new((), SinkStage::new(Arc::new(EngineSink::new(engine))), ())
+    Hop::new((), sink_stage(engine), ())
+}
+
+fn sink_stage<Req: Data, T: Data>(
+    engine: Engine<Req, T>,
+) -> SinkStage<EngineSink<DynEngine<Req, T>, Req, T>> {
+    SinkStage::new(Arc::new(EngineSink::new(engine)))
+}
+
+type AroundHop<O, Req, I> =
+    Hop<(ForwardHalf<GdlOperator<O, Req>>, ()), I, (BackwardHalf<GdlOperator<O, Req>>, ())>;
+
+/// An around node of the hop to `inner`.
+fn around<O, Req, I>(op: Arc<O>, inner: I) -> AroundHop<O, Req, I>
+where
+    GdlOperator<O, Req>: gdl::Around,
+{
+    let (forward, backward) = gdl::around(Arc::new(GdlOperator::new(op)));
+    Hop::new((forward, ()), inner, (backward, ()))
 }
 
 /// A native operator over the hop `next`.
@@ -389,11 +410,19 @@ fn backend_both(
     let backend = fixture.backend();
     [
         linked(backend.clone(), terminal.clone()),
-        pipeline(native::<_, PreprocessedRequest, _>(
-            backend,
-            sink(terminal as Engine<_, _>),
-        )),
+        backend_gdl(backend, terminal),
     ]
+}
+
+/// `backend` over `terminal` on the gdl path, as the frontend composes it.
+fn backend_gdl(
+    backend: Arc<Backend>,
+    terminal: Arc<Script>,
+) -> Engine<PreprocessedRequest, BackendOutput> {
+    pipeline(around::<_, PreprocessedRequest, _>(
+        backend,
+        sink_stage(terminal as Engine<_, _>),
+    ))
 }
 
 #[tokio::test]
@@ -467,6 +496,59 @@ async fn backend_returns_the_terminals_eager_error_both_ways() {
     assert_eq!(d, g);
 }
 
+/// A Backend that cannot decode (no tokenizer) on the Dynamo path: it sends the request on
+/// first and checks after, so an eager error from below wins, and with none the terminal is
+/// called before the decoder's error.
+///
+/// Transition: remove when the Dynamo path checks before it sends the request on.
+#[tokio::test]
+async fn a_backend_that_cannot_decode_checks_after_dispatch_on_dynamo() {
+    let fixture = Fixture::load();
+    let blank = Backend::from_mdc(&ModelDeploymentCard::with_name_only("blank"));
+
+    let failing = Script::new(Reply::Fail(worker_unavailable));
+    let engine = linked::<_, _, BackendOutput, _, _>(blank.clone(), failing.clone());
+    let error = engine
+        .generate(request(preprocessed(&fixture, false)))
+        .await
+        .expect_err("an eager error");
+    assert!(
+        error
+            .to_string()
+            .contains("prefill routing is still activating"),
+        "the terminal's error wins: {error:#}"
+    );
+    assert_eq!(failing.calls(), 1);
+
+    let answering = Script::new(Reply::Items(fixture.tokens("fox")));
+    let engine = linked::<_, _, BackendOutput, _, _>(blank, answering.clone());
+    let error = engine
+        .generate(request(preprocessed(&fixture, false)))
+        .await
+        .expect_err("the decoder's error");
+    assert!(error.to_string().contains("no tokenizer"), "{error:#}");
+    assert_eq!(answering.calls(), 1, "the terminal was called first");
+}
+
+/// A Backend that cannot decode (no tokenizer) on the gdl path fails before it sends the
+/// request on: the terminal is not called, even one that would fail at once.
+#[tokio::test]
+async fn a_backend_that_cannot_decode_fails_before_dispatch_on_gdl() {
+    let fixture = Fixture::load();
+    let blank = Backend::from_mdc(&ModelDeploymentCard::with_name_only("blank"));
+    for terminal in [
+        Script::new(Reply::Fail(worker_unavailable)),
+        Script::new(Reply::Items(fixture.tokens("fox"))),
+    ] {
+        let error = backend_gdl(blank.clone(), terminal.clone())
+            .generate(request(preprocessed(&fixture, false)))
+            .await
+            .expect_err("the decoder's error");
+        assert!(error.to_string().contains("no tokenizer"), "{error:#}");
+        assert_eq!(terminal.calls(), 0, "the terminal was not called");
+    }
+}
+
 /// With `no_stop_trim`, a text-only output is an error, and Backend stops the request below
 /// it. On the gdl path that stop must reach the terminal's Dynamo context, not only a `Cx`.
 #[tokio::test]
@@ -527,6 +609,43 @@ async fn a_kill_mid_stream_reaches_the_terminal_both_ways() {
     }
 }
 
+/// A kill mid-stream through chat over Backend reaches the terminal and ends the stream. On
+/// gdl the two are around nodes of one hop, so Backend's backward half runs in a scope of its
+/// own, not in the hop's attempt.
+#[tokio::test]
+async fn a_kill_mid_stream_through_chat_reaches_the_terminal_both_ways() {
+    let fixture = Fixture::load();
+    let mut reply = fixture.tokens("The fox crossed the river.");
+    reply
+        .last_mut()
+        .unwrap()
+        .data
+        .as_mut()
+        .unwrap()
+        .finish_reason = None;
+    for (way, at) in [("dynamo", 0), ("gdl", 1)] {
+        let terminal = Script::new(Reply::ItemsThenHold(reply.clone()));
+        let engine = chat_both(&fixture, terminal.clone())[at].clone();
+        let request = request(chat(serde_json::json!({})));
+        let context = request.context();
+        let mut stream = engine.generate(request).await.unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("the first item arrives")
+            .unwrap();
+        assert!(!first.is_error(), "{way}: {first:?}");
+        context.kill();
+        assert!(
+            terminal.calls.lock().unwrap()[0].context.is_killed(),
+            "{way}"
+        );
+        let rest = tokio::time::timeout(Duration::from_secs(5), collect(stream))
+            .await
+            .unwrap_or_else(|_| panic!("{way}: the stream did not end"));
+        assert!(rest.iter().all(|item| !item.is_error()), "{way}: {rest:?}");
+    }
+}
+
 fn chat_both(
     fixture: &Fixture,
     terminal: Arc<Script>,
@@ -538,11 +657,48 @@ fn chat_both(
             preprocessor.clone(),
             linked::<_, _, BackendOutput, _, _>(backend.clone(), terminal.clone()),
         ),
-        pipeline(native::<_, NvCreateChatCompletionRequest, _>(
-            preprocessor,
-            native::<_, PreprocessedRequest, _>(backend, sink(terminal)),
-        )),
+        preprocessor_gdl(preprocessor, backend, terminal),
     ]
+}
+
+/// The preprocessor and `backend` over `terminal` on the gdl path, as the frontend composes
+/// pipeline A: one hop to the terminal, with both as its around nodes, and the speculative
+/// prefill sent to Backend's own hop.
+fn preprocessor_gdl<Req: Data, Resp: Data>(
+    preprocessor: Arc<OpenAIPreprocessor>,
+    backend: Arc<Backend>,
+    terminal: Engine<PreprocessedRequest, LLMEngineOutput>,
+) -> Engine<Req, Resp>
+where
+    PreprocessorNode<Req>: gdl::Around<
+            UpReq = SingleIn<Req>,
+            UpItem = Annotated<Resp>,
+            DownReq = SingleIn<PreprocessedRequest>,
+            DownItem = Annotated<BackendOutput>,
+        >,
+{
+    let terminal = sink_stage(terminal);
+    let below = Arc::new(
+        PipelineEngine::<_, PreprocessedRequest, BackendOutput>::for_dynamo_stages(around::<
+            _,
+            PreprocessedRequest,
+            _,
+        >(
+            backend.clone(),
+            terminal.clone(),
+        )),
+    );
+    let (preprocessor_forward, preprocessor_backward) =
+        gdl::around(Arc::new(PreprocessorNode::<Req>::new(preprocessor, below)));
+    let (backend_forward, backend_backward) = gdl::around(Arc::new(GdlOperator::<
+        _,
+        PreprocessedRequest,
+    >::new(backend)));
+    pipeline(Hop::new(
+        (preprocessor_forward, (backend_forward, ())),
+        terminal,
+        (backend_backward, (preprocessor_backward, ())),
+    ))
 }
 
 /// The chat content of the items, and whether one finished.
@@ -609,6 +765,27 @@ async fn chat_rejects_an_invalid_request_before_dispatch_both_ways() {
         (found, format!("{error:#}"))
     });
     assert!(d.0.is_some(), "{d:?}");
+    assert_eq!(d, g);
+    assert_eq!(terminal.calls(), 0);
+}
+
+/// Tool definitions that do not validate fail the chat request before it is sent on, both ways,
+/// even against a terminal that would fail at once: the client sees the validation error.
+#[tokio::test]
+async fn invalid_tools_fail_before_an_eager_error_below_both_ways() {
+    let fixture = Fixture::load();
+    let terminal = Script::new(Reply::Fail(worker_unavailable));
+    let [dynamo, gdl] = chat_both(&fixture, terminal.clone());
+    let invalid = || request(chat(serde_json::json!({"tools": []})));
+    let [d, g] = both(dynamo, gdl, invalid).await.map(|result| {
+        let error = result.expect_err("an eager error");
+        let found = error
+            .chain()
+            .find_map(|e| e.downcast_ref::<DynamoError>())
+            .map(|e| e.error_type());
+        (found, format!("{error:#}"))
+    });
+    assert!(d.1.contains("tools array cannot be empty"), "{d:?}");
     assert_eq!(d, g);
     assert_eq!(terminal.calls(), 0);
 }
@@ -728,10 +905,7 @@ async fn completions_are_the_same_both_ways() {
         preprocessor.clone(),
         linked::<_, _, BackendOutput, _, _>(backend.clone(), terminal.clone()),
     );
-    let gdl = pipeline(native::<_, NvCreateCompletionRequest, _>(
-        preprocessor,
-        native::<_, PreprocessedRequest, _>(backend, sink(terminal)),
-    ));
+    let gdl = preprocessor_gdl(preprocessor, backend, terminal);
     for extra in [
         serde_json::json!({}),
         serde_json::json!({"echo": true}),
@@ -789,6 +963,8 @@ impl
     }
 }
 
+/// Embeddings give the same response on Dynamo's chain, with Backend, and on gdl's, without
+/// it: Backend passes an embeddings response through unchanged.
 #[tokio::test]
 async fn embeddings_are_the_same_both_ways() {
     let fixture = Fixture::load();
@@ -802,9 +978,10 @@ async fn embeddings_are_the_same_both_ways() {
         preprocessor.clone(),
         linked::<_, _, EmbeddingsEngineOutput, _, _>(backend.clone(), terminal.clone()),
     );
+    // The gdl chain has no Backend, a pass-through for embeddings, as the frontend composes it.
     let gdl = pipeline(native::<_, NvCreateEmbeddingRequest, _>(
         preprocessor,
-        native::<_, PreprocessedEmbeddingRequest, _>(backend, sink(terminal)),
+        sink(terminal),
     ));
     for format in [serde_json::json!("float"), serde_json::json!("base64")] {
         let make = || {

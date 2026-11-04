@@ -18,6 +18,7 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
+    marker::PhantomData,
     pin::Pin,
     sync::Arc,
     task::{Context as TaskContext, Poll, ready},
@@ -25,16 +26,19 @@ use std::{
 };
 
 use anyhow::Result;
-use futures::FutureExt;
 use futures::stream::{Stream, StreamExt};
 
 use crate::model_card::ModelDeploymentCard;
-use crate::operator::{Downstream, DynamoDownstream, GdlDownstream, GdlOperator, native};
+use crate::operator::{
+    Downstream, DynamoDownstream, DynamoForm, GdlForm, GdlOperator, Item, ItemForm, gdl_error,
+};
+use dynamo_gdl_adapters::CheckedItems;
 use dynamo_runtime::dynamo_nvtx_range;
 use dynamo_runtime::{
     error::{DynamoError, ErrorClass},
     pipeline::{
-        AsyncEngineContextProvider, ManyOut, Operator, ServerStreamingEngine, SingleIn, async_trait,
+        AsyncEngineContext, AsyncEngineContextProvider, ManyOut, Operator, ServerStreamingEngine,
+        SingleIn, async_trait,
     },
     protocols::{annotated::Annotated, maybe_error::MaybeError},
 };
@@ -72,8 +76,9 @@ pub struct Backend {
 ///
 /// Transition: make concrete when the gdl pipeline is the only local pipeline.
 #[allow(dead_code)]
-struct DecoderState<D: Downstream<PreprocessedRequest, LLMEngineOutput>> {
-    stream: D::Items,
+struct DecoderState<S, F> {
+    /// The engine's stream; `()` until the request is sent (see [`DecoderState::reading`]).
+    stream: S,
     decoders: HashMap<u32, Decoder>,
     finished_choices: HashSet<u32>,
     validate_engine_decode: bool,
@@ -96,6 +101,28 @@ struct DecoderState<D: Downstream<PreprocessedRequest, LLMEngineOutput>> {
     /// When `false`, `jailed_text` is left unset on every chunk rather than snapshotting the
     /// decoder's withheld state for a checkpoint nothing can ever consume.
     migration_possible: bool,
+    form: PhantomData<fn() -> F>,
+}
+
+impl<F> DecoderState<(), F> {
+    /// The state reading `stream`, the engine's response to the request it was built for.
+    fn reading<S>(self, stream: S) -> DecoderState<S, F> {
+        DecoderState {
+            stream,
+            decoders: self.decoders,
+            finished_choices: self.finished_choices,
+            validate_engine_decode: self.validate_engine_decode,
+            no_stop_trim: self.no_stop_trim,
+            retain_model_stop_token_text: self.retain_model_stop_token_text,
+            finished: self.finished,
+            tokenizer: self.tokenizer,
+            skip_special_tokens: self.skip_special_tokens,
+            pending_flush: self.pending_flush,
+            stream_ended: self.stream_ended,
+            migration_possible: self.migration_possible,
+            form: PhantomData,
+        }
+    }
 }
 
 /// Decodes one vocabulary ID for per-token logprob metadata.
@@ -206,11 +233,11 @@ impl Backend {
         }
     }
 
+    /// The decoders for one request, before its stream: the check that the request can be
+    /// decoded at all (a tokenizer, and a migration checkpoint that fits the prompt).
+    ///
     /// Transition: make concrete when the gdl pipeline is the only local pipeline.
-    fn decoder<D>(&self, stream: D::Items, params: DecoderParams) -> anyhow::Result<DecoderState<D>>
-    where
-        D: Downstream<PreprocessedRequest, LLMEngineOutput>,
-    {
+    fn decoder<F>(&self, params: DecoderParams) -> anyhow::Result<DecoderState<(), F>> {
         let Some(tokenizer) = self.tokenizer.as_ref() else {
             anyhow::bail!("Backend built from blank ModelDeploymentCard, no tokenizer");
         };
@@ -225,7 +252,7 @@ impl Backend {
         }
 
         Ok(DecoderState {
-            stream,
+            stream: (),
             decoders,
             finished_choices: HashSet::new(),
             validate_engine_decode: self.validate_engine_decode,
@@ -237,6 +264,7 @@ impl Backend {
             pending_flush: Vec::new(),
             stream_ended: false,
             migration_possible: params.migration_possible,
+            form: PhantomData,
         })
     }
 }
@@ -265,51 +293,82 @@ impl
     }
 }
 
-impl gdl::Operator for GdlOperator<Backend, PreprocessedRequest> {
+/// What Backend's forward half keeps of a request for its backward half: the decoders, and the
+/// request's context, which a stop reaches below.
+///
+/// Not boxed: measured on the gdl pipelines, a box costs one allocation and 1,000 to 1,800
+/// instructions per request, and saves no copy.
+pub struct BackendState {
+    decoder: DecoderState<(), GdlForm>,
+    context: Arc<dyn AsyncEngineContext>,
+}
+
+/// Backend around the stages below it: the forward half checks that the request can be decoded
+/// and builds its decoders, before the request is sent on, and the backward half detokenizes
+/// the response.
+impl gdl::Around for GdlOperator<Backend, PreprocessedRequest> {
     type UpReq = SingleIn<PreprocessedRequest>;
     type UpItem = Annotated<BackendOutput>;
     type DownReq = SingleIn<PreprocessedRequest>;
     type DownItem = Annotated<LLMEngineOutput>;
+    type State = BackendState;
 
-    fn generate<N>(
+    fn forward(
         &self,
-        cx: gdl::Cx,
+        _cx: &gdl::Cx,
         request: SingleIn<PreprocessedRequest>,
-        next: N,
-    ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<BackendOutput>>>> + Send
-    where
-        N: gdl::Next<SingleIn<PreprocessedRequest>, Annotated<LLMEngineOutput>>,
-    {
-        self.op
-            .generate_tokens(request, GdlDownstream::new(cx, next))
-            .map(native)
+    ) -> impl Future<Output = gdl::Result<(Self::DownReq, Self::State)>> + Send {
+        // Checked before the request is sent on, unlike the Dynamo operator: an eager error
+        // below cannot hide a request this Backend could not decode.
+        let decoder = self
+            .op
+            .decoder::<GdlForm>(DecoderParams::from_request(&request))
+            .map_err(gdl_error);
+        std::future::ready(decoder.map(|decoder| {
+            let context = request.context();
+            (request, BackendState { decoder, context })
+        }))
+    }
+
+    fn backward(
+        &self,
+        cx: &gdl::Cx,
+        state: Self::State,
+        input: gdl::Items<Annotated<LLMEngineOutput>>,
+    ) -> gdl::Items<Annotated<BackendOutput>> {
+        let input = CheckedItems::new(input, cx.clone(), state.context);
+        gdl::items(DecoderStream {
+            state: Some(state.decoder.reading(input)),
+        })
     }
 }
 
 impl Backend {
-    /// Send `request` on and detokenize the response: the body of Backend's Dynamo and gdl
-    /// operators.
+    /// Send `request` on and detokenize the response: the body of Backend's Dynamo operator.
+    /// The gdl pipeline runs Backend as an around node instead (see [`BackendState`]).
     ///
-    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
-    async fn generate_tokens<D>(
+    /// Transition: remove when the gdl pipeline is the only local pipeline.
+    async fn generate_tokens(
         &self,
         request: SingleIn<PreprocessedRequest>,
-        next: D,
-    ) -> Result<D::Response<BackendOutput>>
-    where
-        D: Downstream<PreprocessedRequest, LLMEngineOutput> + 'static,
-    {
+        next: DynamoDownstream<PreprocessedRequest, LLMEngineOutput>,
+    ) -> Result<ManyOut<Annotated<BackendOutput>>> {
         let decoder_params = DecoderParams::from_request(&request);
 
         let next_stream = next.send_items(request).await?;
 
         let context = next_stream.context();
-        let state = self.decoder::<D>(next_stream, decoder_params)?;
+        // Checked after the request is sent, as this path always has.
+        let state = self
+            .decoder::<DynamoForm>(decoder_params)?
+            .reading(next_stream);
 
-        Ok(D::respond_items(
-            DecoderStream { state: Some(state) },
-            context,
-        ))
+        Ok(
+            DynamoDownstream::<PreprocessedRequest, LLMEngineOutput>::respond_items(
+                DecoderStream { state: Some(state) },
+                context,
+            ),
+        )
     }
 }
 
@@ -322,17 +381,18 @@ impl Backend {
 /// moves only where it changes type.
 ///
 /// Transition: make concrete when the gdl pipeline is the only local pipeline.
-struct DecoderStream<D: Downstream<PreprocessedRequest, LLMEngineOutput>> {
+struct DecoderStream<S, F> {
     /// `None` once the stream has ended. That drops the stream below and the decoders when this
     /// stream ends, not when its caller drops it, as `unfold` did.
-    state: Option<DecoderState<D>>,
+    state: Option<DecoderState<S, F>>,
 }
 
-impl<D> Stream for DecoderStream<D>
+impl<S, F> Stream for DecoderStream<S, F>
 where
-    D: Downstream<PreprocessedRequest, LLMEngineOutput>,
+    F: ItemForm,
+    S: Stream<Item = Item<F, LLMEngineOutput>> + AsyncEngineContextProvider + Unpin,
 {
-    type Item = D::Item<BackendOutput>;
+    type Item = Item<F, BackendOutput>;
 
     // hot path: per-item-response
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
@@ -340,7 +400,7 @@ where
             return Poll::Ready(None);
         };
         match ready!(state.poll_step(cx)) {
-            Some(output) => Poll::Ready(Some(D::map_item(output, backend_output))),
+            Some(output) => Poll::Ready(Some(F::map_item(output, backend_output))),
             None => {
                 self.state = None;
                 Poll::Ready(None)
@@ -349,12 +409,13 @@ where
     }
 }
 
-impl<D> DecoderState<D>
+impl<S, F> DecoderState<S, F>
 where
-    D: Downstream<PreprocessedRequest, LLMEngineOutput>,
+    F: ItemForm,
+    S: Stream<Item = Item<F, LLMEngineOutput>> + AsyncEngineContextProvider + Unpin,
 {
     /// The next item, detokenized in place, or `None` when the stream has ended.
-    fn poll_step(&mut self, cx: &mut TaskContext<'_>) -> Poll<Option<D::Item<LLMEngineOutput>>> {
+    fn poll_step(&mut self, cx: &mut TaskContext<'_>) -> Poll<Option<Item<F, LLMEngineOutput>>> {
         // If we've already detected a local stop condition, end the stream
         if self.finished {
             return Poll::Ready(None);
@@ -363,12 +424,12 @@ where
         // `stream` already yielded `None` once; do not poll it again (unspecified
         // behavior for most `Stream` impls). Only drain the flush queue from here on.
         if self.stream_ended {
-            return Poll::Ready(self.pending_flush.pop().map(D::from_annotated));
+            return Poll::Ready(self.pending_flush.pop().map(F::from_annotated));
         }
 
         let output = loop {
             let output = ready!(self.stream.poll_next_unpin(cx));
-            let choice_already_finished = output.as_ref().map(D::item).is_some_and(|output| {
+            let choice_already_finished = output.as_ref().map(F::item).is_some_and(|output| {
                 !output.is_event()
                     && output.data.as_ref().is_some_and(|data| {
                         self.finished_choices
@@ -382,7 +443,7 @@ where
 
         match output {
             Some(mut item) => {
-                let output = D::item_mut(&mut item);
+                let output = F::item_mut(&mut item);
                 // move to state.process_output
                 // handle any error conditions / unwraps here
 
@@ -452,7 +513,7 @@ where
                         .class(ErrorClass::BackendProtocol)
                         .message("no_stop_trim requires backend token IDs through the matched stop; the backend omitted them (also required when a parser retains the model's stop token text)")
                         .build();
-                    return Poll::Ready(Some(D::from_annotated(Annotated::from_err(error))));
+                    return Poll::Ready(Some(F::from_annotated(Annotated::from_err(error))));
                 }
 
                 // if we have a data field without an event, then we might need to update the data
@@ -722,7 +783,7 @@ where
                     };
                     self.pending_flush.push(Annotated::from_data(data));
                 }
-                Poll::Ready(self.pending_flush.pop().map(D::from_annotated))
+                Poll::Ready(self.pending_flush.pop().map(F::from_annotated))
             }
         }
     }
@@ -763,6 +824,7 @@ fn backend_output(output: Annotated<LLMEngineOutput>) -> Annotated<BackendOutput
     }
 }
 
+// A pass-through, so the gdl embeddings pipeline has no Backend.
 // Transition: remove when the gdl pipeline is the only local pipeline.
 #[async_trait]
 impl
@@ -791,26 +853,6 @@ impl
         // - Usage statistics validation
 
         Ok(response_stream)
-    }
-}
-
-/// As the Dynamo operator above, a pass-through: the response is the stage below's own.
-impl gdl::Operator for GdlOperator<Backend, PreprocessedEmbeddingRequest> {
-    type UpReq = SingleIn<PreprocessedEmbeddingRequest>;
-    type UpItem = Annotated<EmbeddingsEngineOutput>;
-    type DownReq = SingleIn<PreprocessedEmbeddingRequest>;
-    type DownItem = Annotated<EmbeddingsEngineOutput>;
-
-    async fn generate<N>(
-        &self,
-        cx: gdl::Cx,
-        request: SingleIn<PreprocessedEmbeddingRequest>,
-        next: N,
-    ) -> gdl::Result<gdl::Items<Annotated<EmbeddingsEngineOutput>>>
-    where
-        N: gdl::Next<SingleIn<PreprocessedEmbeddingRequest>, Annotated<EmbeddingsEngineOutput>>,
-    {
-        next.generate(cx, request).await
     }
 }
 

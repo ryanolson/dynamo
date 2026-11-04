@@ -23,7 +23,8 @@ use crate::{
     namespace::NamespaceFilter,
     operator::GdlOperator,
     preprocessor::{
-        OpenAIPreprocessor, PreprocessedEmbeddingRequest, prompt::prompt_formatter_from_mdc,
+        OpenAIPreprocessor, PreprocessedEmbeddingRequest, PreprocessorNode,
+        prompt::prompt_formatter_from_mdc,
     },
     protocols::common::llm_backend::{
         BackendOutput, EmbeddingsEngineOutput, LLMEngineOutput, PreprocessedRequest,
@@ -527,7 +528,7 @@ where
             Context<PreprocessedRequest>,
             Pin<Box<dyn AsyncEngineStream<Annotated<BackendOutput>>>>,
         >,
-    GdlOperator<OpenAIPreprocessor, Req>: gdl::Operator<
+    PreprocessorNode<Req>: gdl::Around<
             UpReq = SingleIn<Req>,
             UpItem = Annotated<Resp>,
             DownReq = SingleIn<PreprocessedRequest>,
@@ -561,9 +562,8 @@ where
         .link_terminal(frontend)?)
 }
 
-/// [`build_pipeline`]'s chain as a gdl local pipeline, built from the terminal up as
-/// [`PreprocessedRouting::build_pipeline`]'s is. The preprocessor and Backend are native gdl
-/// operators.
+/// [`build_pipeline`]'s chain as a gdl local pipeline: one hop to the engine, with the
+/// preprocessor and Backend as its around nodes.
 fn compose_gdl_in_process_pipeline<Req, Resp>(
     preprocessor: Arc<OpenAIPreprocessor>,
     backend: Arc<Backend>,
@@ -572,32 +572,36 @@ fn compose_gdl_in_process_pipeline<Req, Resp>(
 where
     Req: Data,
     Resp: Data,
-    GdlOperator<OpenAIPreprocessor, Req>: gdl::Operator<
+    PreprocessorNode<Req>: gdl::Around<
             UpReq = SingleIn<Req>,
             UpItem = Annotated<Resp>,
             DownReq = SingleIn<PreprocessedRequest>,
             DownItem = Annotated<BackendOutput>,
         >,
 {
-    use gdl::{Hop, OperatorStage, SinkStage};
+    use gdl::{Hop, SinkStage};
     type Pre = PreprocessedRequest;
 
     let engine = SinkStage::new(Arc::new(EngineSink::new(engine)));
-    let backend = OperatorStage::new(
-        Arc::new(GdlOperator::<_, Pre>::new(backend)),
-        Hop::new((), engine, ()),
-    );
-    let preprocessor = OperatorStage::new(
-        Arc::new(GdlOperator::<_, Req>::new(preprocessor)),
-        Hop::new((), backend, ()),
+    let below = Arc::new(PipelineEngine::<_, Pre, BackendOutput>::for_dynamo_stages(
+        around::<_, Pre, _>(backend.clone(), engine.clone()),
+    ));
+    let (preprocessor_forward, preprocessor_backward) =
+        gdl::around(Arc::new(PreprocessorNode::<Req>::new(preprocessor, below)));
+    let (backend_forward, backend_backward) =
+        gdl::around(Arc::new(GdlOperator::<_, Pre>::new(backend)));
+    let hop = Hop::new(
+        (preprocessor_forward, (backend_forward, ())),
+        engine,
+        (backend_backward, (preprocessor_backward, ())),
     );
     Arc::new(PipelineEngine::<_, Req, Resp>::for_dynamo_stages(
-        gdl::Source::new(Hop::new((), preprocessor, ())),
+        gdl::Source::new(hop),
     ))
 }
 
 /// Build the embeddings pipeline: preprocessor, then backend, then `engine`, composed on
-/// `local_pipeline`.
+/// `local_pipeline`. The gdl pipeline has no backend (see [`compose_gdl_embeddings_pipeline`]).
 ///
 /// The caller builds `preprocessor` (`OpenAIPreprocessor::new_for_embeddings`), so a card it
 /// cannot serve fails before the caller creates `engine`.
@@ -611,13 +615,8 @@ pub fn build_embeddings_pipeline(
     // Transition: remove when the gdl pipeline is the only local pipeline.
     local_pipeline: LocalPipeline,
 ) -> anyhow::Result<OpenAIEmbeddingsStreamingEngine> {
-    let backend = Backend::from_mdc(card);
     if local_pipeline == LocalPipeline::Gdl {
-        return Ok(compose_gdl_embeddings_pipeline(
-            preprocessor,
-            backend,
-            engine,
-        ));
+        return Ok(compose_gdl_embeddings_pipeline(preprocessor, engine));
     }
 
     // Transition: remove when the gdl pipeline is the only local pipeline.
@@ -626,7 +625,7 @@ pub fn build_embeddings_pipeline(
         ManyOut<Annotated<NvCreateEmbeddingResponse>>,
     >::new();
     let preprocessor = preprocessor.into_operator();
-    let backend = backend.into_operator();
+    let backend = Backend::from_mdc(card).into_operator();
     let service_backend = ServiceBackend::from_engine(engine);
 
     Ok(frontend
@@ -638,30 +637,24 @@ pub fn build_embeddings_pipeline(
         .link_terminal(frontend)?)
 }
 
-/// [`build_embeddings_pipeline`]'s chain as a gdl local pipeline, built from the terminal up
-/// as [`PreprocessedRouting::build_pipeline`]'s is. The preprocessor and Backend are native
-/// gdl operators.
+/// [`build_embeddings_pipeline`]'s chain as a gdl local pipeline: the preprocessor, a native
+/// gdl operator, over `engine`. Backend passes an embeddings response through unchanged, so the
+/// gdl chain has none.
 fn compose_gdl_embeddings_pipeline(
     preprocessor: Arc<OpenAIPreprocessor>,
-    backend: Arc<Backend>,
     engine: ServiceEngine<
         SingleIn<PreprocessedEmbeddingRequest>,
         ManyOut<Annotated<EmbeddingsEngineOutput>>,
     >,
 ) -> OpenAIEmbeddingsStreamingEngine {
     use gdl::{Hop, OperatorStage, SinkStage};
-    type Pre = PreprocessedEmbeddingRequest;
     type Req = NvCreateEmbeddingRequest;
     type Resp = NvCreateEmbeddingResponse;
 
     let router = SinkStage::new(Arc::new(EngineSink::new(engine)));
-    let backend = OperatorStage::new(
-        Arc::new(GdlOperator::<_, Pre>::new(backend)),
-        Hop::new((), router, ()),
-    );
     let preprocessor = OperatorStage::new(
         Arc::new(GdlOperator::<_, Req>::new(preprocessor)),
-        Hop::new((), backend, ()),
+        Hop::new((), router, ()),
     );
     Arc::new(PipelineEngine::<_, Req, Resp>::for_dynamo_stages(
         gdl::Source::new(Hop::new((), preprocessor, ())),
@@ -759,7 +752,7 @@ impl PreprocessedRouting {
                 Context<PreprocessedRequest>,
                 Pin<Box<dyn AsyncEngineStream<Annotated<BackendOutput>>>>,
             >,
-        GdlOperator<OpenAIPreprocessor, Req>: gdl::Operator<
+        PreprocessorNode<Req>: gdl::Around<
                 UpReq = SingleIn<Req>,
                 UpItem = Annotated<Resp>,
                 DownReq = SingleIn<PreprocessedRequest>,
@@ -809,7 +802,7 @@ impl PreprocessedRouting {
     where
         Req: Data,
         Resp: Data,
-        GdlOperator<OpenAIPreprocessor, Req>: gdl::Operator<
+        PreprocessorNode<Req>: gdl::Around<
                 UpReq = SingleIn<Req>,
                 UpItem = Annotated<Resp>,
                 DownReq = SingleIn<PreprocessedRequest>,
@@ -834,7 +827,7 @@ impl PreprocessedRouting {
     where
         Req: Data,
         Resp: Data,
-        GdlOperator<OpenAIPreprocessor, Req>: gdl::Operator<
+        PreprocessorNode<Req>: gdl::Around<
                 UpReq = SingleIn<Req>,
                 UpItem = Annotated<Resp>,
                 DownReq = SingleIn<PreprocessedRequest>,
@@ -842,23 +835,36 @@ impl PreprocessedRouting {
             >,
     {
         type Pre = PreprocessedRequest;
-        let token_backend = native::<_, Pre, _>(token_backend, self.gdl_routers());
-        let migration = native::<_, BackendOutput, _>(migration, token_backend);
-        gdl::Source::new(native::<_, Req, _>(preprocessor, migration))
+        // Migration over Backend's hop to the routers: the inner end of the preprocessor's hop,
+        // and, as an engine of its own, where a speculative prefill is sent.
+        let migration = gdl::OperatorStage::new(
+            Arc::new(GdlOperator::<_, BackendOutput>::new(migration)),
+            around::<_, Pre, _>(token_backend, self.gdl_routers()),
+        );
+        let below = Arc::new(PipelineEngine::<_, Pre, BackendOutput>::for_dynamo_stages(
+            gdl::Hop::new((), migration.clone(), ()),
+        ));
+        let (forward, backward) =
+            gdl::around(Arc::new(PreprocessorNode::<Req>::new(preprocessor, below)));
+        gdl::Source::new(gdl::Hop::new((forward, ()), migration, (backward, ())))
     }
 
     /// The encoder router, the prefill router and the terminal as native gdl stages: the tail
     /// of [`gdl_pipeline`](Self::gdl_pipeline) and
-    /// [`gdl_preprocessed_pipeline`](Self::gdl_preprocessed_pipeline).
+    /// [`gdl_preprocessed_pipeline`](Self::gdl_preprocessed_pipeline), as the inner end of the
+    /// hop that calls the encoder router.
     fn gdl_routers(
         &self,
-    ) -> impl gdl::Next<SingleIn<PreprocessedRequest>, Annotated<LLMEngineOutput>> {
-        use gdl::{Hop, SinkStage};
+    ) -> impl gdl::Inner<SingleIn<PreprocessedRequest>, Item = Annotated<LLMEngineOutput>> {
+        use gdl::{Hop, OperatorStage, SinkStage};
         type Pre = PreprocessedRequest;
 
         let terminal = Hop::new((), SinkStage::new(Arc::new(self.backend.clone())), ());
         let prefill = native::<_, Pre, _>(self.prefill_router.clone(), terminal);
-        native::<_, Pre, _>(self.encoder_router.clone(), prefill)
+        OperatorStage::new(
+            Arc::new(GdlOperator::<_, Pre>::new(self.encoder_router.clone())),
+            prefill,
+        )
     }
 
     /// Bring your own pre/post processor. Used when frontend has `--dyn-chat-processor
@@ -923,9 +929,25 @@ impl PreprocessedRouting {
     {
         gdl::Source::new(native::<_, LLMEngineOutput, _>(
             migration,
-            self.gdl_routers(),
+            gdl::Hop::new((), self.gdl_routers(), ()),
         ))
     }
+}
+
+/// A hop to `I` with `GdlOperator<O, K>` as its one around node.
+type AroundHop<O, K, I> = gdl::Hop<
+    (gdl::ForwardHalf<GdlOperator<O, K>>, ()),
+    I,
+    (gdl::BackwardHalf<GdlOperator<O, K>>, ()),
+>;
+
+/// `op` as an around node of the hop to `inner`, keyed by `K` (see [`GdlOperator`]).
+fn around<O, K, I>(op: Arc<O>, inner: I) -> AroundHop<O, K, I>
+where
+    GdlOperator<O, K>: gdl::Around,
+{
+    let (forward, backward) = gdl::around(Arc::new(GdlOperator::new(op)));
+    gdl::Hop::new((forward, ()), inner, (backward, ()))
 }
 
 /// `op` as a native gdl operator, keyed by `K` (see [`GdlOperator`]), over the hop `next`.
