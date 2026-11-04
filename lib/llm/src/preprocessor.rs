@@ -8937,7 +8937,7 @@ impl OpenAIPreprocessor {
                 let outcome = agg_fut.await;
                 if let Some(reason) = outcome.drop_reason.as_deref() {
                     tracing::debug!(
-                        state.request_id = %payload.request_id(),
+                        request_id = %payload.request_id(),
                         drop_reason = %reason,
                         partial_response = outcome.response.is_some(),
                         "request payload: response aggregation incomplete; emitting record with drop reason"
@@ -8951,8 +8951,8 @@ impl OpenAIPreprocessor {
             Box::pin(transformed_stream)
         };
 
-        // Step 5: Speculative next-turn prefill. A native operator builds the engine for it
-        // only when the request asks for it.
+        // Step 5: Speculative next-turn prefill. `warmup` gives the engine only when the request
+        // asks for one.
         let final_stream = if speculative_prefill::enabled(request) {
             speculative_prefill::maybe_wrap_stream(
                 final_stream,
@@ -8970,7 +8970,7 @@ impl OpenAIPreprocessor {
         let final_stream =
             crate::request_trace::wrap_chat_request_end_stream(final_stream, state.trace_state);
 
-        // prepend the state.annotations to the response stream
+        // prepend the annotations to the response stream
         stream::iter(state.annotations).chain(final_stream)
     }
 }
@@ -10091,6 +10091,112 @@ mod tests {
     };
     use dynamo_runtime::pipeline::async_trait;
     use std::path::PathBuf;
+
+    async fn dropped_payload_log_fields() -> std::collections::HashMap<String, String> {
+        use dynamo_runtime::logging::FieldVisitor;
+        use std::sync::Mutex;
+        use tracing_subscriber::prelude::*;
+
+        struct PayloadLog(Mutex<Option<tokio::sync::oneshot::Sender<FieldVisitor>>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PayloadLog {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _context: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().target() != "dynamo_llm::preprocessor"
+                    || event
+                        .metadata()
+                        .fields()
+                        .field("partial_response")
+                        .is_none()
+                {
+                    return;
+                }
+                let mut fields = FieldVisitor::default();
+                event.record(&mut fields);
+                if let Some(sender) = self.0.lock().unwrap().take() {
+                    let _ = sender.send(fields);
+                }
+            }
+        }
+
+        let (sender, received) = tokio::sync::oneshot::channel();
+        let _interest_guard = crate::test_utils::tracing_interest_guard();
+        let subscriber = tracing_subscriber::registry().with(PayloadLog(Mutex::new(Some(sender))));
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let card =
+            ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
+                .unwrap();
+        let preprocessor = OpenAIPreprocessor::new(card).unwrap();
+        let request_id = "dropped-payload-request";
+        let mut request: NvCreateChatCompletionRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "TinyLlama_v1.1",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true,
+                "max_tokens": 1,
+            }))
+            .unwrap();
+        let context =
+            PipelineContext::with_id_and_metadata((), request_id.to_string(), Default::default());
+        let controller = context.context();
+        let (_, mut state) = preprocessor
+            .chat_forward(
+                &mut request,
+                context,
+                |request| std::future::ready(Ok(request)),
+                |request, _, state| Ok((request, state)),
+            )
+            .await
+            .unwrap();
+        state.payload_handle = Some(
+            crate::request_trace::payload::RequestPayloadHandle::for_test(
+                request_id,
+                "TinyLlama_v1.1",
+                true,
+            ),
+        );
+        state.payload_parsing_options = Some(ParsingOptions::new(None, None));
+        let stream = preprocessor.chat_backward(
+            &request,
+            state,
+            None,
+            stream::pending(),
+            controller,
+            || panic!("this request does not enable speculative prefill"),
+        );
+        drop(stream);
+        tokio::time::timeout(std::time::Duration::from_secs(5), received)
+            .await
+            .expect("the dropped payload emits its diagnostic")
+            .unwrap()
+            .fields
+    }
+
+    #[tokio::test]
+    async fn dropped_payload_log_reports_the_stream_drop() {
+        let fields = dropped_payload_log_fields().await;
+        assert_eq!(
+            fields.get("drop_reason").map(String::as_str),
+            Some("response_stream_dropped")
+        );
+        assert_eq!(
+            fields.get("partial_response").map(String::as_str),
+            Some("false")
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_payload_log_keeps_the_request_id_field() {
+        let fields = dropped_payload_log_fields().await;
+        assert_eq!(
+            fields.get("request_id").map(String::as_str),
+            Some("dropped-payload-request"),
+            "{fields:?}"
+        );
+    }
 
     #[test]
     fn video_routing_startup_does_not_claim_active_routing() {
