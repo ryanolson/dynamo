@@ -9,10 +9,12 @@
 //! - [`CxBridge`]: a gdl `Cx` from a Dynamo request context, and back.
 //! - [`EngineSink`]: a Dynamo engine as a gdl `Sink`.
 //! - [`PipelineEngine`]: a gdl `Next` as a Dynamo `AsyncEngine`.
-//! - [`AnnotatedItems`] and [`enter`]: what a native gdl operator over Dynamo
-//!   items uses to read its downstream and to raise an eager error, so it
-//!   behaves at its edges as the adapters do. `dynamo_llm::operator` builds
-//!   Backend and the preprocessor this way.
+//! - [`AnnotatedItems`], [`CheckedItems`] and [`enter`]: what a native gdl
+//!   operator over Dynamo items uses to read its downstream and to raise an
+//!   eager error, so it behaves at its edges as the adapters do.
+//!   `dynamo_llm::operator` builds Backend, the preprocessor, Migration and the
+//!   routers this way; the stages that edit items in place read through
+//!   `CheckedItems`, which leaves each item in its gdl `Result`.
 //! - [`metrics`]: a gdl node's metrics on a Dynamo endpoint.
 //! - [`config`]: how a gdl node in Dynamo gets its configuration.
 //!
@@ -45,6 +47,6 @@ mod error;
 mod sink;
 
 pub use bridge::{CxBridge, REQUEST_ID};
-pub use engine::{AnnotatedItems, PipelineEngine};
+pub use engine::{AnnotatedItems, CheckedItems, PipelineEngine};
 pub use error::enter;
 pub use sink::EngineSink;
