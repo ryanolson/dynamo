@@ -9,6 +9,8 @@
 //! - [`CxBridge`]: a gdl `Cx` from a Dynamo request context, and back.
 //! - [`EngineSink`]: a Dynamo engine as a gdl `Sink`.
 //! - [`PipelineEngine`]: a gdl `Next` as a Dynamo `AsyncEngine`.
+//! - [`Carried`] and [`Boxed`]: how a gdl pipeline carries a Dynamo request,
+//!   as `SingleIn<T>` itself or, for a large request, boxed.
 //! - [`AnnotatedItems`], [`CheckedItems`] and [`enter`]: what a native gdl
 //!   operator over Dynamo items uses to read its downstream and to raise an
 //!   eager error, so it behaves at its edges as the adapters do.
@@ -27,9 +29,10 @@
 //!                                                         \-> SinkStage(EngineSink(engine))
 //! ```
 //!
-//! The request stays Dynamo's `SingleIn<T>` and its context is the source of
-//! truth: `PipelineEngine` derives a fresh `Cx` from the context it
-//! receives, and nothing is stored in the context's registry, because
+//! The request stays Dynamo's `SingleIn<T>`, boxed for a large one
+//! ([`Boxed`]), and its context is the source of truth: `PipelineEngine`
+//! derives a fresh `Cx` from the context it receives, and nothing is stored
+//! in the context's registry, because
 //! Migration rebuilds the context of every attempt. Items stay `Annotated<T>`,
 //! so a Dynamo error item does not end a stream, while a gdl `Err` does.
 //!
@@ -44,9 +47,11 @@ pub mod metrics;
 mod bridge;
 mod engine;
 mod error;
+mod request;
 mod sink;
 
 pub use bridge::{CxBridge, REQUEST_ID};
 pub use engine::{AnnotatedItems, CheckedItems, PipelineEngine};
 pub use error::enter;
+pub use request::{Boxed, Carried, SpareBox};
 pub use sink::EngineSink;

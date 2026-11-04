@@ -16,13 +16,15 @@ use gdl::Items;
 
 use crate::bridge::CxBridge;
 use crate::error::{exit, exit_item};
+use crate::request::Carried;
 
 /// A gdl [`Next`](gdl::Next), such as a [`Source`](gdl::Source), as a Dynamo
 /// `AsyncEngine`, so that `ModelManager`, the HTTP service and Python store it
 /// as they store any engine.
 ///
 /// Each call derives a fresh `Cx` from the request's context and passes the
-/// request on as it is: the gdl request type is Dynamo's `SingleIn<Req>`. The
+/// request on in its carrier `R`: Dynamo's `SingleIn<Req>` as it is, or
+/// [`Boxed<Req>`](crate::Boxed) for a large request. The
 /// `Cx` follows the context's stop and, unless a Dynamo engine runs in the
 /// pipeline ([`for_dynamo_stages`](Self::for_dynamo_stages)), its kill (see
 /// [`CxBridge`]). The response stream carries the request's
@@ -33,16 +35,16 @@ use crate::error::{exit, exit_item};
 /// A gdl `Err` item ends the stream: it leaves as a last error item, or with
 /// no item when it is a cancel of a request that was killed, since a killed
 /// Dynamo stream just ends.
-pub struct PipelineEngine<N, Req, T> {
+pub struct PipelineEngine<N, Req, T, R = SingleIn<Req>> {
     next: N,
     /// Whether a kill of the request cancels the `Cx` (see [`CxBridge`]).
     ///
     /// Transition: remove when no Dynamo stage runs inside a gdl pipeline.
     cancel_on_kill: bool,
-    types: PhantomData<fn(Req) -> T>,
+    types: PhantomData<fn(Req, R) -> T>,
 }
 
-impl<N, Req, T> PipelineEngine<N, Req, T> {
+impl<N, Req, T, R> PipelineEngine<N, Req, T, R> {
     /// Wrap a gdl pipeline of gdl-native nodes: a kill of the request cancels
     /// it ([`CxBridge::cx`]).
     pub fn new(next: N) -> Self {
@@ -69,12 +71,13 @@ impl<N, Req, T> PipelineEngine<N, Req, T> {
 }
 
 #[async_trait]
-impl<N, Req, T> AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, anyhow::Error>
-    for PipelineEngine<N, Req, T>
+impl<N, Req, T, R> AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, anyhow::Error>
+    for PipelineEngine<N, Req, T, R>
 where
-    N: gdl::Next<SingleIn<Req>, Annotated<T>>,
+    N: gdl::Next<R, Annotated<T>>,
     Req: Data,
     T: Data,
+    R: Carried<Req>,
 {
     async fn generate(&self, request: SingleIn<Req>) -> anyhow::Result<ManyOut<Annotated<T>>> {
         let context = request.context();
@@ -84,7 +87,7 @@ where
             CxBridge::cx_for_dynamo_stages(request.controller())
         };
         let root = cx.clone();
-        match self.next.generate(cx, request).await {
+        match self.next.generate(cx, R::carry(request)).await {
             Ok(items) => Ok(ResponseStream::new(
                 Box::pin(AnnotatedItems::new(items, root, Arc::clone(&context))),
                 context,
