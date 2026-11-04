@@ -870,3 +870,86 @@ async fn a_slow_client_bounds_remote_worker_production_to_its_reads() {
     runtime.shutdown();
     assert_eq!(outcomes, [("dynamo", 5), ("gdl", 5)]);
 }
+
+/// A finite retry budget must still let the caller run to cancel an eager failure storm.
+#[tokio::test]
+#[ignore = "review finding: a pass-through inner hop spends the entire eager retry budget in one poll"]
+async fn the_request_edge_alone_keeps_eager_retries_cancellable() {
+    use dynamo_gdl_adapters::{EngineSink, PipelineEngine};
+    use dynamo_llm::migration::Migration;
+    use dynamo_llm::operator::GdlOperator;
+    use gdl::{Hop, OperatorStage, SinkStage, Source};
+
+    const RETRIES: u32 = 4096;
+
+    // The proposed inner hop calls its inner end without creating an attempt boundary.
+    #[derive(Clone)]
+    struct PassThrough<I>(I);
+
+    impl<Req, I> gdl::Next<Req, I::Item> for PassThrough<I>
+    where
+        Req: Send + 'static,
+        I: gdl::Inner<Req>,
+    {
+        fn generate(
+            &self,
+            cx: gdl::Cx,
+            request: Req,
+        ) -> impl std::future::Future<Output = gdl::Result<gdl::Items<I::Item>>> + Send {
+            self.0.call(cx, request)
+        }
+    }
+
+    async fn attempts_before_cancel<N>(next: N, worker: Arc<Worker>) -> usize
+    where
+        N: gdl::Next<SingleIn<PreprocessedRequest>, Annotated<LLMEngineOutput>>,
+    {
+        let migration = Migration::new(
+            RETRIES,
+            None,
+            "TinyLlama_v1.1".to_string(),
+            Arc::new(Metrics::new()),
+        );
+        let edge = Source::new(Hop::new(
+            (),
+            OperatorStage::new(
+                Arc::new(GdlOperator::<_, LLMEngineOutput>::new(migration)),
+                next,
+            ),
+            (),
+        ));
+        let engine = PipelineEngine::<_, PreprocessedRequest, LLMEngineOutput>::new(edge);
+        let request = preprocessed();
+        let context = request.context();
+        let mut call = Box::pin(engine.generate(request));
+        tokio::select! {
+            biased;
+            result = &mut call => drop(result),
+            () = std::future::poll_fn(|_| {
+                if worker.calls() > 0 {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            }) => {
+                context.kill();
+                let _ = tokio::time::timeout(Duration::from_secs(5), &mut call)
+                    .await
+                    .expect("the cancelled dispatch ends");
+            }
+        }
+        worker.calls()
+    }
+
+    let (worker, _) = Worker::new(vec![Turn::Unavailable]);
+    let sink = SinkStage::new(Arc::new(EngineSink::new(worker.clone() as Engine)));
+    let scoped = attempts_before_cancel(Hop::new((), sink, ()), worker).await;
+    let (worker, _) = Worker::new(vec![Turn::Unavailable]);
+    let sink = SinkStage::new(Arc::new(EngineSink::new(worker.clone() as Engine)));
+    let pass_through = attempts_before_cancel(PassThrough(sink), worker).await;
+    assert!(scoped < RETRIES as usize + 1, "scoped control: {scoped}");
+    assert!(
+        pass_through < RETRIES as usize + 1,
+        "scoped control: {scoped}, pass-through: {pass_through}"
+    );
+}
