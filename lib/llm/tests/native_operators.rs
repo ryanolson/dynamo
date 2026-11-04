@@ -467,6 +467,40 @@ async fn backend_returns_the_terminals_eager_error_both_ways() {
     assert_eq!(d, g);
 }
 
+/// A Backend that cannot decode (no tokenizer) on the Dynamo path: it sends the request on
+/// first and checks after, so an eager error from below wins, and with none the terminal is
+/// called before the decoder's error.
+///
+/// Transition: remove when the Dynamo path checks before it sends the request on.
+#[tokio::test]
+async fn a_backend_that_cannot_decode_checks_after_dispatch_on_dynamo() {
+    let fixture = Fixture::load();
+    let blank = Backend::from_mdc(&ModelDeploymentCard::with_name_only("blank"));
+
+    let failing = Script::new(Reply::Fail(worker_unavailable));
+    let engine = linked::<_, _, BackendOutput, _, _>(blank.clone(), failing.clone());
+    let error = engine
+        .generate(request(preprocessed(&fixture, false)))
+        .await
+        .expect_err("an eager error");
+    assert!(
+        error
+            .to_string()
+            .contains("prefill routing is still activating"),
+        "the terminal's error wins: {error:#}"
+    );
+    assert_eq!(failing.calls(), 1);
+
+    let answering = Script::new(Reply::Items(fixture.tokens("fox")));
+    let engine = linked::<_, _, BackendOutput, _, _>(blank, answering.clone());
+    let error = engine
+        .generate(request(preprocessed(&fixture, false)))
+        .await
+        .expect_err("the decoder's error");
+    assert!(error.to_string().contains("no tokenizer"), "{error:#}");
+    assert_eq!(answering.calls(), 1, "the terminal was called first");
+}
+
 /// With `no_stop_trim`, a text-only output is an error, and Backend stops the request below
 /// it. On the gdl path that stop must reach the terminal's Dynamo context, not only a `Cx`.
 #[tokio::test]
@@ -609,6 +643,27 @@ async fn chat_rejects_an_invalid_request_before_dispatch_both_ways() {
         (found, format!("{error:#}"))
     });
     assert!(d.0.is_some(), "{d:?}");
+    assert_eq!(d, g);
+    assert_eq!(terminal.calls(), 0);
+}
+
+/// Tool definitions that do not validate fail the chat request before it is sent on, both ways,
+/// even against a terminal that would fail at once: the client sees the validation error.
+#[tokio::test]
+async fn invalid_tools_fail_before_an_eager_error_below_both_ways() {
+    let fixture = Fixture::load();
+    let terminal = Script::new(Reply::Fail(worker_unavailable));
+    let [dynamo, gdl] = chat_both(&fixture, terminal.clone());
+    let invalid = || request(chat(serde_json::json!({"tools": []})));
+    let [d, g] = both(dynamo, gdl, invalid).await.map(|result| {
+        let error = result.expect_err("an eager error");
+        let found = error
+            .chain()
+            .find_map(|e| e.downcast_ref::<DynamoError>())
+            .map(|e| e.error_type());
+        (found, format!("{error:#}"))
+    });
+    assert!(d.1.contains("tools array cannot be empty"), "{d:?}");
     assert_eq!(d, g);
     assert_eq!(terminal.calls(), 0);
 }
