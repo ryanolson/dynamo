@@ -631,6 +631,9 @@ async fn a_kill_during_a_retry_ends_pipeline_c_quietly_on_both_local_pipelines()
 /// What each local pipeline does today when the request is killed while Migration's retry is
 /// dispatching, so that a change to either shows. The required outcome, Dynamo's, is in the
 /// ignored test above.
+///
+/// Transition: remove when `a_kill_during_a_retry_ends_pipeline_c_quietly_on_both_local_pipelines`
+/// passes.
 #[tokio::test]
 async fn a_kill_during_a_retry_today() {
     let mut outcomes = Vec::new();
