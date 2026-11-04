@@ -2215,10 +2215,10 @@ mod tests {
             let handoff = Annotated::from_data(LLMEngineOutput {
                 token_ids: vec![11],
                 finish_reason: Some(FinishReason::Length),
-                disaggregated_params: Some(serde_json::json!({
+                disaggregated_params: Some(Box::new(serde_json::json!({
                     "request_type": "context_only",
                     "ctx_request_id": "staged-prefill",
-                })),
+                }))),
                 ..Default::default()
             });
             use dynamo_runtime::protocols::maybe_error::MaybeError;
@@ -2391,11 +2391,11 @@ mod tests {
                 request: SingleIn<dynamo_runtime::pipeline::AddressedRequest<PreprocessedRequest>>,
             ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
                 let handoff = Annotated::from_data(LLMEngineOutput {
-                    disaggregated_params: Some(serde_json::json!({
+                    disaggregated_params: Some(Box::new(serde_json::json!({
                         "bootstrap_host": "prefill",
                         "bootstrap_port": 1,
                         "bootstrap_room": 7,
-                    })),
+                    }))),
                     ..Default::default()
                 });
                 let release = self.0.clone();
@@ -2499,10 +2499,10 @@ mod tests {
                 let handoff = Annotated::from_data(LLMEngineOutput {
                     token_ids: vec![11],
                     finish_reason: Some(FinishReason::Length),
-                    disaggregated_params: Some(serde_json::json!({
+                    disaggregated_params: Some(Box::new(serde_json::json!({
                         "request_type": "context_only",
                         "ctx_request_id": "prefill-after-kill",
-                    })),
+                    }))),
                     ..Default::default()
                 });
                 Ok(ResponseStream::new(
