@@ -617,36 +617,12 @@ async fn kill_during_the_retry(local_pipeline: LocalPipeline) -> String {
 /// retry's worker sees the kill and answers with no item, and the stream ends quietly: the
 /// failure that caused the retry is not sent, because the retry was made.
 #[tokio::test]
-#[ignore = "kill during a Migration retry: on gdl the hop below Migration drops the retry's \
-            dispatch and returns Cancelled, Migration then sends the failure that caused the retry \
-            as a last error item, where Dynamo's chain ends the stream quietly"]
 async fn a_kill_during_a_retry_ends_pipeline_c_quietly_on_both_local_pipelines() {
     let mut outcomes = Vec::new();
     for local_pipeline in BOTH {
         outcomes.push(kill_during_the_retry(local_pipeline).await);
     }
     assert_eq!(outcomes, ["after the kill: 0 items, errors [], calls 2"; 2]);
-}
-
-/// What each local pipeline does today when the request is killed while Migration's retry is
-/// dispatching, so that a change to either shows. The required outcome, Dynamo's, is in the
-/// ignored test above.
-///
-/// Transition: remove when `a_kill_during_a_retry_ends_pipeline_c_quietly_on_both_local_pipelines`
-/// passes.
-#[tokio::test]
-async fn a_kill_during_a_retry_today() {
-    let mut outcomes = Vec::new();
-    for local_pipeline in BOTH {
-        outcomes.push(kill_during_the_retry(local_pipeline).await);
-    }
-    assert_eq!(
-        outcomes,
-        [
-            "after the kill: 0 items, errors [], calls 2",
-            "after the kill: 1 items, errors [\"Unavailable: worker went away\"], calls 2",
-        ]
-    );
 }
 
 /// A kill while Migration's retry after an eager `WorkerUnavailable` is still dispatching:
