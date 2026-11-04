@@ -594,7 +594,7 @@ impl PrefillRouter {
                         .dispatch_kv_plan(conditional_request, decision.plan)
                         .await?;
                     return with_bypass_marker(
-                        Box::pin(response_stream),
+                        response_stream.into_many_out(),
                         client_requested_bypass_marker,
                     )
                     .map(D::adopt);

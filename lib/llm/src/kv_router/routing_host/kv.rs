@@ -605,13 +605,11 @@ impl RoutingHost {
         if route_span.is_disabled() {
             return Ok(response);
         }
-        // The route span is on, so the response goes into its wrapper, which takes a boxed
-        // response; this path pays for the box either way.
-        let context = response.context();
-        Ok(ResponseStream::from_parts(
-            Box::pin(wrap_route_span(Box::pin(response), route_span)),
-            context,
-        ))
+        // The route span is on: its wrapper takes and returns a boxed response, as before.
+        Ok(super::RouteResponse::Boxed(wrap_route_span(
+            response.into_many_out(),
+            route_span,
+        )))
     }
 
     fn warn_if_output_replay_annotation_ignored(
@@ -675,7 +673,7 @@ impl RoutingHost {
         let stream = self.dispatch_kv_plan(request, plan).await?;
         Ok(PrefillDispatch {
             metadata,
-            stream: Box::pin(stream),
+            stream: stream.into_many_out(),
             booking,
         })
     }
