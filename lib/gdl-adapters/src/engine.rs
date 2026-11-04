@@ -102,8 +102,11 @@ where
 /// so it sees what a Dynamo operator on Dynamo's `link` chain sees from the
 /// same stages. One that can work on the gdl item as it is reads through
 /// [`CheckedItems`] instead, and saves taking each item out of its `Result`.
+/// The two apply the same rule.
 pub struct AnnotatedItems<T> {
-    items: CheckedItems<T>,
+    items: Option<Items<Annotated<T>>>,
+    root: gdl::Cx,
+    context: Arc<dyn AsyncEngineContext>,
 }
 
 impl<T> AnnotatedItems<T> {
@@ -115,21 +118,27 @@ impl<T> AnnotatedItems<T> {
         context: Arc<dyn AsyncEngineContext>,
     ) -> Self {
         Self {
-            items: CheckedItems::new(items, root, context),
+            items: Some(items),
+            root,
+            context,
         }
     }
 }
 
 impl<T> std::fmt::Debug for AnnotatedItems<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.items.fmt(f)
+        f.debug_struct("AnnotatedItems")
+            .field("ended", &self.items.is_none())
+            .field("root", &self.root)
+            .field("context", &self.context.id())
+            .finish()
     }
 }
 
 /// The request's Dynamo context, as a Dynamo response stream gives it.
 impl<T: Data> AsyncEngineContextProvider for AnnotatedItems<T> {
     fn context(&self) -> Arc<dyn AsyncEngineContext> {
-        self.items.context()
+        Arc::clone(&self.context)
     }
 }
 
@@ -137,13 +146,35 @@ impl<T: Data> Stream for AnnotatedItems<T> {
     type Item = Annotated<T>;
 
     fn poll_next(mut self: Pin<&mut Self>, task: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        match Pin::new(&mut self.items).poll_next(task) {
+        let Some(items) = self.items.as_mut() else {
+            return Poll::Ready(None);
+        };
+        match items.as_mut().poll_next(task) {
             Poll::Ready(Some(Ok(item))) => Poll::Ready(Some(item)),
-            Poll::Ready(Some(Err(_))) => unreachable!("checked items carry no `Err`"),
-            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(Some(Err(error))) => {
+                self.items = None;
+                Poll::Ready(last_item(error, &self.root, self.context.as_ref()))
+            }
+            Poll::Ready(None) => {
+                self.items = None;
+                Poll::Ready(None)
+            }
             Poll::Pending => Poll::Pending,
         }
     }
+}
+
+/// gdl's `Err` rule, which [`AnnotatedItems`] and [`CheckedItems`] share: the
+/// last item of a stream that ended in `error`, or `None` when it is a cancel
+/// of a request that was killed, since a killed Dynamo stream just ends.
+fn last_item<T>(
+    error: gdl::Error,
+    root: &gdl::Cx,
+    context: &dyn AsyncEngineContext,
+) -> Option<Annotated<T>> {
+    let killed =
+        error.kind() == gdl::ErrorKind::Cancelled && (root.is_cancelled() || context.is_killed());
+    (!killed).then(|| exit_item(error))
 }
 
 /// gdl items with gdl's `Err` rule applied, as [`AnnotatedItems`] applies it,
@@ -211,9 +242,7 @@ impl<T: Data> Stream for CheckedItems<T> {
                 else {
                     unreachable!("matched above");
                 };
-                let killed = error.kind() == gdl::ErrorKind::Cancelled
-                    && (self.root.is_cancelled() || self.context.is_killed());
-                poll = Poll::Ready((!killed).then(|| Ok(exit_item(error))));
+                poll = Poll::Ready(last_item(error, &self.root, self.context.as_ref()).map(Ok));
             }
             Poll::Ready(None) => self.items = None,
         }
