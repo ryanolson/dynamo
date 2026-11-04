@@ -323,7 +323,7 @@ impl RoutingHost {
         &self,
         request: SingleIn<PreprocessedRequest>,
         plan: RoutePlan,
-    ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+    ) -> Result<super::RouteResponse, Error> {
         let RoutePlan {
             phase,
             mut selection,
@@ -513,7 +513,7 @@ impl RoutingHost {
         mut guard: RequestGuard,
         budget: &CleanupBudget,
         affinity: Option<Hold>,
-    ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+    ) -> Result<super::RouteResponse, Error> {
         let context_id = request.context().id().to_string();
         let request_context = request.context().clone();
         let route_trace_context = get_route_trace_context(&request);
@@ -601,9 +601,16 @@ impl RoutingHost {
             record_route_error(&route_span, error.as_ref());
             return Err(error);
         }
-        Ok(wrap_route_span(
-            into_monitored_response(response_stream, guard),
-            route_span,
+        let response = into_monitored_response(response_stream, guard);
+        if route_span.is_disabled() {
+            return Ok(response);
+        }
+        // The route span is on, so the response goes into its wrapper, which takes a boxed
+        // response; this path pays for the box either way.
+        let context = response.context();
+        Ok(ResponseStream::from_parts(
+            Box::pin(wrap_route_span(Box::pin(response), route_span)),
+            context,
         ))
     }
 
@@ -668,7 +675,7 @@ impl RoutingHost {
         let stream = self.dispatch_kv_plan(request, plan).await?;
         Ok(PrefillDispatch {
             metadata,
-            stream,
+            stream: Box::pin(stream),
             booking,
         })
     }

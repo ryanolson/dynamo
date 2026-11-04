@@ -295,3 +295,7 @@ required-features = ["block-manager-bench"]
 [[test]]
 name = "allocations"
 harness = false
+
+[[test]]
+name = "routing_allocations"
+harness = false
