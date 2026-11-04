@@ -748,3 +748,135 @@ async fn a_slow_client_holds_the_worker_back_on_both_local_pipelines() {
     }
     assert_eq!(outcomes, [5, 5]);
 }
+
+/// Migration holds a failed attempt's response stream until its replacement's dispatch
+/// returns: it replaces the stream only then. So a replacement whose dispatch stalls keeps the
+/// failed stream, on both local pipelines; it is dropped when the request ends.
+#[tokio::test]
+async fn a_failed_attempt_is_held_until_its_replacement_dispatch_returns_on_both_local_pipelines() {
+    let mut outcomes = Vec::new();
+    for local_pipeline in BOTH {
+        let (worker, mut arrivals) = Worker::new(vec![
+            Turn::Stream(vec![token(450), went_away()], Then::End),
+            Turn::HangUntilKilled,
+        ]);
+        let request = preprocessed();
+        let context = request.context();
+        let mut stream = pipeline_c(local_pipeline, worker.clone(), 3)
+            .generate(request)
+            .await
+            .unwrap();
+        let first = next_within(&mut stream, Duration::from_secs(5))
+            .await
+            .expect("the first item arrives")
+            .expect("the stream is not over");
+        assert!(!first.is_error());
+        let dropped_before_failure = worker.call(0).1;
+        let reader = tokio::spawn(rest(stream));
+        for index in 0..2 {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), arrivals.recv())
+                    .await
+                    .expect("the replacement reaches dispatch"),
+                Some(index)
+            );
+        }
+        let dropped_during_replacement = worker.call(0).1;
+        context.kill();
+        reader.await.unwrap();
+        outcomes.push((
+            local_pipeline.as_str(),
+            dropped_before_failure,
+            dropped_during_replacement,
+            worker.call(0).1,
+        ));
+    }
+    assert_eq!(
+        outcomes,
+        [("dynamo", false, false, true), ("gdl", false, false, true)]
+    );
+}
+
+/// A slow client with the request plane between the pipeline and the worker: the transport
+/// reads ahead of the caller, the same on both local pipelines. So the local composition adds
+/// no read-ahead (`a_slow_client_holds_the_worker_back_on_both_local_pipelines`), and the
+/// request plane's buffer is what bounds a remote worker's lead.
+#[tokio::test]
+async fn a_slow_client_through_the_request_plane_is_read_ahead_of_on_both_local_pipelines() {
+    use dynamo_runtime::distributed::DistributedConfig;
+    use dynamo_runtime::pipeline::network::{Ingress, egress::push_router::PushRouter};
+    use dynamo_runtime::{DistributedRuntime, Runtime};
+
+    let runtime = Runtime::from_current().unwrap();
+    let distributed = DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+        .await
+        .unwrap();
+    let mut outcomes = Vec::new();
+    for local_pipeline in BOTH {
+        let (worker, _) = Worker::new(vec![Turn::Endless]);
+        let endpoint = distributed
+            .namespace(format!("review-backpressure-{}", local_pipeline.as_str()))
+            .unwrap()
+            .component("worker")
+            .unwrap()
+            .endpoint("generate");
+        let started = tokio::time::timeout(
+            Duration::from_secs(5),
+            endpoint
+                .clone()
+                .endpoint_builder()
+                .handler(Ingress::for_engine(worker.clone()).unwrap())
+                .graceful_shutdown(false)
+                .start_with_registration(),
+        )
+        .await
+        .expect("the worker starts")
+        .unwrap();
+        let client = endpoint.client().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), client.wait_for_instances())
+            .await
+            .expect("the client discovers the worker")
+            .unwrap();
+        let remote = Arc::new(
+            PushRouter::from_client(client, RouterMode::RoundRobin)
+                .await
+                .unwrap(),
+        );
+        let request = preprocessed();
+        let context = request.context();
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            pipeline_c(local_pipeline, remote, 3).generate(request),
+        )
+        .await
+        .expect("dispatch completes")
+        .unwrap();
+        for _ in 0..5 {
+            next_within(&mut stream, Duration::from_secs(5))
+                .await
+                .expect("an item arrives")
+                .expect("the stream is not over");
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(200), async {
+            while worker.produced.load(Ordering::Acquire) <= 5 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        outcomes.push((
+            local_pipeline.as_str(),
+            worker.produced.load(Ordering::Acquire),
+        ));
+        context.kill();
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), started.shutdown())
+            .await
+            .expect("the worker shuts down")
+            .unwrap();
+    }
+    runtime.shutdown();
+    assert!(
+        outcomes.iter().all(|(_, produced)| *produced > 5),
+        "{outcomes:?}"
+    );
+}
