@@ -7,7 +7,8 @@
 //!
 //! Each test runs one request both ways and compares what comes out: the items, an eager
 //! error and what it downcasts to, and what the terminal saw. The gdl side is composed as
-//! the frontend composes it: `PipelineEngine` above, native stages, `EngineSink` below.
+//! the frontend composes it: `PipelineEngine` above, native stages (Backend as an around node
+//! of the hop below it), `EngineSink` below.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -51,7 +52,7 @@ use dynamo_runtime::pipeline::{
 use dynamo_runtime::protocols::annotated::Annotated;
 use dynamo_runtime::protocols::maybe_error::MaybeError;
 use futures::{StreamExt, stream};
-use gdl::{Hop, OperatorStage, SinkStage, Source};
+use gdl::{BackwardHalf, ForwardHalf, Hop, OperatorStage, SinkStage, Source};
 use serde::Serialize;
 
 const MODEL_PATH: &str = "tests/data/sample-models/TinyLlama_v1.1";
@@ -98,7 +99,25 @@ type SinkHop<Req, T> = Hop<(), SinkStage<EngineSink<DynEngine<Req, T>, Req, T>>,
 
 /// The terminal as the inner end of a gdl hop.
 fn sink<Req: Data, T: Data>(engine: Engine<Req, T>) -> SinkHop<Req, T> {
-    Hop::new((), SinkStage::new(Arc::new(EngineSink::new(engine))), ())
+    Hop::new((), sink_stage(engine), ())
+}
+
+fn sink_stage<Req: Data, T: Data>(
+    engine: Engine<Req, T>,
+) -> SinkStage<EngineSink<DynEngine<Req, T>, Req, T>> {
+    SinkStage::new(Arc::new(EngineSink::new(engine)))
+}
+
+type AroundHop<O, Req, I> =
+    Hop<(ForwardHalf<GdlOperator<O, Req>>, ()), I, (BackwardHalf<GdlOperator<O, Req>>, ())>;
+
+/// An around node of the hop to `inner`.
+fn around<O, Req, I>(op: Arc<O>, inner: I) -> AroundHop<O, Req, I>
+where
+    GdlOperator<O, Req>: gdl::Around,
+{
+    let (forward, backward) = gdl::around(Arc::new(GdlOperator::new(op)));
+    Hop::new((forward, ()), inner, (backward, ()))
 }
 
 /// A native operator over the hop `next`.
@@ -389,11 +408,19 @@ fn backend_both(
     let backend = fixture.backend();
     [
         linked(backend.clone(), terminal.clone()),
-        pipeline(native::<_, PreprocessedRequest, _>(
-            backend,
-            sink(terminal as Engine<_, _>),
-        )),
+        backend_gdl(backend, terminal),
     ]
+}
+
+/// `backend` over `terminal` on the gdl path, as the frontend composes it.
+fn backend_gdl(
+    backend: Arc<Backend>,
+    terminal: Arc<Script>,
+) -> Engine<PreprocessedRequest, BackendOutput> {
+    pipeline(around::<_, PreprocessedRequest, _>(
+        backend,
+        sink_stage(terminal as Engine<_, _>),
+    ))
 }
 
 #[tokio::test]
@@ -501,6 +528,25 @@ async fn a_backend_that_cannot_decode_checks_after_dispatch_on_dynamo() {
     assert_eq!(answering.calls(), 1, "the terminal was called first");
 }
 
+/// A Backend that cannot decode (no tokenizer) on the gdl path fails before it sends the
+/// request on: the terminal is not called, even one that would fail at once.
+#[tokio::test]
+async fn a_backend_that_cannot_decode_fails_before_dispatch_on_gdl() {
+    let fixture = Fixture::load();
+    let blank = Backend::from_mdc(&ModelDeploymentCard::with_name_only("blank"));
+    for terminal in [
+        Script::new(Reply::Fail(worker_unavailable)),
+        Script::new(Reply::Items(fixture.tokens("fox"))),
+    ] {
+        let error = backend_gdl(blank.clone(), terminal.clone())
+            .generate(request(preprocessed(&fixture, false)))
+            .await
+            .expect_err("the decoder's error");
+        assert!(error.to_string().contains("no tokenizer"), "{error:#}");
+        assert_eq!(terminal.calls(), 0, "the terminal was not called");
+    }
+}
+
 /// With `no_stop_trim`, a text-only output is an error, and Backend stops the request below
 /// it. On the gdl path that stop must reach the terminal's Dynamo context, not only a `Cx`.
 #[tokio::test]
@@ -574,7 +620,7 @@ fn chat_both(
         ),
         pipeline(native::<_, NvCreateChatCompletionRequest, _>(
             preprocessor,
-            native::<_, PreprocessedRequest, _>(backend, sink(terminal)),
+            around::<_, PreprocessedRequest, _>(backend, sink_stage(terminal)),
         )),
     ]
 }
@@ -785,7 +831,7 @@ async fn completions_are_the_same_both_ways() {
     );
     let gdl = pipeline(native::<_, NvCreateCompletionRequest, _>(
         preprocessor,
-        native::<_, PreprocessedRequest, _>(backend, sink(terminal)),
+        around::<_, PreprocessedRequest, _>(backend, sink_stage(terminal)),
     ));
     for extra in [
         serde_json::json!({}),

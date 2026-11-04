@@ -26,18 +26,19 @@ use std::{
 };
 
 use anyhow::Result;
-use futures::FutureExt;
 use futures::stream::{Stream, StreamExt};
 
 use crate::model_card::ModelDeploymentCard;
 use crate::operator::{
-    Downstream, DynamoDownstream, GdlDownstream, GdlOperator, Item, ItemForm, native,
+    Downstream, DynamoDownstream, DynamoForm, GdlForm, GdlOperator, Item, ItemForm, gdl_error,
 };
+use dynamo_gdl_adapters::CheckedItems;
 use dynamo_runtime::dynamo_nvtx_range;
 use dynamo_runtime::{
     error::{DynamoError, ErrorClass},
     pipeline::{
-        AsyncEngineContextProvider, ManyOut, Operator, ServerStreamingEngine, SingleIn, async_trait,
+        AsyncEngineContext, AsyncEngineContextProvider, ManyOut, Operator, ServerStreamingEngine,
+        SingleIn, async_trait,
     },
     protocols::{annotated::Annotated, maybe_error::MaybeError},
 };
@@ -292,40 +293,66 @@ impl
     }
 }
 
-impl gdl::Operator for GdlOperator<Backend, PreprocessedRequest> {
+/// What Backend's forward half keeps of a request for its backward half: the decoders, and the
+/// request's context, which a stop reaches below.
+///
+/// Not boxed: measured on the gdl pipelines, a box costs one allocation and 1,000 to 1,800
+/// instructions per request, and saves no copy.
+pub struct BackendState {
+    decoder: DecoderState<(), GdlForm>,
+    context: Arc<dyn AsyncEngineContext>,
+}
+
+/// Backend around the stages below it: the forward half checks that the request can be decoded
+/// and builds its decoders, before the request is sent on, and the backward half detokenizes
+/// the response.
+impl gdl::Around for GdlOperator<Backend, PreprocessedRequest> {
     type UpReq = SingleIn<PreprocessedRequest>;
     type UpItem = Annotated<BackendOutput>;
     type DownReq = SingleIn<PreprocessedRequest>;
     type DownItem = Annotated<LLMEngineOutput>;
+    type State = BackendState;
 
-    fn generate<N>(
+    fn forward(
         &self,
-        cx: gdl::Cx,
+        _cx: &gdl::Cx,
         request: SingleIn<PreprocessedRequest>,
-        next: N,
-    ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<BackendOutput>>>> + Send
-    where
-        N: gdl::Next<SingleIn<PreprocessedRequest>, Annotated<LLMEngineOutput>>,
-    {
-        self.op
-            .generate_tokens(request, GdlDownstream::new(cx, next))
-            .map(native)
+    ) -> impl Future<Output = gdl::Result<(Self::DownReq, Self::State)>> + Send {
+        // Checked before the request is sent on, unlike the Dynamo operator: an eager error
+        // below cannot hide a request this Backend could not decode.
+        let decoder = self
+            .op
+            .decoder::<GdlForm>(DecoderParams::from_request(&request))
+            .map_err(gdl_error);
+        std::future::ready(decoder.map(|decoder| {
+            let context = request.context();
+            (request, BackendState { decoder, context })
+        }))
+    }
+
+    fn backward(
+        &self,
+        cx: &gdl::Cx,
+        state: Self::State,
+        input: gdl::Items<Annotated<LLMEngineOutput>>,
+    ) -> gdl::Items<Annotated<BackendOutput>> {
+        let input = CheckedItems::new(input, cx.clone(), state.context);
+        gdl::items(DecoderStream {
+            state: Some(state.decoder.reading(input)),
+        })
     }
 }
 
 impl Backend {
-    /// Send `request` on and detokenize the response: the body of Backend's Dynamo and gdl
-    /// operators.
+    /// Send `request` on and detokenize the response: the body of Backend's Dynamo operator.
+    /// The gdl pipeline runs Backend as an around node instead (see [`BackendState`]).
     ///
-    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
-    async fn generate_tokens<D>(
+    /// Transition: remove when the gdl pipeline is the only local pipeline.
+    async fn generate_tokens(
         &self,
         request: SingleIn<PreprocessedRequest>,
-        next: D,
-    ) -> Result<D::Response<BackendOutput>>
-    where
-        D: Downstream<PreprocessedRequest, LLMEngineOutput> + 'static,
-    {
+        next: DynamoDownstream<PreprocessedRequest, LLMEngineOutput>,
+    ) -> Result<ManyOut<Annotated<BackendOutput>>> {
         let decoder_params = DecoderParams::from_request(&request);
 
         let next_stream = next.send_items(request).await?;
@@ -333,13 +360,15 @@ impl Backend {
         let context = next_stream.context();
         // Checked after the request is sent, as this path always has.
         let state = self
-            .decoder::<D::Form>(decoder_params)?
+            .decoder::<DynamoForm>(decoder_params)?
             .reading(next_stream);
 
-        Ok(D::respond_items(
-            DecoderStream { state: Some(state) },
-            context,
-        ))
+        Ok(
+            DynamoDownstream::<PreprocessedRequest, LLMEngineOutput>::respond_items(
+                DecoderStream { state: Some(state) },
+                context,
+            ),
+        )
     }
 }
 

@@ -50,30 +50,30 @@
 //! | Row | Allocations, 1 item | Bytes, 1 item | Allocations, 16 items | Bytes, 16 items |
 //! |---|---:|---:|---:|---:|
 //! | `engine` | 7 | 2,752 | 22 | 2,812 |
-//! | `a` | 347 | 100,862 | 860 | 122,350 |
-//! | `a-gdl` | 331 | 81,271 | 844 | 102,759 |
-//! | `b` | 400 | 226,929 | 913 | 248,417 |
-//! | `b-gdl` | 357 | 127,346 | 870 | 148,834 |
-//! | `c` | 71 | 144,683 | 86 | 144,743 |
-//! | `c-gdl` | 46 | 62,124 | 61 | 62,184 |
+//! | `a` | 347 | 100,902 | 860 | 122,390 |
+//! | `a-gdl` | 328 | 73,535 | 841 | 95,023 |
+//! | `b` | 400 | 222,937 | 913 | 244,425 |
+//! | `b-gdl` | 354 | 111,210 | 867 | 132,698 |
+//! | `c` | 71 | 140,547 | 86 | 140,607 |
+//! | `c-gdl` | 46 | 53,612 | 61 | 53,672 |
 //! | `embed-engine` | 8 | 6,548 | 23 | 88,868 |
-//! | `embed` | 199 | 44,406 | 2,283 | 529,854 |
-//! | `embeddings-gdl` | 184 | 44,415 | 2,268 | 529,863 |
+//! | `embed` | 199 | 44,438 | 2,283 | 529,886 |
+//! | `embeddings-gdl` | 184 | 44,431 | 2,268 | 529,879 |
 //!
 //! Each gdl row differs from its dynamo row by the same number of allocations at both item
-//! counts, so nothing per item: `a-gdl` −16, `b-gdl` −43, `c-gdl` −25, `embeddings-gdl` −15.
+//! counts, so nothing per item: `a-gdl` −19, `b-gdl` −46, `c-gdl` −25, `embeddings-gdl` −15.
 //! `lib/gdl-adapters/tests/allocations.rs` measures the parts in isolation: 14 allocations
 //! for a `link` stage, 5 for a native gdl operator, and 21 against 19 at the boundary
-//! (`PipelineEngine` above, `EngineSink` below). Every operator in the gdl rows is native; the
-//! test engine at the terminal enters through `EngineSink`, where the frontend's `RoutingHost`
-//! is a gdl sink of its own.
-//! `a-gdl`, `b-gdl` and `c-gdl` ask for fewer bytes than their dynamo rows (the `link` chain
-//! boxes a future per edge, the gdl composition one per stage); `embeddings-gdl` asks for 9 more,
-//! because its `link` futures are small.
+//! (`PipelineEngine` above, `EngineSink` below). Every operator in the gdl rows is native, and
+//! Backend an around node of the hop below it; the test engine at the terminal enters through
+//! `EngineSink`, where the frontend's `RoutingHost` is a gdl sink of its own.
+//! Each gdl row asks for fewer bytes than its dynamo row (the `link` chain boxes a future per
+//! edge, the gdl composition one per stage); `embeddings-gdl` only 7 fewer, because its `link`
+//! futures are small.
 //!
 //! The largest allocation of `b` and `c` is Migration's boxed future, 59,592 bytes per request;
-//! that of `b-gdl` and `c-gdl` is 16,496 bytes (debug build). `a` and `embed`, which have no
-//! Migration, make neither.
+//! the largest of `b-gdl` is 18,912 bytes and of `c-gdl` 16,496 (debug build). `a` and `embed`,
+//! which have no Migration, make neither.
 //!
 //! Run: `cargo test -p dynamo-llm --test allocations`. For instructions and `memcpy` calls per
 //! request, see `lib/llm/benches/callgrind.sh` and `hotpath.sh`, which run this binary under
@@ -128,27 +128,27 @@ const BASELINE: &[Row] = &[
     row("engine", 1, 7, 2752),
     row("engine", 16, 22, 2812),
     // Transition: remove when the gdl pipeline is the only local pipeline.
-    row("a", 1, 347, 100862),
-    row("a", 16, 860, 122350),
-    row("a-gdl", 1, 331, 81271),
-    row("a-gdl", 16, 844, 102759),
+    row("a", 1, 347, 100902),
+    row("a", 16, 860, 122390),
+    row("a-gdl", 1, 328, 73535),
+    row("a-gdl", 16, 841, 95023),
     // Transition: remove when the gdl pipeline is the only local pipeline.
-    row("b", 1, 400, 226929),
-    row("b", 16, 913, 248417),
-    row("b-gdl", 1, 357, 127346),
-    row("b-gdl", 16, 870, 148834),
+    row("b", 1, 400, 222937),
+    row("b", 16, 913, 244425),
+    row("b-gdl", 1, 354, 111210),
+    row("b-gdl", 16, 867, 132698),
     // Transition: remove when the gdl pipeline is the only local pipeline.
-    row("c", 1, 71, 144683),
-    row("c", 16, 86, 144743),
-    row("c-gdl", 1, 46, 62124),
-    row("c-gdl", 16, 61, 62184),
+    row("c", 1, 71, 140547),
+    row("c", 16, 86, 140607),
+    row("c-gdl", 1, 46, 53612),
+    row("c-gdl", 16, 61, 53672),
     row("embed-engine", 1, 8, 6548),
     row("embed-engine", 16, 23, 88868),
     // Transition: remove when the gdl pipeline is the only local pipeline.
-    row("embed", 1, 199, 44406),
-    row("embed", 16, 2283, 529854),
-    row("embeddings-gdl", 1, 184, 44415),
-    row("embeddings-gdl", 16, 2268, 529863),
+    row("embed", 1, 199, 44438),
+    row("embed", 16, 2283, 529886),
+    row("embeddings-gdl", 1, 184, 44431),
+    row("embeddings-gdl", 16, 2268, 529879),
 ];
 
 #[global_allocator]

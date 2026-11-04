@@ -15,7 +15,8 @@ decoder stream, then the preprocessor's response transform, through the stream l
 the stages.
 
 - **Entry points:** `DecoderStream::poll_next` in `lib/llm/src/backend.rs` (Backend's stream over
-  the engine's stream, built by `Backend::generate_tokens`), and
+  the engine's stream, built by `Backend::generate_tokens` on the Dynamo pipeline and by the
+  backward half of Backend's around node on gdl), and
   `transform_postprocessor_stream_with_image_tokens` in `lib/llm/src/preprocessor.rs`, with the
   in-place edits of `lib/llm/src/preprocessor/edit.rs` after the parsers, and
   `Migrated::poll_next` in `lib/llm/src/migration.rs` (Migration's stream over the active

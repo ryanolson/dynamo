@@ -562,8 +562,8 @@ where
 }
 
 /// [`build_pipeline`]'s chain as a gdl local pipeline, built from the terminal up as
-/// [`PreprocessedRouting::build_pipeline`]'s is. The preprocessor and Backend are native gdl
-/// operators.
+/// [`PreprocessedRouting::build_pipeline`]'s is. The preprocessor is a native gdl operator, and
+/// Backend an around node of the hop to the engine.
 fn compose_gdl_in_process_pipeline<Req, Resp>(
     preprocessor: Arc<OpenAIPreprocessor>,
     backend: Arc<Backend>,
@@ -583,13 +583,9 @@ where
     type Pre = PreprocessedRequest;
 
     let engine = SinkStage::new(Arc::new(EngineSink::new(engine)));
-    let backend = OperatorStage::new(
-        Arc::new(GdlOperator::<_, Pre>::new(backend)),
-        Hop::new((), engine, ()),
-    );
     let preprocessor = OperatorStage::new(
         Arc::new(GdlOperator::<_, Req>::new(preprocessor)),
-        Hop::new((), backend, ()),
+        around::<_, Pre, _>(backend, engine),
     );
     Arc::new(PipelineEngine::<_, Req, Resp>::for_dynamo_stages(
         gdl::Source::new(Hop::new((), preprocessor, ())),
@@ -842,23 +838,27 @@ impl PreprocessedRouting {
             >,
     {
         type Pre = PreprocessedRequest;
-        let token_backend = native::<_, Pre, _>(token_backend, self.gdl_routers());
+        let token_backend = around::<_, Pre, _>(token_backend, self.gdl_routers());
         let migration = native::<_, BackendOutput, _>(migration, token_backend);
         gdl::Source::new(native::<_, Req, _>(preprocessor, migration))
     }
 
     /// The encoder router, the prefill router and the terminal as native gdl stages: the tail
     /// of [`gdl_pipeline`](Self::gdl_pipeline) and
-    /// [`gdl_preprocessed_pipeline`](Self::gdl_preprocessed_pipeline).
+    /// [`gdl_preprocessed_pipeline`](Self::gdl_preprocessed_pipeline), as the inner end of the
+    /// hop that calls the encoder router.
     fn gdl_routers(
         &self,
-    ) -> impl gdl::Next<SingleIn<PreprocessedRequest>, Annotated<LLMEngineOutput>> {
-        use gdl::{Hop, SinkStage};
+    ) -> impl gdl::Inner<SingleIn<PreprocessedRequest>, Item = Annotated<LLMEngineOutput>> {
+        use gdl::{Hop, OperatorStage, SinkStage};
         type Pre = PreprocessedRequest;
 
         let terminal = Hop::new((), SinkStage::new(Arc::new(self.backend.clone())), ());
         let prefill = native::<_, Pre, _>(self.prefill_router.clone(), terminal);
-        native::<_, Pre, _>(self.encoder_router.clone(), prefill)
+        OperatorStage::new(
+            Arc::new(GdlOperator::<_, Pre>::new(self.encoder_router.clone())),
+            prefill,
+        )
     }
 
     /// Bring your own pre/post processor. Used when frontend has `--dyn-chat-processor
@@ -923,9 +923,25 @@ impl PreprocessedRouting {
     {
         gdl::Source::new(native::<_, LLMEngineOutput, _>(
             migration,
-            self.gdl_routers(),
+            gdl::Hop::new((), self.gdl_routers(), ()),
         ))
     }
+}
+
+/// A hop to `I` with `GdlOperator<O, K>` as its one around node.
+type AroundHop<O, K, I> = gdl::Hop<
+    (gdl::ForwardHalf<GdlOperator<O, K>>, ()),
+    I,
+    (gdl::BackwardHalf<GdlOperator<O, K>>, ()),
+>;
+
+/// `op` as an around node of the hop to `inner`, keyed by `K` (see [`GdlOperator`]).
+fn around<O, K, I>(op: Arc<O>, inner: I) -> AroundHop<O, K, I>
+where
+    GdlOperator<O, K>: gdl::Around,
+{
+    let (forward, backward) = gdl::around(Arc::new(GdlOperator::new(op)));
+    gdl::Hop::new((forward, ()), inner, (backward, ()))
 }
 
 /// `op` as a native gdl operator, keyed by `K` (see [`GdlOperator`]), over the hop `next`.

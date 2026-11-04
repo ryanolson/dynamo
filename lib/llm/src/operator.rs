@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Dynamo's operators as Dynamo operators and as native gdl operators: Backend, the
-//! preprocessor, Migration, and the encoder and prefill routers.
+//! Dynamo's operators as Dynamo operators and as native gdl operators: the preprocessor,
+//! Migration, and the encoder and prefill routers. Backend is a gdl around node instead (see
+//! `backend.rs`): its forward and backward halves run on either side of the hop below it.
 //!
 //! Each operator has one body, generic over [`Downstream`]: how it calls the stage below it.
 //! Its Dynamo `Operator` impl passes the `Arc<dyn AsyncEngine>` it is given, and its gdl
@@ -487,5 +488,11 @@ pub(crate) fn detached<T: Send + 'static>(
 /// A body's error as a native operator's: an error that came from below leaves as the same
 /// `gdl::Error`, and one the body raised enters gdl with its `anyhow::Error` as the source.
 pub(crate) fn native<T>(result: anyhow::Result<gdl::Items<T>>) -> gdl::Result<gdl::Items<T>> {
-    result.map_err(|error| error.downcast::<gdl::Error>().unwrap_or_else(enter))
+    result.map_err(gdl_error)
+}
+
+/// A body's error as gdl's: the same `gdl::Error` if it came from below, else one that carries
+/// it as its source.
+pub(crate) fn gdl_error(error: anyhow::Error) -> gdl::Error {
+    error.downcast::<gdl::Error>().unwrap_or_else(enter)
 }
