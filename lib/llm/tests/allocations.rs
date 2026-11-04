@@ -51,9 +51,9 @@
 //! |---|---:|---:|---:|---:|
 //! | `engine` | 7 | 2,752 | 22 | 2,812 |
 //! | `a` | 347 | 100,902 | 860 | 122,390 |
-//! | `a-gdl` | 328 | 73,535 | 841 | 95,023 |
+//! | `a-gdl` | 327 | 68,271 | 840 | 89,759 |
 //! | `b` | 400 | 222,937 | 913 | 244,425 |
-//! | `b-gdl` | 354 | 111,210 | 867 | 132,698 |
+//! | `b-gdl` | 352 | 110,506 | 865 | 131,994 |
 //! | `c` | 71 | 140,547 | 86 | 140,607 |
 //! | `c-gdl` | 46 | 53,612 | 61 | 53,672 |
 //! | `embed-engine` | 8 | 6,548 | 23 | 88,868 |
@@ -61,12 +61,13 @@
 //! | `embeddings-gdl` | 184 | 44,431 | 2,268 | 529,879 |
 //!
 //! Each gdl row differs from its dynamo row by the same number of allocations at both item
-//! counts, so nothing per item: `a-gdl` −19, `b-gdl` −46, `c-gdl` −25, `embeddings-gdl` −15.
+//! counts, so nothing per item: `a-gdl` −20, `b-gdl` −48, `c-gdl` −25, `embeddings-gdl` −15.
 //! `lib/gdl-adapters/tests/allocations.rs` measures the parts in isolation: 14 allocations
 //! for a `link` stage, 5 for a native gdl operator, and 21 against 19 at the boundary
 //! (`PipelineEngine` above, `EngineSink` below). Every operator in the gdl rows is native, and
-//! Backend an around node of the hop below it; the test engine at the terminal enters through
-//! `EngineSink`, where the frontend's `RoutingHost` is a gdl sink of its own.
+//! Backend and the chat preprocessor are around nodes of the hop below them; the test engine
+//! at the terminal enters through `EngineSink`, where the frontend's `RoutingHost` is a gdl
+//! sink of its own.
 //! Each gdl row asks for fewer bytes than its dynamo row (the `link` chain boxes a future per
 //! edge, the gdl composition one per stage); `embeddings-gdl` only 7 fewer, because its `link`
 //! futures are small.
@@ -130,13 +131,13 @@ const BASELINE: &[Row] = &[
     // Transition: remove when the gdl pipeline is the only local pipeline.
     row("a", 1, 347, 100902),
     row("a", 16, 860, 122390),
-    row("a-gdl", 1, 328, 73535),
-    row("a-gdl", 16, 841, 95023),
+    row("a-gdl", 1, 327, 68271),
+    row("a-gdl", 16, 840, 89759),
     // Transition: remove when the gdl pipeline is the only local pipeline.
     row("b", 1, 400, 222937),
     row("b", 16, 913, 244425),
-    row("b-gdl", 1, 354, 111210),
-    row("b-gdl", 16, 867, 132698),
+    row("b-gdl", 1, 352, 110506),
+    row("b-gdl", 16, 865, 131994),
     // Transition: remove when the gdl pipeline is the only local pipeline.
     row("c", 1, 71, 140547),
     row("c", 16, 86, 140607),

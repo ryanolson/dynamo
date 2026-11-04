@@ -7,8 +7,8 @@
 //!
 //! Each test runs one request both ways and compares what comes out: the items, an eager
 //! error and what it downcasts to, and what the terminal saw. The gdl side is composed as
-//! the frontend composes it: `PipelineEngine` above, native stages (Backend as an around node
-//! of the hop below it), `EngineSink` below.
+//! the frontend composes it: `PipelineEngine` above, native stages (Backend and the chat and
+//! completions preprocessors as around nodes of the hop below them), `EngineSink` below.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -27,7 +27,9 @@ use dynamo_llm::model_card::ModelDeploymentCard;
 use dynamo_llm::model_type::ModelType;
 use dynamo_llm::operator::GdlOperator;
 use dynamo_llm::preprocessor::prompt::prompt_formatter_from_mdc;
-use dynamo_llm::preprocessor::{OpenAIPreprocessor, PreprocessedEmbeddingRequest};
+use dynamo_llm::preprocessor::{
+    OpenAIPreprocessor, PreprocessedEmbeddingRequest, PreprocessorNode,
+};
 use dynamo_llm::protocols::common::extensions::{
     SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId, session_affinity_from_headers,
 };
@@ -607,6 +609,43 @@ async fn a_kill_mid_stream_reaches_the_terminal_both_ways() {
     }
 }
 
+/// A kill mid-stream through chat over Backend reaches the terminal and ends the stream. On
+/// gdl the two are around nodes of one hop, so Backend's backward half runs in a scope of its
+/// own, not in the hop's attempt.
+#[tokio::test]
+async fn a_kill_mid_stream_through_chat_reaches_the_terminal_both_ways() {
+    let fixture = Fixture::load();
+    let mut reply = fixture.tokens("The fox crossed the river.");
+    reply
+        .last_mut()
+        .unwrap()
+        .data
+        .as_mut()
+        .unwrap()
+        .finish_reason = None;
+    for (way, at) in [("dynamo", 0), ("gdl", 1)] {
+        let terminal = Script::new(Reply::ItemsThenHold(reply.clone()));
+        let engine = chat_both(&fixture, terminal.clone())[at].clone();
+        let request = request(chat(serde_json::json!({})));
+        let context = request.context();
+        let mut stream = engine.generate(request).await.unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("the first item arrives")
+            .unwrap();
+        assert!(!first.is_error(), "{way}: {first:?}");
+        context.kill();
+        assert!(
+            terminal.calls.lock().unwrap()[0].context.is_killed(),
+            "{way}"
+        );
+        let rest = tokio::time::timeout(Duration::from_secs(5), collect(stream))
+            .await
+            .unwrap_or_else(|_| panic!("{way}: the stream did not end"));
+        assert!(rest.iter().all(|item| !item.is_error()), "{way}: {rest:?}");
+    }
+}
+
 fn chat_both(
     fixture: &Fixture,
     terminal: Arc<Script>,
@@ -618,11 +657,48 @@ fn chat_both(
             preprocessor.clone(),
             linked::<_, _, BackendOutput, _, _>(backend.clone(), terminal.clone()),
         ),
-        pipeline(native::<_, NvCreateChatCompletionRequest, _>(
-            preprocessor,
-            around::<_, PreprocessedRequest, _>(backend, sink_stage(terminal)),
-        )),
+        preprocessor_gdl(preprocessor, backend, terminal),
     ]
+}
+
+/// The preprocessor and `backend` over `terminal` on the gdl path, as the frontend composes
+/// pipeline A: one hop to the terminal, with both as its around nodes, and the speculative
+/// prefill sent to Backend's own hop.
+fn preprocessor_gdl<Req: Data, Resp: Data>(
+    preprocessor: Arc<OpenAIPreprocessor>,
+    backend: Arc<Backend>,
+    terminal: Engine<PreprocessedRequest, LLMEngineOutput>,
+) -> Engine<Req, Resp>
+where
+    PreprocessorNode<Req>: gdl::Around<
+            UpReq = SingleIn<Req>,
+            UpItem = Annotated<Resp>,
+            DownReq = SingleIn<PreprocessedRequest>,
+            DownItem = Annotated<BackendOutput>,
+        >,
+{
+    let terminal = sink_stage(terminal);
+    let below = Arc::new(
+        PipelineEngine::<_, PreprocessedRequest, BackendOutput>::for_dynamo_stages(around::<
+            _,
+            PreprocessedRequest,
+            _,
+        >(
+            backend.clone(),
+            terminal.clone(),
+        )),
+    );
+    let (preprocessor_forward, preprocessor_backward) =
+        gdl::around(Arc::new(PreprocessorNode::<Req>::new(preprocessor, below)));
+    let (backend_forward, backend_backward) = gdl::around(Arc::new(GdlOperator::<
+        _,
+        PreprocessedRequest,
+    >::new(backend)));
+    pipeline(Hop::new(
+        (preprocessor_forward, (backend_forward, ())),
+        terminal,
+        (backend_backward, (preprocessor_backward, ())),
+    ))
 }
 
 /// The chat content of the items, and whether one finished.
@@ -829,10 +905,7 @@ async fn completions_are_the_same_both_ways() {
         preprocessor.clone(),
         linked::<_, _, BackendOutput, _, _>(backend.clone(), terminal.clone()),
     );
-    let gdl = pipeline(native::<_, NvCreateCompletionRequest, _>(
-        preprocessor,
-        around::<_, PreprocessedRequest, _>(backend, sink_stage(terminal)),
-    ));
+    let gdl = preprocessor_gdl(preprocessor, backend, terminal);
     for extra in [
         serde_json::json!({}),
         serde_json::json!({"echo": true}),

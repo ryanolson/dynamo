@@ -1,9 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Dynamo's operators as Dynamo operators and as native gdl operators: the preprocessor,
-//! Migration, and the encoder and prefill routers. Backend is a gdl around node instead (see
-//! `backend.rs`): its forward and backward halves run on either side of the hop below it.
+//! Dynamo's operators as Dynamo operators and as native gdl operators: the embeddings
+//! preprocessor, Migration, and the encoder and prefill routers. Backend and the chat and
+//! completions preprocessors are gdl around nodes instead (`BackendState`, `PreprocessorNode`):
+//! their forward and backward halves run on either side of the hop below them.
 //!
 //! Each operator has one body, generic over [`Downstream`]: how it calls the stage below it.
 //! Its Dynamo `Operator` impl passes the `Arc<dyn AsyncEngine>` it is given, and its gdl
@@ -21,7 +22,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use dynamo_gdl_adapters::{AnnotatedItems, CheckedItems, CxBridge, PipelineEngine, enter};
+use dynamo_gdl_adapters::{AnnotatedItems, CheckedItems, CxBridge, enter};
 use dynamo_runtime::engine::{AsyncEngine, AsyncEngineContext, Data, ResponseStream};
 use dynamo_runtime::pipeline::{AsyncEngineContextProvider, Error, ManyOut, SingleIn};
 use dynamo_runtime::protocols::annotated::Annotated;
@@ -62,10 +63,6 @@ pub(crate) trait Downstream<Req: Data, T: Data>: Send + Sync {
         &self,
         request: SingleIn<Req>,
     ) -> impl Future<Output = anyhow::Result<Self::Stream>> + Send;
-
-    /// The stage below as a Dynamo engine, for a request the operator sends on its own, after
-    /// the one it was called for has ended (speculative prefill).
-    fn engine(&self) -> Arc<dyn AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, Error>>;
 
     /// The operator's response, as its caller takes it.
     ///
@@ -271,10 +268,6 @@ impl<Req: Data, T: Data> Downstream<Req, T> for DynamoDownstream<Req, T> {
         self.0.generate(request)
     }
 
-    fn engine(&self) -> Arc<dyn AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, Error>> {
-        Arc::clone(&self.0)
-    }
-
     type Response<U: Data> = ManyOut<Annotated<U>>;
 
     fn respond<U, S>(stream: S, context: Arc<dyn AsyncEngineContext>) -> ManyOut<Annotated<U>>
@@ -356,15 +349,6 @@ where
     ) -> impl Future<Output = anyhow::Result<Self::Stream>> + Send {
         let cx = CxBridge::cx_for_cleanup(request.context().as_ref());
         self.send_under(cx, request)
-    }
-
-    /// Transition: root with `PipelineEngine::new` when no Dynamo engine runs inside a gdl
-    /// pipeline.
-    fn engine(&self) -> Arc<dyn AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, Error>> {
-        // Each call derives a fresh root `Cx`: the request's `cx` is cancelled once its
-        // response ends. Below the preprocessor of pipeline A is a Dynamo engine, so a kill
-        // reaches it through the request's context, not a cancel that would drop its call.
-        Arc::new(PipelineEngine::for_dynamo_stages(self.next.clone()))
     }
 
     type Response<U: Data> = gdl::Items<Annotated<U>>;
