@@ -66,8 +66,11 @@
 //! accepted at one allocation per box: `a-gdl` and `b-gdl` +2 (the chat request where it enters
 //! the pipeline, the preprocessed request where the preprocessor builds it; Migration sends its
 //! first attempt in that box), `c-gdl` +1 (the preprocessed request where it enters). Unboxed,
-//! gdl's chain copies a 2 KB request at every node and future it moves through, which cost more
-//! instructions than the two allocations.
+//! gdl's chain copies a 2 KB request at every node and future it moves through. Boxed, per
+//! request (aarch64, `hotpath.sh` with `HOTPATH_RUNS=3`): `a-gdl` 19 fewer `memcpy` calls and
+//! 7,394 fewer instructions (4.6%), `b-gdl` 45 and 20,276 (10.6%), `c-gdl` 27 and 9,529 (23%),
+//! with nothing per item. Callgrind leaves out the system allocator; a `malloc` and `free` pair
+//! costs about 170 instructions.
 //! `lib/gdl-adapters/tests/allocations.rs` measures the parts in isolation: 14 allocations
 //! for a `link` stage, 5 for a native gdl operator, and 21 against 19 at the boundary
 //! (`PipelineEngine` above, `EngineSink` below). Every operator in the gdl rows is native, and
