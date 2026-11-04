@@ -2363,4 +2363,103 @@ mod tests {
         );
         assert_eq!(seen, [expected.clone(), expected]);
     }
+
+    /// Check the matrix's no-decode outcome when bootstrap prefill fails after handoff.
+    #[tokio::test]
+    #[ignore = "review finding: bootstrap hands off to decode before a late prefill failure"]
+    async fn a_prefill_failure_after_bootstrap_handoff_sends_no_decode_leg() {
+        use crate::entrypoint::input::LocalPipeline;
+        use crate::http::service::metrics::Metrics;
+        use crate::model_card::ModelDeploymentCard;
+        use dynamo_runtime::protocols::maybe_error::MaybeError;
+        use dynamo_runtime::{DistributedRuntime, Runtime, distributed::DistributedConfig};
+        use std::time::Duration;
+
+        struct DiesAfterBootstrap(Arc<tokio::sync::Notify>);
+
+        #[async_trait]
+        impl
+            dynamo_runtime::pipeline::StreamingDispatch<
+                PreprocessedRequest,
+                Annotated<LLMEngineOutput>,
+            > for DiesAfterBootstrap
+        {
+            async fn generate(
+                &self,
+                request: SingleIn<dynamo_runtime::pipeline::AddressedRequest<PreprocessedRequest>>,
+            ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+                let handoff = Annotated::from_data(LLMEngineOutput {
+                    disaggregated_params: Some(serde_json::json!({
+                        "bootstrap_host": "prefill",
+                        "bootstrap_port": 1,
+                        "bootstrap_room": 7,
+                    })),
+                    ..Default::default()
+                });
+                let release = self.0.clone();
+                let failure = stream::once(async move {
+                    release.notified().await;
+                    Annotated::from_err(
+                        DynamoError::builder()
+                            .error_type(ErrorType::Disconnected)
+                            .message("prefill worker went away after bootstrap")
+                            .build(),
+                    )
+                });
+                Ok(ResponseStream::new(
+                    Box::pin(stream::iter([handoff]).chain(failure)),
+                    request.context(),
+                ))
+            }
+
+            async fn generate_bidirectional(
+                &self,
+                _: dynamo_runtime::component::Instance,
+                _: String,
+                _: dynamo_runtime::pipeline::ManyIn<PreprocessedRequest>,
+            ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+                unreachable!("prefill dispatch takes a single request")
+            }
+        }
+
+        let runtime = Runtime::from_current().unwrap();
+        let distributed =
+            DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+                .await
+                .unwrap();
+        let card =
+            ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
+                .unwrap();
+        let mut seen = Vec::new();
+        for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+            let name = local_pipeline.as_str();
+            let release = Arc::new(tokio::sync::Notify::new());
+            let (routing, decode) = prefill_routing(
+                &distributed,
+                &format!("review-bootstrap-failure-{name}"),
+                Arc::new(DiesAfterBootstrap(release.clone())),
+            )
+            .await;
+            let pipeline = routing
+                .with_local_pipeline(local_pipeline)
+                .build_preprocessed_pipeline(&card, 0, None, Arc::new(Metrics::new()))
+                .unwrap();
+            let reader = tokio::spawn(async move {
+                outcome(pipeline.generate(Context::new(inference_request()))).await
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while decode.requests.lock().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("bootstrap hands the request on before prefill finishes");
+            release.notify_one();
+            let result = reader.await.unwrap();
+            seen.push((name, decode.requests.lock().len(), result));
+        }
+        runtime.shutdown();
+        let failure = "error None, migratable true".to_string();
+        assert_eq!(seen, [("dynamo", 0, failure.clone()), ("gdl", 0, failure)]);
+    }
 }
