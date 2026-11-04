@@ -748,3 +748,46 @@ async fn a_slow_client_holds_the_worker_back_on_both_local_pipelines() {
     }
     assert_eq!(outcomes, [5, 5]);
 }
+
+/// A stalled replacement must not retain the failed attempt's response stream.
+#[tokio::test]
+#[ignore = "review finding: both pipelines retain the failed stream during replacement dispatch"]
+async fn a_failed_attempt_is_dropped_before_its_replacement_is_dispatched() {
+    let mut outcomes = Vec::new();
+    for local_pipeline in BOTH {
+        let (worker, mut arrivals) = Worker::new(vec![
+            Turn::Stream(vec![token(450), went_away()], Then::End),
+            Turn::HangUntilKilled,
+        ]);
+        let request = preprocessed();
+        let context = request.context();
+        let mut stream = pipeline_c(local_pipeline, worker.clone(), 3)
+            .generate(request)
+            .await
+            .unwrap();
+        let first = next_within(&mut stream, Duration::from_secs(5))
+            .await
+            .expect("the first item arrives")
+            .expect("the stream is not over");
+        assert!(!first.is_error());
+        let dropped_before_failure = worker.call(0).1;
+        let reader = tokio::spawn(rest(stream));
+        for index in 0..2 {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), arrivals.recv())
+                    .await
+                    .expect("the replacement reaches dispatch"),
+                Some(index)
+            );
+        }
+        let dropped_during_replacement = worker.call(0).1;
+        context.kill();
+        reader.await.unwrap();
+        outcomes.push((
+            local_pipeline.as_str(),
+            dropped_before_failure,
+            dropped_during_replacement,
+        ));
+    }
+    assert_eq!(outcomes, [("dynamo", false, true), ("gdl", false, true)]);
+}
