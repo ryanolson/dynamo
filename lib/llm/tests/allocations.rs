@@ -50,10 +50,10 @@
 //! | Row | Allocations, 1 item | Bytes, 1 item | Allocations, 16 items | Bytes, 16 items |
 //! |---|---:|---:|---:|---:|
 //! | `engine` | 7 | 2,752 | 22 | 2,812 |
-//! | `a` | 347 | 100,902 | 860 | 122,390 |
-//! | `a-gdl` | 327 | 68,271 | 840 | 89,759 |
-//! | `b` | 400 | 222,937 | 913 | 244,425 |
-//! | `b-gdl` | 352 | 110,506 | 865 | 131,994 |
+//! | `a` | 346 | 100,886 | 859 | 122,374 |
+//! | `a-gdl` | 326 | 68,263 | 839 | 89,751 |
+//! | `b` | 399 | 222,921 | 912 | 244,409 |
+//! | `b-gdl` | 351 | 110,498 | 864 | 131,986 |
 //! | `c` | 71 | 140,547 | 86 | 140,607 |
 //! | `c-gdl` | 46 | 53,612 | 61 | 53,672 |
 //! | `embed-engine` | 8 | 6,548 | 23 | 88,868 |
@@ -129,15 +129,15 @@ const BASELINE: &[Row] = &[
     row("engine", 1, 7, 2752),
     row("engine", 16, 22, 2812),
     // Transition: remove when the gdl pipeline is the only local pipeline.
-    row("a", 1, 347, 100902),
-    row("a", 16, 860, 122390),
-    row("a-gdl", 1, 327, 68271),
-    row("a-gdl", 16, 840, 89759),
+    row("a", 1, 346, 100886),
+    row("a", 16, 859, 122374),
+    row("a-gdl", 1, 326, 68263),
+    row("a-gdl", 16, 839, 89751),
     // Transition: remove when the gdl pipeline is the only local pipeline.
-    row("b", 1, 400, 222937),
-    row("b", 16, 913, 244425),
-    row("b-gdl", 1, 352, 110506),
-    row("b-gdl", 16, 865, 131994),
+    row("b", 1, 399, 222921),
+    row("b", 16, 912, 244409),
+    row("b-gdl", 1, 351, 110498),
+    row("b-gdl", 16, 864, 131986),
     // Transition: remove when the gdl pipeline is the only local pipeline.
     row("c", 1, 71, 140547),
     row("c", 16, 86, 140607),
