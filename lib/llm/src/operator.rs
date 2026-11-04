@@ -13,7 +13,10 @@
 //!
 //! The request stays Dynamo's `SingleIn<T>` on both paths: its context carries the id, the
 //! metadata and registry (session affinity, LoRA name, request metrics) and the stop and kill
-//! that the stages below read. Items stay `Annotated<T>`; an operator that edits its items in
+//! that the stages below read. On gdl the chat, completion and preprocessed requests travel
+//! boxed between the nodes ([`Boxed`](dynamo_gdl_adapters::Boxed)), so gdl's chain moves a pointer, not the request. A
+//! native operator takes the request out of its box to run its body, and the body's first send
+//! puts the request it sends in that box again ([`GdlDownstream::with_spare`]). Items stay `Annotated<T>`; an operator that edits its items in
 //! place reads and answers them as [`Downstream::Item`], which on gdl leaves each item in its
 //! gdl `Result`, so it is not taken out and wrapped again at every stage.
 
@@ -22,7 +25,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use dynamo_gdl_adapters::{AnnotatedItems, CheckedItems, CxBridge, enter};
+use dynamo_gdl_adapters::{AnnotatedItems, Carried, CheckedItems, CxBridge, enter};
 use dynamo_runtime::engine::{AsyncEngine, AsyncEngineContext, Data, ResponseStream};
 use dynamo_runtime::pipeline::{AsyncEngineContextProvider, Error, ManyOut, SingleIn};
 use dynamo_runtime::protocols::annotated::Annotated;
@@ -306,21 +309,49 @@ impl<Req: Data, T: Data> Downstream<Req, T> for DynamoDownstream<Req, T> {
     }
 }
 
-/// gdl's `cx` and `next`, as a native operator's body calls them.
-pub(crate) struct GdlDownstream<N> {
+/// gdl's `cx` and `next`, as a native operator's body calls them. `next` takes requests in
+/// the carrier `R` (see [`Carried`]): boxed for Migration and the routers, `SingleIn` itself for
+/// the embeddings preprocessor.
+pub(crate) struct GdlDownstream<N, R: Carried<Req>, Req: Data> {
     cx: gdl::Cx,
     next: N,
+    /// The box of the request the operator was given, for the first request its body sends.
+    spare: R::Spare,
 }
 
-impl<N> GdlDownstream<N> {
+impl<N, R: Carried<Req>, Req: Data> GdlDownstream<N, R, Req> {
     pub(crate) fn new(cx: gdl::Cx, next: N) -> Self {
-        Self { cx, next }
+        Self::with_spare(cx, next, R::Spare::default())
+    }
+
+    /// As [`new`](Self::new), and the first request the body sends goes in `spare`: the memory
+    /// of the request the operator took apart ([`Carried::take`]), so the operator adds no
+    /// allocation.
+    pub(crate) fn with_spare(cx: gdl::Cx, next: N, spare: R::Spare) -> Self {
+        Self { cx, next, spare }
+    }
+
+    /// Send `request` on in its carrier, as it came, and answer with the response of the stage
+    /// below as it is: [`Downstream::forward`] for a request that does not go through the body.
+    pub(crate) fn forward_carried<T>(
+        &self,
+        request: R,
+    ) -> impl Future<Output = anyhow::Result<gdl::Items<Annotated<T>>>> + Send
+    where
+        N: gdl::Next<R, Annotated<T>>,
+        T: Data,
+    {
+        // Carried as itself, so `native` gives back the same `gdl::Error`.
+        self.next
+            .generate(self.cx.clone(), request)
+            .map(|result| result.map_err(anyhow::Error::new))
     }
 }
 
-impl<N, Req, T> Downstream<Req, T> for GdlDownstream<N>
+impl<N, R, Req, T> Downstream<Req, T> for GdlDownstream<N, R, Req>
 where
-    N: gdl::Next<SingleIn<Req>, Annotated<T>>,
+    N: gdl::Next<R, Annotated<T>>,
+    R: Carried<Req>,
     Req: Data,
     T: Data,
 {
@@ -337,10 +368,7 @@ where
         &self,
         request: SingleIn<Req>,
     ) -> impl Future<Output = anyhow::Result<Self::Response<T>>> + Send {
-        // Carried as itself, so `native` gives back the same `gdl::Error`.
-        self.next
-            .generate(self.cx.clone(), request)
-            .map(|result| result.map_err(anyhow::Error::new))
+        self.forward_carried(R::carry_in(request, &self.spare))
     }
 
     fn send_cleanup(
@@ -380,7 +408,7 @@ where
         let context = request.context();
         let root = self.cx.clone();
         self.next
-            .generate(self.cx.clone(), request)
+            .generate(self.cx.clone(), R::carry_in(request, &self.spare))
             .map(move |result| match result {
                 Ok(items) => Ok(CheckedItems::new(items, root, context)),
                 // Carried as itself, so `native` gives back the same `gdl::Error`.
@@ -400,16 +428,15 @@ where
     }
 }
 
-impl<N> GdlDownstream<N> {
+impl<N, R: Carried<Req>, Req: Data> GdlDownstream<N, R, Req> {
     /// Send `request` on under `cx` and read the response as a Dynamo stream.
-    fn send_under<Req, T>(
+    fn send_under<T>(
         &self,
         cx: gdl::Cx,
         request: SingleIn<Req>,
     ) -> impl Future<Output = anyhow::Result<AnnotatedItems<T>>> + Send
     where
-        N: gdl::Next<SingleIn<Req>, Annotated<T>>,
-        Req: Data,
+        N: gdl::Next<R, Annotated<T>>,
         T: Data,
     {
         // The stream gives the request's own context: the stages below are Dynamo's, or keep
@@ -417,7 +444,7 @@ impl<N> GdlDownstream<N> {
         let context = request.context();
         let root = cx.clone();
         self.next
-            .generate(cx, request)
+            .generate(cx, R::carry_in(request, &self.spare))
             .map(move |result| match result {
                 Ok(items) => Ok(AnnotatedItems::new(items, root, context)),
                 // Carried as itself, so `native` gives back the same `gdl::Error`.

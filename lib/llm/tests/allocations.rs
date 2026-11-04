@@ -51,17 +51,26 @@
 //! |---|---:|---:|---:|---:|
 //! | `engine` | 7 | 2,752 | 22 | 2,812 |
 //! | `a` | 346 | 100,886 | 859 | 122,374 |
-//! | `a-gdl` | 326 | 68,263 | 839 | 89,751 |
+//! | `a-gdl` | 328 | 65,567 | 841 | 87,055 |
 //! | `b` | 399 | 222,921 | 912 | 244,409 |
-//! | `b-gdl` | 351 | 110,498 | 864 | 131,986 |
+//! | `b-gdl` | 353 | 84,586 | 866 | 106,074 |
 //! | `c` | 71 | 140,547 | 86 | 140,607 |
-//! | `c-gdl` | 46 | 53,612 | 61 | 53,672 |
+//! | `c-gdl` | 47 | 30,428 | 62 | 30,488 |
 //! | `embed-engine` | 8 | 6,548 | 23 | 88,868 |
 //! | `embed` | 199 | 44,438 | 2,283 | 529,886 |
 //! | `embeddings-gdl` | 180 | 42,407 | 2,264 | 527,855 |
 //!
 //! Each gdl row differs from its dynamo row by the same number of allocations at both item
-//! counts, so nothing per item: `a-gdl` −20, `b-gdl` −48, `c-gdl` −25, `embeddings-gdl` −19.
+//! counts, so nothing per item: `a-gdl` −18, `b-gdl` −46, `c-gdl` −24, `embeddings-gdl` −19.
+//! The gdl rows carry the chat and preprocessed requests boxed (`dynamo_gdl_adapters::Boxed`),
+//! accepted at one allocation per box: `a-gdl` and `b-gdl` +2 (the chat request where it enters
+//! the pipeline, the preprocessed request where the preprocessor builds it; Migration sends its
+//! first attempt in that box), `c-gdl` +1 (the preprocessed request where it enters). Unboxed,
+//! gdl's chain copies a 2 KB request at every node and future it moves through. Boxed, per
+//! request (aarch64, `hotpath.sh` with `HOTPATH_RUNS=3`): `a-gdl` 19 fewer `memcpy` calls and
+//! 7,394 fewer instructions (4.6%), `b-gdl` 45 and 20,276 (10.6%), `c-gdl` 27 and 9,529 (23%),
+//! with nothing per item. Callgrind leaves out the system allocator; a `malloc` and `free` pair
+//! costs about 170 instructions.
 //! `lib/gdl-adapters/tests/allocations.rs` measures the parts in isolation: 14 allocations
 //! for a `link` stage, 5 for a native gdl operator, and 21 against 19 at the boundary
 //! (`PipelineEngine` above, `EngineSink` below). Every operator in the gdl rows is native, and
@@ -72,7 +81,7 @@
 //! edge, the gdl composition one per stage, and `embeddings-gdl` has no backend stage.
 //!
 //! The largest allocation of `b` and `c` is Migration's boxed future, 59,592 bytes per request;
-//! the largest of `b-gdl` is 18,912 bytes and of `c-gdl` 16,496 (debug build). `a` and `embed`,
+//! the largest of `b-gdl` is 13,376 bytes and of `c-gdl` 12,256 (debug build). `a` and `embed`,
 //! which have no Migration, make neither.
 //!
 //! Run: `cargo test -p dynamo-llm --test allocations`. For instructions and `memcpy` calls per
@@ -130,18 +139,21 @@ const BASELINE: &[Row] = &[
     // Transition: remove when the gdl pipeline is the only local pipeline.
     row("a", 1, 346, 100886),
     row("a", 16, 859, 122374),
-    row("a-gdl", 1, 326, 68263),
-    row("a-gdl", 16, 839, 89751),
+    // +2 for the boxed chat and preprocessed requests (see the module docs).
+    row("a-gdl", 1, 328, 65567),
+    row("a-gdl", 16, 841, 87055),
     // Transition: remove when the gdl pipeline is the only local pipeline.
     row("b", 1, 399, 222921),
     row("b", 16, 912, 244409),
-    row("b-gdl", 1, 351, 110498),
-    row("b-gdl", 16, 864, 131986),
+    // +2 for the boxed chat and preprocessed requests (see the module docs).
+    row("b-gdl", 1, 353, 84586),
+    row("b-gdl", 16, 866, 106074),
     // Transition: remove when the gdl pipeline is the only local pipeline.
     row("c", 1, 71, 140547),
     row("c", 16, 86, 140607),
-    row("c-gdl", 1, 46, 53612),
-    row("c-gdl", 16, 61, 53672),
+    // +1 for the boxed preprocessed request (see the module docs).
+    row("c-gdl", 1, 47, 30428),
+    row("c-gdl", 16, 62, 30488),
     row("embed-engine", 1, 8, 6548),
     row("embed-engine", 16, 23, 88868),
     // Transition: remove when the gdl pipeline is the only local pipeline.

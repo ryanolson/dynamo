@@ -82,7 +82,7 @@ use crate::protocols::common::preprocessor::{
 };
 use crate::protocols::common::timing::RequestTracker;
 use crate::tokenizers::Encoding;
-use dynamo_gdl_adapters::AnnotatedItems;
+use dynamo_gdl_adapters::{AnnotatedItems, Boxed};
 
 use dynamo_parsers::tool_calling::ToolDefinition;
 use dynamo_parsers::{
@@ -8526,10 +8526,12 @@ pub struct ChatNodeState {
     context: Arc<dyn AsyncEngineContext>,
 }
 
+/// The request comes and goes boxed ([`Boxed`]): the forward half moves the chat request into its
+/// state and sends the preprocessed request on in a box of its own.
 impl gdl::Around for PreprocessorNode<NvCreateChatCompletionRequest> {
-    type UpReq = SingleIn<NvCreateChatCompletionRequest>;
+    type UpReq = Boxed<NvCreateChatCompletionRequest>;
     type UpItem = Annotated<NvCreateChatCompletionStreamResponse>;
-    type DownReq = SingleIn<PreprocessedRequest>;
+    type DownReq = Boxed<PreprocessedRequest>;
     type DownItem = Annotated<BackendOutput>;
     type State = Box<ChatNodeState>;
 
@@ -8538,11 +8540,11 @@ impl gdl::Around for PreprocessorNode<NvCreateChatCompletionRequest> {
     fn forward(
         &self,
         _cx: &gdl::Cx,
-        request: SingleIn<NvCreateChatCompletionRequest>,
-    ) -> impl Future<Output = gdl::Result<(SingleIn<PreprocessedRequest>, Box<ChatNodeState>)>> + Send
+        request: Boxed<NvCreateChatCompletionRequest>,
+    ) -> impl Future<Output = gdl::Result<(Boxed<PreprocessedRequest>, Box<ChatNodeState>)>> + Send
     {
         async move {
-            let (mut request, context) = request.into_parts();
+            let (mut request, context) = (*request).into_parts();
             let (common_request, state, tool_definitions) = self
                 .op
                 .chat_forward(
@@ -8560,7 +8562,7 @@ impl gdl::Around for PreprocessorNode<NvCreateChatCompletionRequest> {
                 .map_err(gdl_error)?;
             let context = common_request.context();
             Ok((
-                common_request,
+                Box::new(common_request),
                 Box::new(ChatNodeState {
                     request,
                     state,
@@ -9031,10 +9033,11 @@ pub struct CompletionNodeState {
     context: Arc<dyn AsyncEngineContext>,
 }
 
+/// The request comes and goes boxed, as the chat node's does.
 impl gdl::Around for PreprocessorNode<NvCreateCompletionRequest> {
-    type UpReq = SingleIn<NvCreateCompletionRequest>;
+    type UpReq = Boxed<NvCreateCompletionRequest>;
     type UpItem = Annotated<NvCreateCompletionResponse>;
-    type DownReq = SingleIn<PreprocessedRequest>;
+    type DownReq = Boxed<PreprocessedRequest>;
     type DownItem = Annotated<BackendOutput>;
     type State = CompletionNodeState;
 
@@ -9043,11 +9046,11 @@ impl gdl::Around for PreprocessorNode<NvCreateCompletionRequest> {
     fn forward(
         &self,
         _cx: &gdl::Cx,
-        request: SingleIn<NvCreateCompletionRequest>,
-    ) -> impl Future<Output = gdl::Result<(SingleIn<PreprocessedRequest>, CompletionNodeState)>> + Send
+        request: Boxed<NvCreateCompletionRequest>,
+    ) -> impl Future<Output = gdl::Result<(Boxed<PreprocessedRequest>, CompletionNodeState)>> + Send
     {
         async move {
-            let (request, context) = request.into_parts();
+            let (request, context) = (*request).into_parts();
             let (common_request, state) = self
                 .op
                 .completion_forward(
@@ -9060,7 +9063,10 @@ impl gdl::Around for PreprocessorNode<NvCreateCompletionRequest> {
                 .await
                 .map_err(gdl_error)?;
             let context = common_request.context();
-            Ok((common_request, CompletionNodeState { state, context }))
+            Ok((
+                Box::new(common_request),
+                CompletionNodeState { state, context },
+            ))
         }
     }
 

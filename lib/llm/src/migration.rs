@@ -10,6 +10,7 @@ use std::task::{Poll, ready};
 use std::time::Instant;
 
 use anyhow::{Error, Result};
+use dynamo_gdl_adapters::{Boxed, Carried};
 use futures::{FutureExt, Stream, stream::StreamExt};
 
 use crate::{
@@ -333,23 +334,26 @@ impl<Resp> gdl::Operator for GdlOperator<Migration, Resp>
 where
     Resp: Data + HasTokenIds,
 {
-    type UpReq = SingleIn<PreprocessedRequest>;
+    type UpReq = Boxed<PreprocessedRequest>;
     type UpItem = Annotated<Resp>;
-    type DownReq = SingleIn<PreprocessedRequest>;
+    type DownReq = Boxed<PreprocessedRequest>;
     type DownItem = Annotated<Resp>;
 
     fn generate<N>(
         &self,
         cx: gdl::Cx,
-        request: SingleIn<PreprocessedRequest>,
+        request: Boxed<PreprocessedRequest>,
         next: N,
     ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<Resp>>>> + Send
     where
-        N: gdl::Next<SingleIn<PreprocessedRequest>, Annotated<Resp>>,
+        N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<Resp>>,
     {
-        // Each attempt is a call of `next` under `cx`, so gdl runs it in a child of `cx`.
+        // Each attempt is a new request, built from the one kept here: the first goes on in
+        // this request's box. Each attempt is a call of `next` under `cx`, so gdl runs it in a
+        // child of `cx`.
+        let (request, spare) = request.take();
         self.op
-            .migrate(request, GdlDownstream::new(cx, next))
+            .migrate(request, GdlDownstream::with_spare(cx, next, spare))
             .map(native)
     }
 }

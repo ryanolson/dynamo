@@ -32,7 +32,7 @@ use crate::model_card::ModelDeploymentCard;
 use crate::operator::{
     Downstream, DynamoDownstream, DynamoForm, GdlForm, GdlOperator, Item, ItemForm, gdl_error,
 };
-use dynamo_gdl_adapters::CheckedItems;
+use dynamo_gdl_adapters::{Boxed, CheckedItems};
 use dynamo_runtime::dynamo_nvtx_range;
 use dynamo_runtime::{
     error::{DynamoError, ErrorClass},
@@ -307,16 +307,16 @@ pub struct BackendState {
 /// and builds its decoders, before the request is sent on, and the backward half detokenizes
 /// the response.
 impl gdl::Around for GdlOperator<Backend, PreprocessedRequest> {
-    type UpReq = SingleIn<PreprocessedRequest>;
+    type UpReq = Boxed<PreprocessedRequest>;
     type UpItem = Annotated<BackendOutput>;
-    type DownReq = SingleIn<PreprocessedRequest>;
+    type DownReq = Boxed<PreprocessedRequest>;
     type DownItem = Annotated<LLMEngineOutput>;
     type State = BackendState;
 
     fn forward(
         &self,
         _cx: &gdl::Cx,
-        request: SingleIn<PreprocessedRequest>,
+        request: Boxed<PreprocessedRequest>,
     ) -> impl Future<Output = gdl::Result<(Self::DownReq, Self::State)>> + Send {
         // Checked before the request is sent on, unlike the Dynamo operator: an eager error
         // below cannot hide a request this Backend could not decode.
