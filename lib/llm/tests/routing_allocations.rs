@@ -19,8 +19,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use dynamo_gdl_adapters::PipelineEngine;
+use dynamo_kv_router::config::KvRouterConfig;
 use dynamo_llm::discovery::LoadThresholdHandle;
-use dynamo_llm::kv_router::{LlmDispatch, RouterLoadSource, RoutingHost, RoutingLoadContext};
+use dynamo_llm::kv_router::{
+    KvRouter, LlmDispatch, RouterLoadSource, RoutingHost, RoutingLoadContext, SelectionPolicySource,
+};
+use dynamo_llm::local_model::runtime_config::ModelRuntimeConfig;
 use dynamo_llm::protocols::common::llm_backend::{LLMEngineOutput, PreprocessedRequest};
 use dynamo_llm::protocols::common::{OutputOptions, SamplingOptions, StopConditions};
 use dynamo_llm::types::Annotated;
@@ -29,6 +33,7 @@ use dynamo_runtime::engine::{AsyncEngine, AsyncEngineContextProvider, ResponseSt
 use dynamo_runtime::pipeline::network::egress::addressed_router::{
     AddressedRequest, StreamingDispatch,
 };
+use dynamo_runtime::pipeline::network::egress::route_span::wrap_route_span;
 use dynamo_runtime::pipeline::{Context, Error, ManyIn, ManyOut, RouterMode, SingleIn};
 use dynamo_runtime::{Runtime, component::Instance};
 use futures::{StreamExt, stream};
@@ -136,13 +141,17 @@ type Engine =
 
 /// Allocations of the typical request through `engine`: the most common count over
 /// `REQUESTS` requests, after `WARMUP` of warm-up.
-async fn typical(engine: &Engine, items: usize) -> u64 {
+async fn typical(engine: &Engine, items: usize, route_span: Option<&tracing::Span>) -> u64 {
     let mut counts = HashMap::<u64, usize>::new();
     for i in 0..WARMUP + REQUESTS {
         let request = Context::new(request());
         ALLOCS.store(0, Ordering::Relaxed);
         COUNTING.store(true, Ordering::Relaxed);
         let stream = engine.generate(request).await.expect("routed");
+        let stream = match route_span {
+            Some(span) => wrap_route_span(stream, span.clone()),
+            None => stream,
+        };
         let seen = stream.count().await;
         COUNTING.store(false, Ordering::Relaxed);
         assert_eq!(seen, items, "every item reaches the caller");
@@ -157,7 +166,7 @@ async fn typical(engine: &Engine, items: usize) -> u64 {
         .unwrap()
 }
 
-async fn host(runtime: &Runtime, items: usize) -> Arc<RoutingHost> {
+async fn host(runtime: &Runtime, items: usize, mode: RouterMode) -> Arc<RoutingHost> {
     let distributed = DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
         .await
         .expect("process-local runtime");
@@ -169,7 +178,7 @@ async fn host(runtime: &Runtime, items: usize) -> Arc<RoutingHost> {
         .endpoint("generate".to_string());
     let client = endpoint.client().await.unwrap();
     endpoint.register_endpoint_instance().await.unwrap();
-    client.wait_for_instances().await.unwrap();
+    let workers = client.wait_for_instances().await.unwrap();
     let load_context = RoutingLoadContext::start(
         client.clone(),
         RouterLoadSource::Aggregated,
@@ -180,14 +189,87 @@ async fn host(runtime: &Runtime, items: usize) -> Arc<RoutingHost> {
     .await
     .expect("load context");
     let dispatch: LlmDispatch = Arc::new(ItemsDispatch { items });
-    Arc::new(
-        RoutingHost::builder(client, RouterMode::RoundRobin)
-            .load_context(load_context)
-            .dispatch(dispatch)
-            .build()
-            .await
-            .expect("routing host"),
-    )
+    let mut builder = RoutingHost::builder(client.clone(), mode)
+        .load_context(load_context)
+        .dispatch(dispatch);
+    if matches!(mode, RouterMode::KV) {
+        let (_tx, workers) = tokio::sync::watch::channel(
+            workers
+                .into_iter()
+                .map(|worker| (worker.id(), ModelRuntimeConfig::default()))
+                .collect(),
+        );
+        let chooser = KvRouter::new(
+            endpoint,
+            client,
+            workers,
+            None,
+            16,
+            SelectionPolicySource::Registry,
+            Some(KvRouterConfig {
+                skip_initial_worker_wait: true,
+                use_kv_events: false,
+                router_track_active_blocks: false,
+                ..Default::default()
+            }),
+            None,
+            "decode",
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("KV router");
+        builder = builder.kv_router(Arc::new(chooser));
+    }
+    Arc::new(builder.build().await.expect("routing host"))
+}
+
+/// Enable one span without allocating in the subscriber itself.
+struct RouteSpanSubscriber(&'static str);
+
+impl tracing::Subscriber for RouteSpanSubscriber {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.is_span() && metadata.name() == self.0
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, _: &tracing::Event<'_>) {}
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+async fn traced_kv_route_keeps_the_span_wrappers_allocation_budget(runtime: &Runtime) {
+    let engine: Engine = host(runtime, 1, RouterMode::KV).await;
+    let reference = {
+        let _subscriber =
+            tracing::subscriber::set_default(RouteSpanSubscriber("allocation_reference.route"));
+        let span = tracing::info_span!("allocation_reference.route");
+        assert!(!span.is_disabled());
+        // Wrap the monitored response directly, without adding another stream boundary.
+        typical(&engine, 1, Some(&span)).await
+    };
+    let traced = {
+        let _subscriber =
+            tracing::subscriber::set_default(RouteSpanSubscriber("kv_router.route_request"));
+        typical(&engine, 1, None).await
+    };
+    println!("KV route: reference={reference}, traced={traced}");
+    assert!(
+        traced <= reference,
+        "the traced KV route added {} allocations beyond wrap_route_span's existing boxes",
+        traced.saturating_sub(reference),
+    );
 }
 
 fn main() {
@@ -199,14 +281,14 @@ fn main() {
         let dynamo_runtime = Runtime::from_current().unwrap();
         let mut failed = false;
         for items in [1, 16] {
-            let host = host(&dynamo_runtime, items).await;
+            let host = host(&dynamo_runtime, items, RouterMode::RoundRobin).await;
             let engine: Engine = host.clone();
             let sink = host.clone();
             let gdl: Engine = Arc::new(PipelineEngine::<_, PreprocessedRequest, LLMEngineOutput>::new(
                 gdl::Source::new(gdl::Hop::new((), gdl::SinkStage::new(sink), ())),
             ));
             for (name, engine) in [("engine", &engine), ("gdl", &gdl)] {
-                let allocs = typical(engine, items).await;
+                let allocs = typical(engine, items, None).await;
                 let record = RECORDS
                     .iter()
                     .find(|(n, i, _)| *n == name && *i == items)
@@ -221,6 +303,7 @@ fn main() {
                 }
             }
         }
+        traced_kv_route_keeps_the_span_wrappers_allocation_budget(&dynamo_runtime).await;
         failed
     });
     if failed {
