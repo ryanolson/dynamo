@@ -98,12 +98,23 @@ the stages.
   1,008 and `Annotated<NvCreateChatCompletionStreamResponse>` 768. gdl's own boundaries copy no
   item; the copies are the stages' own transforms, and both forms pay them.
 
-- **After the in-place stages** (aarch64, `hotpath.sh --base` with `HOTPATH_RUNS=3`, 2026-11-03):
-  `memcpy` calls per extra item fell from 70.2 to 42.2 on `a`, 79.2 to 54.2 on `a-gdl`, 79.2 to
-  51.2 on `b` and 100.2 to 75.2 on `b-gdl`; instructions per extra item from 24,100 to 20,702 on
-  `a` (-14%). The copies left on `a` are Backend's decoder stream (7 per item), the
-  preprocessor's transform (5), the in-place edits (3), and string copies inside the tokenizer's
-  decode.
+- **After the in-place stages and the boxed fields** (aarch64, `hotpath.sh --base` with
+  `HOTPATH_RUNS=3`, 2026-11-03; memcpy calls and instructions per extra item):
+
+  | Row | memcpy, before | memcpy, after | instructions, before | instructions, after |
+  |---|---:|---:|---:|---:|
+  | `a` | 70.2 | 41.2 | 24,100 | 19,869 |
+  | `a-gdl` | 79.2 | 53.2 | 25,703 | 21,444 |
+  | `b` | 79.2 | 42.2 | 25,971 | 20,055 |
+  | `b-gdl` | 100.2 | 58.2 | 29,731 | 22,034 |
+  | `c` | 13.0 | 5.0 | 2,823 | 797 |
+  | `c-gdl` | 22.0 | 13.0 | 4,263 | 1,827 |
+
+  The copies left on `a` are Backend's decoder stream (5 per item), the preprocessor's transform
+  (5), the in-place edits (2), and string copies inside the tokenizer's decode. The gdl rows pay
+  about 8 (`c-gdl`) to 12 (`a-gdl`) more: taking items out of gdl's `Result` at the
+  `PipelineEngine` boundary and in `AnnotatedItems` (about 3 per reader), the KV router sink's
+  boxed Dynamo stream, and gdl's own `Bounded` layer (2).
 
 - **Not covered:** the window starts where the HTTP handler calls the engine. HTTP parsing, the
   handler's request metrics and SSE encoding are outside it, and the reasoning and tool-call
