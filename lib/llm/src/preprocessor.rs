@@ -80,6 +80,7 @@ use crate::protocols::common::preprocessor::{
 use crate::protocols::common::timing::RequestTracker;
 use crate::tokenizers::Encoding;
 
+use dynamo_parsers::tool_calling::ToolDefinition;
 use dynamo_parsers::{
     ReasoningParser, ReasoningParserType, reasoning::ParserResult,
     tool_calling::parsers::get_tool_parser_map,
@@ -5777,6 +5778,33 @@ impl OpenAIPreprocessor {
     where
         S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
     {
+        let tool_definitions = Self::chat_tool_definitions(request)?;
+        Ok(self.postprocessor_parsing_stream_with_tools(
+            stream,
+            request,
+            prompt_injected_reasoning,
+            guided_tool_constraint,
+            tool_processing_route,
+            tool_definitions,
+        ))
+    }
+
+    /// The response parsers of [`postprocessor_parsing_stream_with_constraint`], given the
+    /// request's validated tool definitions ([`chat_tool_definitions`](Self::chat_tool_definitions)).
+    ///
+    /// [`postprocessor_parsing_stream_with_constraint`]: Self::postprocessor_parsing_stream_with_constraint
+    fn postprocessor_parsing_stream_with_tools<S>(
+        &self,
+        stream: S,
+        request: &NvCreateChatCompletionRequest,
+        prompt_injected_reasoning: PromptReasoningPrefill,
+        guided_tool_constraint: crate::protocols::openai::GuidedToolConstraint,
+        tool_processing_route: ToolProcessingRoute,
+        tool_definitions: Option<Vec<ToolDefinition>>,
+    ) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static
+    where
+        S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
+    {
         use crate::protocols::openai::chat_completions::unified_parser;
         let prompt_prefill = prompt_injected_reasoning;
         let prompt_injected_reasoning = prompt_prefill.for_route(&tool_processing_route);
@@ -5796,9 +5824,6 @@ impl OpenAIPreprocessor {
         );
 
         if let ToolProcessingRoute::Unified(family) = &tool_processing_route {
-            let tool_definitions =
-                crate::preprocessor::tool_choice::effective_tool_definitions(request)?;
-            let tool_definitions = (!tool_definitions.is_empty()).then_some(tool_definitions);
             let reasoning_disabled = Self::request_disables_reasoning_with_family(
                 request,
                 self.tool_call_parser.as_deref(),
@@ -5862,12 +5887,12 @@ impl OpenAIPreprocessor {
                         structured_response: Self::has_structured_response_format(request),
                     },
                 ));
-            return Ok(Self::apply_unified_response_policies(
+            return Self::apply_unified_response_policies(
                 unified,
                 Self::tool_call_parsing_enabled(request),
                 defer_reasoning_for_nonempty_content,
                 reasoning_disabled,
-            ));
+            );
         }
 
         // Guided output may be bare JSON or `reasoning</think>JSON`. Supported
@@ -6029,11 +6054,6 @@ impl OpenAIPreprocessor {
 
         let tool_call_parsing_enabled = Self::tool_call_parsing_enabled(request);
 
-        // Convert OpenAI tools to parser ToolDefinition format before applying jail
-        let tool_definitions =
-            crate::preprocessor::tool_choice::effective_tool_definitions(request)?;
-        let tool_definitions = (!tool_definitions.is_empty()).then_some(tool_definitions);
-
         let transformed_stream: Pin<Box<dyn Stream<Item = _> + Send>> = match tool_processing_route
         {
             ToolProcessingRoute::LegacyJail(effective_tool_call_parser) => {
@@ -6057,10 +6077,7 @@ impl OpenAIPreprocessor {
             }
         };
 
-        Ok(Self::apply_tool_call_response_policy(
-            transformed_stream,
-            tool_call_parsing_enabled,
-        ))
+        Self::apply_tool_call_response_policy(transformed_stream, tool_call_parsing_enabled)
     }
 
     /// Enforce the request's tool-call policy after model-specific parsing.
@@ -8492,215 +8509,325 @@ impl OpenAIPreprocessor {
     where
         D: Downstream<PreprocessedRequest, BackendOutput>,
     {
-        // unpack the request
         let (mut request, context) = request.into_parts();
-        let lifecycle = preprocessing_lifecycle(&context);
-        let preprocessing = lifecycle.start(LifecycleStage::RequestPreprocessing);
+        self.chat_forward(
+            &mut request,
+            context,
+            // forward the common completion request to the next operator
+            |common_request| next.send(common_request),
+            |response_stream, request, state| {
+                // Extract context once
+                let context = response_stream.context();
 
-        // In-process callers bypassing HTTP still need the function engine view.
-        request
-            .inner
-            .normalize_custom_tools()
-            .map_err(|error| invalid_argument_error(error.to_string()))?;
-        request.normalize_responses_history_phases(tool_choice::uses_muse_spark_parser(
-            self.tool_call_parser.as_deref(),
-            self.runtime_config.reasoning_parser.as_deref(),
-        ));
-        request
-            .normalize_responses_tools(self.formatter.supports_native_tools(&request))
-            .map_err(|error| invalid_argument_error(error.to_string()))?;
+                // Checked after the request is sent, as this path always has. Validation
+                // before dispatch already checked these tools, so this does not fail in
+                // practice.
+                let tool_definitions = Self::chat_tool_definitions(request)?;
+                let stream = self.chat_backward(
+                    request,
+                    state,
+                    tool_definitions,
+                    response_stream,
+                    context.clone(),
+                    || next.engine(),
+                );
 
-        // Preserve original inbound streaming flag before any internal overrides
-        let request_id = context.id().to_string();
-        let original_stream_flag = request.inner.stream.unwrap_or(false);
+                // box the response stream once
+                Ok(D::respond(stream, context))
+            },
+        )
+        .await
+    }
 
-        // Build request payload handle (None if request trace is disabled / not eligible).
-        // The handle snapshots the pristine request and its arrival time here;
-        // the single payload record is published once at stream completion
-        // (or with an empty response on cancel/timeout), off the request path.
-        let payload_http_headers = if crate::request_trace::payload::http_header_capture_active() {
-            context
-                .get_optional::<std::collections::BTreeMap<String, String>>(
-                    crate::request_trace::payload::HTTP_HEADERS_CONTEXT_KEY,
+    /// Everything the chat preprocessor does before it sends the request on, with `request` and
+    /// `context` unpacked from the request: `dispatch` sends the preprocessed request on, and
+    /// `then` gets its result, the request, and what [`chat_backward`](Self::chat_backward)
+    /// needs of it. A native operator that returns the preprocessed request instead of sending
+    /// it passes it through `dispatch`.
+    ///
+    /// Nothing large is returned and `then` is not async, so the request stays with the caller
+    /// and the state where this function built it: each copy of them would cost a memcpy per
+    /// request.
+    ///
+    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
+    // A block, not an `async fn`: the block uses its arguments where it captured them, where
+    // an `async fn` would move each into a local first and keep both in its future.
+    #[allow(clippy::manual_async_fn)]
+    fn chat_forward<Sent, T, Dispatch, Fut, Then>(
+        &self,
+        request: &mut NvCreateChatCompletionRequest,
+        context: PipelineContext<()>,
+        dispatch: Dispatch,
+        then: Then,
+    ) -> impl Future<Output = Result<T, Error>>
+    where
+        Dispatch: Fn(SingleIn<PreprocessedRequest>) -> Fut,
+        Fut: Future<Output = Result<Sent, Error>>,
+        Then: FnOnce(Sent, &NvCreateChatCompletionRequest, ChatState) -> Result<T, Error>,
+    {
+        async move {
+            let lifecycle = preprocessing_lifecycle(&context);
+            let preprocessing = lifecycle.start(LifecycleStage::RequestPreprocessing);
+
+            // In-process callers bypassing HTTP still need the function engine view.
+            request
+                .inner
+                .normalize_custom_tools()
+                .map_err(|error| invalid_argument_error(error.to_string()))?;
+            request.normalize_responses_history_phases(tool_choice::uses_muse_spark_parser(
+                self.tool_call_parser.as_deref(),
+                self.runtime_config.reasoning_parser.as_deref(),
+            ));
+            request
+                .normalize_responses_tools(self.formatter.supports_native_tools(request))
+                .map_err(|error| invalid_argument_error(error.to_string()))?;
+
+            // Preserve original inbound streaming flag before any internal overrides
+            let request_id = context.id().to_string();
+            let original_stream_flag = request.inner.stream.unwrap_or(false);
+
+            // Build request payload handle (None if request trace is disabled / not eligible).
+            // The handle snapshots the pristine request and its arrival time here;
+            // the single payload record is published once at stream completion
+            // (or with an empty response on cancel/timeout), off the request path.
+            let payload_http_headers =
+                if crate::request_trace::payload::http_header_capture_active() {
+                    context
+                        .get_optional::<std::collections::BTreeMap<String, String>>(
+                            crate::request_trace::payload::HTTP_HEADERS_CONTEXT_KEY,
+                        )
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
+            let payload_handle = crate::request_trace::payload::create_handle(
+                request,
+                &request_id,
+                payload_http_headers,
+            );
+
+            // For non-streaming requests (stream=false), enable usage by default
+            // This ensures compliance with OpenAI API spec where non-streaming responses
+            // always include usage statistics
+            request.enable_usage_for_nonstreaming(original_stream_flag);
+
+            // Set stream=true for internal processing (after request payload capture)
+            request.inner.stream = Some(true);
+            self.apply_preserve_thinking(request)?;
+            // Apply the deployment default before parser-specific normalization so
+            // it can override an implicit model default (for example Kimi K2.5),
+            // while explicit request controls still take precedence.
+            let thinking_control_from_client = Self::request_has_client_thinking_control(request);
+            self.validate_reasoning_request(request)?;
+            self.apply_default_thinking_mode(request);
+            Self::normalize_thinking_arg_with_source(
+                request,
+                self.runtime_config.reasoning_parser.as_deref(),
+                self.tool_call_parser.as_deref(),
+                thinking_control_from_client,
+            );
+            Self::normalize_kimi_k3_named_tool_choice(request, self.tool_call_parser.as_deref());
+            crate::preprocessor::tool_choice::declare_legacy_builtin_tools_for_beam(
+                request,
+                self.tool_call_parser.as_deref(),
+                self.runtime_config.reasoning_parser.as_deref(),
+            );
+            crate::preprocessor::tool_choice::relax_noncompliant_strict_tools_for_beam(
+                request,
+                self.tool_call_parser.as_deref(),
+                self.runtime_config.reasoning_parser.as_deref(),
+            );
+
+            // create a response generator
+            let response_generator = request.response_generator(context.id().to_string());
+            let tracker = Some(response_generator.tracker());
+            let preprocess_options = PreprocessRequestOptions {
+                preserve_omitted_max_tokens: context
+                    .get::<bool>(PRESERVE_OMITTED_MAX_TOKENS_CONTEXT_KEY)
+                    .ok()
+                    .is_some_and(|flag| *flag),
+            };
+
+            // convert the chat completion request to a common completion request
+            let (mut common_request, annotations, prompt_injected_reasoning, image_tokens) = self
+                .preprocess_request_with_options(
+                    request,
+                    tracker.as_deref(),
+                    preprocess_options,
+                    context
+                        .get_optional::<String>(LORA_NAME_CONTEXT_KEY)
+                        .ok()
+                        .flatten()
+                        .map(|name| name.as_ref().clone()),
                 )
-                .ok()
-                .flatten()
-        } else {
-            None
-        };
-        let payload_handle = crate::request_trace::payload::create_handle(
-            &request,
-            &request_id,
-            payload_http_headers,
-        );
+                .instrument(preprocessing.clone())
+                .await?;
+            if let Some(tracked) = RequestMetrics::from_context(&context) {
+                tracked.add_input_tokens(common_request.token_ids.len());
+            }
+            attach_request_context_metadata(&mut common_request, &context);
 
-        // For non-streaming requests (stream=false), enable usage by default
-        // This ensures compliance with OpenAI API spec where non-streaming responses
-        // always include usage statistics
-        request.enable_usage_for_nonstreaming(original_stream_flag);
-
-        // Set stream=true for internal processing (after request payload capture)
-        request.inner.stream = Some(true);
-        self.apply_preserve_thinking(&mut request)?;
-        // Apply the deployment default before parser-specific normalization so
-        // it can override an implicit model default (for example Kimi K2.5),
-        // while explicit request controls still take precedence.
-        let thinking_control_from_client = Self::request_has_client_thinking_control(&request);
-        self.validate_reasoning_request(&request)?;
-        self.apply_default_thinking_mode(&mut request);
-        Self::normalize_thinking_arg_with_source(
-            &mut request,
-            self.runtime_config.reasoning_parser.as_deref(),
-            self.tool_call_parser.as_deref(),
-            thinking_control_from_client,
-        );
-        Self::normalize_kimi_k3_named_tool_choice(&mut request, self.tool_call_parser.as_deref());
-        crate::preprocessor::tool_choice::declare_legacy_builtin_tools_for_beam(
-            &mut request,
-            self.tool_call_parser.as_deref(),
-            self.runtime_config.reasoning_parser.as_deref(),
-        );
-        crate::preprocessor::tool_choice::relax_noncompliant_strict_tools_for_beam(
-            &mut request,
-            self.tool_call_parser.as_deref(),
-            self.runtime_config.reasoning_parser.as_deref(),
-        );
-
-        // create a response generator
-        let response_generator = request.response_generator(context.id().to_string());
-        let tracker = Some(response_generator.tracker());
-        let preprocess_options = PreprocessRequestOptions {
-            preserve_omitted_max_tokens: context
-                .get::<bool>(PRESERVE_OMITTED_MAX_TOKENS_CONTEXT_KEY)
-                .ok()
-                .is_some_and(|flag| *flag),
-        };
-
-        // convert the chat completion request to a common completion request
-        let (mut common_request, annotations, prompt_injected_reasoning, image_tokens) = self
-            .preprocess_request_with_options(
-                &request,
-                tracker.as_deref(),
-                preprocess_options,
+            let guided_tool_constraint = self.apply_tool_choice_guided_decoding(
+                request,
+                &mut common_request,
+                prompt_injected_reasoning.clone(),
+            )?;
+            let tool_processing_route =
+                self.tool_processing_route(request, &guided_tool_constraint)?;
+            let payload_parsing_options = payload_handle.as_ref().map(|_| {
                 context
-                    .get_optional::<String>(LORA_NAME_CONTEXT_KEY)
+                    .get_optional::<ParsingOptions>(REQUEST_PARSING_OPTIONS_CONTEXT_KEY)
                     .ok()
                     .flatten()
-                    .map(|name| name.as_ref().clone()),
+                    .map(|options| options.as_ref().clone())
+                    .unwrap_or_else(|| {
+                        let mut options = ParsingOptions::new(
+                            self.tool_call_parser.clone(),
+                            self.runtime_config.reasoning_parser.clone(),
+                        );
+                        options.tool_choice = request.inner.tool_choice.clone();
+                        options.guided_tool_constraint = guided_tool_constraint.clone();
+                        options.parallel_tool_calls = request.inner.parallel_tool_calls;
+                        options
+                            .with_tool_call_parsing_enabled(Self::tool_call_parsing_enabled(
+                                request,
+                            ))
+                            .with_move_reasoning_to_content_when_empty(
+                                Self::wants_reasoning_as_content_when_empty(
+                                    request.chat_template_args.as_ref(),
+                                ),
+                            )
+                    })
+            });
+            validate_legacy_jail_nvext_choice_count(
+                request.inner.n.unwrap_or(1),
+                request
+                    .nvext
+                    .as_ref()
+                    .and_then(|nvext| nvext.extra_fields.as_deref()),
+                tool_processing_route.uses_legacy_jail(),
+            )?;
+
+            tracing::trace!(model = %common_request.model, token_count = common_request.token_ids.len(), ?prompt_injected_reasoning, "Pre-processed request");
+            let trace_state = crate::request_trace::build_request_end_trace_state(
+                &common_request,
+                &tracker,
+                &context,
+                self.kv_cache_block_size,
+            );
+            let trace_tokens_enabled = trace_state.is_some();
+            let trace_finish_reason_metadata =
+                crate::request_trace::finish_reason_metadata_handle(&trace_state);
+
+            // Attach the timing tracker to the request so downstream components can record metrics
+            common_request.tracker = tracker;
+
+            // Capture media counts before `common_request` is moved into the context.
+            let mm_counts = MultimodalCounts::from_preprocessed(&common_request);
+
+            let mut response_generator = Box::new(response_generator);
+
+            // Update ISL only for text prompts (embeddings get sequence length from tensor shape)
+            if common_request.prompt_embeds.is_none() {
+                let isl = common_request.token_ids.len() as u32;
+                response_generator.update_isl(isl);
+            }
+
+            // repack the common completion request
+            let common_request = context.map(|_| common_request);
+
+            // create a stream of annotations this will be prepend to the response stream
+            let annotations: Vec<Annotated<NvCreateChatCompletionStreamResponse>> = annotations
+                .into_iter()
+                .filter_map(|(k, v)| Annotated::from_annotation(k, &v).ok())
+                .collect();
+            drop(preprocessing);
+
+            let sent = dispatch(common_request).await?;
+            then(
+                sent,
+                request,
+                ChatState {
+                    request_id,
+                    response_generator,
+                    payload_handle,
+                    payload_parsing_options,
+                    trace_state,
+                    trace_tokens_enabled,
+                    trace_finish_reason_metadata,
+                    mm_counts,
+                    image_tokens,
+                    prompt_injected_reasoning,
+                    guided_tool_constraint,
+                    tool_processing_route,
+                    annotations,
+                },
             )
-            .instrument(preprocessing.clone())
-            .await?;
-        if let Some(tracked) = RequestMetrics::from_context(&context) {
-            tracked.add_input_tokens(common_request.token_ids.len());
         }
-        attach_request_context_metadata(&mut common_request, &context);
+    }
 
-        let guided_tool_constraint = self.apply_tool_choice_guided_decoding(
-            &request,
-            &mut common_request,
-            prompt_injected_reasoning.clone(),
-        )?;
-        let tool_processing_route =
-            self.tool_processing_route(&request, &guided_tool_constraint)?;
-        let payload_parsing_options = payload_handle.as_ref().map(|_| {
-            context
-                .get_optional::<ParsingOptions>(REQUEST_PARSING_OPTIONS_CONTEXT_KEY)
-                .ok()
-                .flatten()
-                .map(|options| options.as_ref().clone())
-                .unwrap_or_else(|| {
-                    let mut options = ParsingOptions::new(
-                        self.tool_call_parser.clone(),
-                        self.runtime_config.reasoning_parser.clone(),
-                    );
-                    options.tool_choice = request.inner.tool_choice.clone();
-                    options.guided_tool_constraint = guided_tool_constraint.clone();
-                    options.parallel_tool_calls = request.inner.parallel_tool_calls;
-                    options
-                        .with_tool_call_parsing_enabled(Self::tool_call_parsing_enabled(&request))
-                        .with_move_reasoning_to_content_when_empty(
-                            Self::wants_reasoning_as_content_when_empty(
-                                request.chat_template_args.as_ref(),
-                            ),
-                        )
-                })
-        });
-        validate_legacy_jail_nvext_choice_count(
-            request.inner.n.unwrap_or(1),
-            request
-                .nvext
-                .as_ref()
-                .and_then(|nvext| nvext.extra_fields.as_deref()),
-            tool_processing_route.uses_legacy_jail(),
-        )?;
+    /// The tool definitions the response parsers read: the request's tools, validated. A
+    /// request whose tools do not validate fails here.
+    #[inline]
+    pub(crate) fn chat_tool_definitions(
+        request: &NvCreateChatCompletionRequest,
+    ) -> Result<Option<Vec<ToolDefinition>>, Error> {
+        let tool_definitions =
+            crate::preprocessor::tool_choice::effective_tool_definitions(request)?;
+        Ok((!tool_definitions.is_empty()).then_some(tool_definitions))
+    }
 
-        tracing::trace!(model = %common_request.model, token_count = common_request.token_ids.len(), ?prompt_injected_reasoning, "Pre-processed request");
-        let trace_state = crate::request_trace::build_request_end_trace_state(
-            &common_request,
-            &tracker,
-            &context,
-            self.kv_cache_block_size,
-        );
-        let trace_tokens_enabled = trace_state.is_some();
-        let trace_finish_reason_metadata =
-            crate::request_trace::finish_reason_metadata_handle(&trace_state);
-
-        // Attach the timing tracker to the request so downstream components can record metrics
-        common_request.tracker = tracker;
-
-        // Capture media counts before `common_request` is moved into the context.
-        let mm_counts = MultimodalCounts::from_preprocessed(&common_request);
-
-        let mut response_generator = Box::new(response_generator);
-
-        // Update ISL only for text prompts (embeddings get sequence length from tensor shape)
-        if common_request.prompt_embeds.is_none() {
-            let isl = common_request.token_ids.len() as u32;
-            response_generator.update_isl(isl);
-        }
-
-        // repack the common completion request
-        let common_request = context.map(|_| common_request);
-
-        // create a stream of annotations this will be prepend to the response stream
-        let annotations: Vec<Annotated<NvCreateChatCompletionStreamResponse>> = annotations
-            .into_iter()
-            .flat_map(|(k, v)| Annotated::from_annotation(k, &v))
-            .collect();
-        let annotations_stream = stream::iter(annotations);
-        drop(preprocessing);
-
-        // forward the common completion request to the next operator
-        let response_stream = next.send(common_request).await?;
-        // Extract context once
-        let context = response_stream.context();
-
+    /// Everything the chat preprocessor does with the response: `response_stream`, the response
+    /// to the request [`chat_forward`](Self::chat_forward) made, as the client's chat chunks.
+    /// `context` is the request's; `warmup` gives the engine a speculative next-turn prefill is
+    /// sent to, and is called only when the request asks for one.
+    ///
+    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
+    #[inline(always)]
+    fn chat_backward<S, W>(
+        &self,
+        request: &NvCreateChatCompletionRequest,
+        state: ChatState,
+        tool_definitions: Option<Vec<ToolDefinition>>,
+        response_stream: S,
+        context: Arc<dyn AsyncEngineContext>,
+        warmup: W,
+    ) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static + use<S, W>
+    where
+        S: Stream<Item = Annotated<BackendOutput>> + Send + 'static,
+        W: FnOnce() -> Arc<
+            dyn AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>,
+        >,
+    {
         // transform the postprocessor stream (no boxing yet) - detokenize
         let stream = Self::transform_postprocessor_stream_with_image_tokens(
             response_stream,
-            response_generator,
+            state.response_generator,
             context.clone(),
-            payload_handle.is_some(),
-            trace_tokens_enabled,
-            trace_finish_reason_metadata,
-            mm_counts,
-            image_tokens,
+            state.payload_handle.is_some(),
+            state.trace_tokens_enabled,
+            state.trace_finish_reason_metadata,
+            state.mm_counts,
+            state.image_tokens,
         );
 
-        let transformed_stream = self.postprocessor_parsing_stream_with_constraint(
+        let transformed_stream = self.postprocessor_parsing_stream_with_tools(
             stream,
-            &request,
-            prompt_injected_reasoning,
-            guided_tool_constraint,
-            tool_processing_route,
-        )?;
+            request,
+            state.prompt_injected_reasoning,
+            state.guided_tool_constraint,
+            state.tool_processing_route,
+            tool_definitions,
+        );
         let transformed_stream = Self::normalize_chat_stream_roles(transformed_stream);
 
         // Request payload capture is a pass-through: every chunk reaches the HTTP
         // layer unchanged (metrics, errors, aggregation all behave as with capture
         // off) while a copy is aggregated on the side for the record.
-        let final_stream = if let Some(payload) = payload_handle {
-            let parsing_options = payload_parsing_options
+        let final_stream = if let Some(payload) = state.payload_handle {
+            let parsing_options = state
+                .payload_parsing_options
                 .expect("payload capture has matching request parsing options");
             let (stream, agg_fut) =
                 crate::request_trace::payload_stream::scan_aggregate_with_future(
@@ -8714,7 +8841,7 @@ impl OpenAIPreprocessor {
                 let outcome = agg_fut.await;
                 if let Some(reason) = outcome.drop_reason.as_deref() {
                     tracing::debug!(
-                        request_id = %payload.request_id(),
+                        state.request_id = %payload.request_id(),
                         drop_reason = %reason,
                         partial_response = outcome.response.is_some(),
                         "request payload: response aggregation incomplete; emitting record with drop reason"
@@ -8730,12 +8857,12 @@ impl OpenAIPreprocessor {
 
         // Step 5: Speculative next-turn prefill. A native operator builds the engine for it
         // only when the request asks for it.
-        let final_stream = if speculative_prefill::enabled(&request) {
+        let final_stream = if speculative_prefill::enabled(request) {
             speculative_prefill::maybe_wrap_stream(
                 final_stream,
-                &request,
-                &request_id,
-                &next.engine(),
+                request,
+                &state.request_id,
+                &warmup(),
                 &self.formatter,
                 &self.tokenizer,
                 &self.speculative_prefill_tasks,
@@ -8745,14 +8872,31 @@ impl OpenAIPreprocessor {
         };
 
         let final_stream =
-            crate::request_trace::wrap_chat_request_end_stream(final_stream, trace_state);
+            crate::request_trace::wrap_chat_request_end_stream(final_stream, state.trace_state);
 
-        // prepend the annotations to the response stream
-        let stream = annotations_stream.chain(final_stream);
-
-        // box the response stream once
-        Ok(D::respond(stream, context))
+        // prepend the state.annotations to the response stream
+        stream::iter(state.annotations).chain(final_stream)
     }
+}
+
+/// What the chat preprocessor keeps of a request between sending it on and reading the
+/// response (see [`OpenAIPreprocessor::chat_forward`]).
+///
+/// Transition: make concrete when the gdl pipeline is the only local pipeline.
+pub(crate) struct ChatState {
+    request_id: String,
+    response_generator: Box<crate::protocols::openai::chat_completions::DeltaGenerator>,
+    payload_handle: Option<crate::request_trace::payload::RequestPayloadHandle>,
+    payload_parsing_options: Option<ParsingOptions>,
+    trace_state: Option<crate::request_trace::RequestEndTraceState>,
+    trace_tokens_enabled: bool,
+    trace_finish_reason_metadata: Option<crate::request_trace::SharedFinishReasonMetadata>,
+    mm_counts: MultimodalCounts,
+    image_tokens: Option<usize>,
+    prompt_injected_reasoning: PromptReasoningPrefill,
+    guided_tool_constraint: crate::protocols::openai::GuidedToolConstraint,
+    tool_processing_route: ToolProcessingRoute,
+    annotations: Vec<Annotated<NvCreateChatCompletionStreamResponse>>,
 }
 
 // Transition: remove when the gdl pipeline is the only local pipeline.
@@ -8819,123 +8963,188 @@ impl OpenAIPreprocessor {
     where
         D: Downstream<PreprocessedRequest, BackendOutput>,
     {
-        let _stage_guard = StageGuard::new(STAGE_PREPROCESS, "");
+        let (request, context) = request.into_parts();
+        self.completion_forward(
+            request,
+            context,
+            // forward the common completion request to the next operator
+            |common_request| next.send(common_request),
+            |response_stream, state| {
+                // Extract context once
+                let context = response_stream.context();
 
-        // unpack the request
-        let (mut request, context) = request.into_parts();
-        let request_id = context.id().to_string();
+                let stream = Self::completion_backward(state, response_stream, context.clone());
+                Ok(D::respond(stream, context))
+            },
+        )
+        .await
+    }
 
-        // Preserve original streaming flag
-        let original_stream_flag = request.inner.stream.unwrap_or(false);
+    /// Everything the completions preprocessor does before it sends the request on:
+    /// `dispatch` sends the preprocessed request on, and `then` gets its result and what
+    /// [`completion_backward`](Self::completion_backward) needs. As in
+    /// [`chat_forward`](Self::chat_forward), nothing large is returned and `then` is not async.
+    ///
+    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
+    // A block, not an `async fn`: the block uses its arguments where it captured them, where
+    // an `async fn` would move each into a local first and keep both in its future.
+    #[allow(clippy::manual_async_fn)]
+    fn completion_forward<Sent, T, Dispatch, Fut, Then>(
+        &self,
+        mut request: NvCreateCompletionRequest,
+        context: PipelineContext<()>,
+        dispatch: Dispatch,
+        then: Then,
+    ) -> impl Future<Output = Result<T, Error>>
+    where
+        Dispatch: Fn(SingleIn<PreprocessedRequest>) -> Fut,
+        Fut: Future<Output = Result<Sent, Error>>,
+        Then: FnOnce(Sent, CompletionState) -> Result<T, Error>,
+    {
+        async move {
+            let _stage_guard = StageGuard::new(STAGE_PREPROCESS, "");
 
-        // For non-streaming requests (stream=false), enable usage by default
-        // This ensures compliance with OpenAI API spec where non-streaming responses
-        // always include usage statistics
-        request.enable_usage_for_nonstreaming(original_stream_flag);
+            let request_id = context.id().to_string();
 
-        request.inner.stream = Some(true);
+            // Preserve original streaming flag
+            let original_stream_flag = request.inner.stream.unwrap_or(false);
 
-        // create a response generator
-        let response_generator = request.response_generator(request_id.clone());
-        let mut response_generator = Box::new(response_generator);
-        let tracker = Some(response_generator.tracker());
-        // convert the chat completion request to a common completion request
-        let mut builder = self.builder_with_lora(
-            &request,
-            context
-                .get_optional::<String>(LORA_NAME_CONTEXT_KEY)
-                .ok()
-                .flatten()
-                .map(|name| name.as_ref().clone()),
-        )?;
+            // For non-streaming requests (stream=false), enable usage by default
+            // This ensures compliance with OpenAI API spec where non-streaming responses
+            // always include usage statistics
+            request.enable_usage_for_nonstreaming(original_stream_flag);
 
-        // Check if embeddings are provided - skip tokenization path
-        let annotations = if let Some(ref prompt_embeds) = request.inner.prompt_embeds {
-            // Skip tokenization for embeddings
-            builder.token_ids(vec![]); // Empty token IDs
-            builder.prompt_embeds(Some(prompt_embeds.clone()));
-            // No token annotations
-            HashMap::new()
-        } else {
-            // Normal path: tokenize the prompt; embeddings don't need MM routing,
-            // so install tokens on the builder right away.
-            let (token_ids, ann) = self
-                .gather_tokens(&request, None, tracker.as_deref())
-                .await?;
-            builder.token_ids(token_ids);
-            ann
-        };
+            request.inner.stream = Some(true);
 
-        // Gather multimodal data (works with both embeddings and text prompts)
-        // Returned MM entries are unused on the embeddings path; routing info is
-        // not built here.
-        let _ = self
-            .gather_multi_modal_data(&request, &mut builder, None, &[])
-            .await?;
+            // create a response generator
+            let response_generator = request.response_generator(request_id.clone());
+            let mut response_generator = Box::new(response_generator);
+            let tracker = Some(response_generator.tracker());
+            // convert the chat completion request to a common completion request
+            let mut builder = self.builder_with_lora(
+                &request,
+                context
+                    .get_optional::<String>(LORA_NAME_CONTEXT_KEY)
+                    .ok()
+                    .flatten()
+                    .map(|name| name.as_ref().clone()),
+            )?;
 
-        let mut common_request = builder.build()?;
-        Self::validate_preprocessed_token_budget(&common_request, self.token_budget.as_ref())?;
-        if let Some(tracked) = RequestMetrics::from_context(&context) {
-            tracked.add_input_tokens(common_request.token_ids.len());
-        }
-        attach_request_context_metadata(&mut common_request, &context);
-
-        let trace_state = crate::request_trace::build_request_end_trace_state(
-            &common_request,
-            &tracker,
-            &context,
-            self.kv_cache_block_size,
-        );
-        let trace_tokens_enabled = trace_state.is_some();
-        let trace_finish_reason_metadata =
-            crate::request_trace::finish_reason_metadata_handle(&trace_state);
-
-        // Attach the timing tracker to the request so downstream components can record metrics
-        common_request.tracker = tracker;
-
-        // Update ISL only for text prompts (embeddings get sequence length from tensor shape)
-        if common_request.prompt_embeds.is_none() {
-            let isl = common_request.token_ids.len() as u32;
-            response_generator.update_isl(isl);
-        }
-
-        // `echo: true` returns the prompt ahead of the completion. The generator
-        // rebuilds it from the tokens the engine saw once the engine reports its prompt
-        // logprobs (or on the choice's final chunk when it reports none).
-        if request.inner.echo == Some(true) && common_request.prompt_embeds.is_none() {
-            let prompt_text = match &request.inner.prompt {
-                dynamo_protocols::types::Prompt::String(text) => Some(text.clone()),
-                _ => None,
+            // Check if embeddings are provided - skip tokenization path
+            let annotations = if let Some(ref prompt_embeds) = request.inner.prompt_embeds {
+                // Skip tokenization for embeddings
+                builder.token_ids(vec![]); // Empty token IDs
+                builder.prompt_embeds(Some(prompt_embeds.clone()));
+                // No token annotations
+                HashMap::new()
+            } else {
+                // Normal path: tokenize the prompt; embeddings don't need MM routing,
+                // so install tokens on the builder right away.
+                let (token_ids, ann) = self
+                    .gather_tokens(&request, None, tracker.as_deref())
+                    .await?;
+                builder.token_ids(token_ids);
+                ann
             };
-            response_generator.enable_echo(
-                Arc::clone(&common_request.token_ids),
-                prompt_text,
-                self.tokenizer.clone(),
-                common_request
-                    .output_options
-                    .skip_special_tokens
-                    .unwrap_or(true),
+
+            // Gather multimodal data (works with both embeddings and text prompts)
+            // Returned MM entries are unused on the embeddings path; routing info is
+            // not built here.
+            let _ = self
+                .gather_multi_modal_data(&request, &mut builder, None, &[])
+                .await?;
+
+            let mut common_request = builder.build()?;
+            Self::validate_preprocessed_token_budget(&common_request, self.token_budget.as_ref())?;
+            if let Some(tracked) = RequestMetrics::from_context(&context) {
+                tracked.add_input_tokens(common_request.token_ids.len());
+            }
+            attach_request_context_metadata(&mut common_request, &context);
+
+            let trace_state = crate::request_trace::build_request_end_trace_state(
+                &common_request,
+                &tracker,
+                &context,
+                self.kv_cache_block_size,
             );
+            let trace_tokens_enabled = trace_state.is_some();
+            let trace_finish_reason_metadata =
+                crate::request_trace::finish_reason_metadata_handle(&trace_state);
+
+            // Attach the timing tracker to the request so downstream components can record metrics
+            common_request.tracker = tracker;
+
+            // Update ISL only for text prompts (embeddings get sequence length from tensor shape)
+            if common_request.prompt_embeds.is_none() {
+                let isl = common_request.token_ids.len() as u32;
+                response_generator.update_isl(isl);
+            }
+
+            // `echo: true` returns the prompt ahead of the completion. The generator
+            // rebuilds it from the tokens the engine saw once the engine reports its prompt
+            // logprobs (or on the choice's final chunk when it reports none).
+            if request.inner.echo == Some(true) && common_request.prompt_embeds.is_none() {
+                let prompt_text = match &request.inner.prompt {
+                    dynamo_protocols::types::Prompt::String(text) => Some(text.clone()),
+                    _ => None,
+                };
+                response_generator.enable_echo(
+                    Arc::clone(&common_request.token_ids),
+                    prompt_text,
+                    self.tokenizer.clone(),
+                    common_request
+                        .output_options
+                        .skip_special_tokens
+                        .unwrap_or(true),
+                );
+            }
+
+            // repack the common completion request
+            let common_request = context.map(|_| common_request);
+
+            // create a stream of annotations this will be prepend to the response stream
+            let annotations: Vec<Annotated<NvCreateCompletionResponse>> = annotations
+                .into_iter()
+                .filter_map(|(k, v)| Annotated::from_annotation(k, &v).ok())
+                .collect();
+
+            // End preprocess stage before handing off to downstream (route/dispatch).
+            drop(_stage_guard);
+
+            let sent = dispatch(common_request).await?;
+            then(
+                sent,
+                CompletionState {
+                    response_generator,
+                    trace_state,
+                    trace_tokens_enabled,
+                    trace_finish_reason_metadata,
+                    annotations,
+                },
+            )
         }
+    }
 
-        // repack the common completion request
-        let common_request = context.map(|_| common_request);
-
-        // create a stream of annotations this will be prepend to the response stream
-        let annotations: Vec<Annotated<NvCreateCompletionResponse>> = annotations
-            .into_iter()
-            .flat_map(|(k, v)| Annotated::from_annotation(k, &v))
-            .collect();
-        let annotations_stream = stream::iter(annotations);
-
-        // End preprocess stage before handing off to downstream (route/dispatch).
-        drop(_stage_guard);
-
-        // forward the common completion request to the next operator
-        let response_stream = next.send(common_request).await?;
-
-        // Extract context once
-        let context = response_stream.context();
+    /// Everything the completions preprocessor does with the response. `context` is the
+    /// request's.
+    ///
+    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
+    #[inline(always)]
+    fn completion_backward<S>(
+        state: CompletionState,
+        response_stream: S,
+        context: Arc<dyn AsyncEngineContext>,
+    ) -> impl Stream<Item = Annotated<NvCreateCompletionResponse>> + Send + 'static + use<S>
+    where
+        S: Stream<Item = Annotated<BackendOutput>> + Send + 'static,
+    {
+        let CompletionState {
+            response_generator,
+            trace_state,
+            trace_tokens_enabled,
+            trace_finish_reason_metadata,
+            annotations,
+        } = state;
 
         // transform the postprocessor stream. Legacy `/v1/completions` is
         // text-only, so multimodal counts are always zero here.
@@ -8953,10 +9162,20 @@ impl OpenAIPreprocessor {
             crate::request_trace::wrap_completion_request_end_stream(Box::pin(stream), trace_state);
 
         // prepend the annotations to the response stream
-        let stream = annotations_stream.chain(stream);
-
-        Ok(D::respond(stream, context))
+        stream::iter(annotations).chain(stream)
     }
+}
+
+/// What the completions preprocessor keeps of a request between sending it on and reading
+/// the response.
+///
+/// Transition: make concrete when the gdl pipeline is the only local pipeline.
+pub(crate) struct CompletionState {
+    response_generator: Box<crate::protocols::openai::completions::DeltaGenerator>,
+    trace_state: Option<crate::request_trace::RequestEndTraceState>,
+    trace_tokens_enabled: bool,
+    trace_finish_reason_metadata: Option<crate::request_trace::SharedFinishReasonMetadata>,
+    annotations: Vec<Annotated<NvCreateCompletionResponse>>,
 }
 
 // Transition: remove when the gdl pipeline is the only local pipeline.
@@ -9027,36 +9246,77 @@ impl OpenAIPreprocessor {
     where
         D: Downstream<PreprocessedEmbeddingRequest, EmbeddingsEngineOutput>,
     {
-        // Unpack request
         let (request, context) = request.into_parts();
-
-        // Preprocess the embedding request
-        let (preprocessed_request, annotations) =
-            self.preprocess_embedding_request(&request).await?;
-        if let Some(metrics) = RequestMetrics::from_context(&context) {
-            metrics.add_input_tokens(preprocessed_request.token_ids.iter().map(Vec::len).sum());
-        }
-
-        // Forward to next stage
-        let preprocessed_request = context.map(|_| preprocessed_request);
-        let response_stream = next.send(preprocessed_request).await?;
+        let (response_stream, annotations) = self
+            .embedding_forward(
+                &request,
+                context,
+                // Forward to next stage
+                |preprocessed_request| next.send(preprocessed_request),
+            )
+            .await?;
 
         // Extract context once
         let context = response_stream.context();
 
-        // Transform response stream back to OpenAI format
-        let stream = Self::transform_embedding_postprocessor_stream(response_stream, request);
+        Ok(D::respond(
+            Self::embedding_backward(request, annotations, response_stream),
+            context,
+        ))
+    }
 
-        // Prepend annotations
-        let annotations_stream = stream::iter(
-            annotations
+    /// Everything the embeddings preprocessor does before it sends the request on: `dispatch`
+    /// sends the preprocessed request on. Returns its result and the annotations
+    /// [`embedding_backward`](Self::embedding_backward) puts first. The request stays with the
+    /// caller, which hands it to the backward half: each move of it is a memcpy.
+    ///
+    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
+    // A block, not an `async fn`: the block uses its arguments where it captured them, where
+    // an `async fn` would move each into a local first and keep both in its future.
+    #[allow(clippy::manual_async_fn)]
+    fn embedding_forward<Sent, Dispatch, Fut>(
+        &self,
+        request: &NvCreateEmbeddingRequest,
+        context: PipelineContext<()>,
+        dispatch: Dispatch,
+    ) -> impl Future<Output = Result<(Sent, Vec<Annotated<NvCreateEmbeddingResponse>>), Error>>
+    where
+        Dispatch: Fn(SingleIn<PreprocessedEmbeddingRequest>) -> Fut,
+        Fut: Future<Output = Result<Sent, Error>>,
+    {
+        async move {
+            // Preprocess the embedding request
+            let (preprocessed_request, annotations) =
+                self.preprocess_embedding_request(request).await?;
+            if let Some(metrics) = RequestMetrics::from_context(&context) {
+                metrics.add_input_tokens(preprocessed_request.token_ids.iter().map(Vec::len).sum());
+            }
+
+            let annotations = annotations
                 .into_iter()
-                .flat_map(|(k, v)| Annotated::from_annotation(k, &v))
-                .collect::<Vec<_>>(),
-        );
+                .filter_map(|(k, v)| Annotated::from_annotation(k, &v).ok())
+                .collect::<Vec<_>>();
+            let sent = dispatch(context.map(|_| preprocessed_request)).await?;
+            Ok((sent, annotations))
+        }
+    }
 
-        let combined_stream = annotations_stream.chain(stream);
-        Ok(D::respond(combined_stream, context))
+    /// Everything the embeddings preprocessor does with the response to `request`: the
+    /// annotations first, then the response in OpenAI's form.
+    ///
+    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
+    #[inline(always)]
+    fn embedding_backward<S>(
+        request: NvCreateEmbeddingRequest,
+        annotations: Vec<Annotated<NvCreateEmbeddingResponse>>,
+        response_stream: S,
+    ) -> impl Stream<Item = Annotated<NvCreateEmbeddingResponse>> + Send + 'static + use<S>
+    where
+        S: Stream<Item = Annotated<EmbeddingsEngineOutput>> + Send + 'static,
+    {
+        // Transform response stream back to OpenAI format, after the annotations
+        let stream = Self::transform_embedding_postprocessor_stream(response_stream, request);
+        stream::iter(annotations).chain(stream)
     }
 }
 

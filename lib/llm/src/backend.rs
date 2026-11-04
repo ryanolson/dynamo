@@ -18,6 +18,7 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
+    marker::PhantomData,
     pin::Pin,
     sync::Arc,
     task::{Context as TaskContext, Poll, ready},
@@ -29,7 +30,9 @@ use futures::FutureExt;
 use futures::stream::{Stream, StreamExt};
 
 use crate::model_card::ModelDeploymentCard;
-use crate::operator::{Downstream, DynamoDownstream, GdlDownstream, GdlOperator, native};
+use crate::operator::{
+    Downstream, DynamoDownstream, GdlDownstream, GdlOperator, Item, ItemForm, native,
+};
 use dynamo_runtime::dynamo_nvtx_range;
 use dynamo_runtime::{
     error::{DynamoError, ErrorClass},
@@ -72,8 +75,9 @@ pub struct Backend {
 ///
 /// Transition: make concrete when the gdl pipeline is the only local pipeline.
 #[allow(dead_code)]
-struct DecoderState<D: Downstream<PreprocessedRequest, LLMEngineOutput>> {
-    stream: D::Items,
+struct DecoderState<S, F> {
+    /// The engine's stream; `()` until the request is sent (see [`DecoderState::reading`]).
+    stream: S,
     decoders: HashMap<u32, Decoder>,
     finished_choices: HashSet<u32>,
     validate_engine_decode: bool,
@@ -96,6 +100,28 @@ struct DecoderState<D: Downstream<PreprocessedRequest, LLMEngineOutput>> {
     /// When `false`, `jailed_text` is left unset on every chunk rather than snapshotting the
     /// decoder's withheld state for a checkpoint nothing can ever consume.
     migration_possible: bool,
+    form: PhantomData<fn() -> F>,
+}
+
+impl<F> DecoderState<(), F> {
+    /// The state reading `stream`, the engine's response to the request it was built for.
+    fn reading<S>(self, stream: S) -> DecoderState<S, F> {
+        DecoderState {
+            stream,
+            decoders: self.decoders,
+            finished_choices: self.finished_choices,
+            validate_engine_decode: self.validate_engine_decode,
+            no_stop_trim: self.no_stop_trim,
+            retain_model_stop_token_text: self.retain_model_stop_token_text,
+            finished: self.finished,
+            tokenizer: self.tokenizer,
+            skip_special_tokens: self.skip_special_tokens,
+            pending_flush: self.pending_flush,
+            stream_ended: self.stream_ended,
+            migration_possible: self.migration_possible,
+            form: PhantomData,
+        }
+    }
 }
 
 /// Decodes one vocabulary ID for per-token logprob metadata.
@@ -206,11 +232,11 @@ impl Backend {
         }
     }
 
+    /// The decoders for one request, before its stream: the check that the request can be
+    /// decoded at all (a tokenizer, and a migration checkpoint that fits the prompt).
+    ///
     /// Transition: make concrete when the gdl pipeline is the only local pipeline.
-    fn decoder<D>(&self, stream: D::Items, params: DecoderParams) -> anyhow::Result<DecoderState<D>>
-    where
-        D: Downstream<PreprocessedRequest, LLMEngineOutput>,
-    {
+    fn decoder<F>(&self, params: DecoderParams) -> anyhow::Result<DecoderState<(), F>> {
         let Some(tokenizer) = self.tokenizer.as_ref() else {
             anyhow::bail!("Backend built from blank ModelDeploymentCard, no tokenizer");
         };
@@ -225,7 +251,7 @@ impl Backend {
         }
 
         Ok(DecoderState {
-            stream,
+            stream: (),
             decoders,
             finished_choices: HashSet::new(),
             validate_engine_decode: self.validate_engine_decode,
@@ -237,6 +263,7 @@ impl Backend {
             pending_flush: Vec::new(),
             stream_ended: false,
             migration_possible: params.migration_possible,
+            form: PhantomData,
         })
     }
 }
@@ -304,7 +331,10 @@ impl Backend {
         let next_stream = next.send_items(request).await?;
 
         let context = next_stream.context();
-        let state = self.decoder::<D>(next_stream, decoder_params)?;
+        // Checked after the request is sent, as this path always has.
+        let state = self
+            .decoder::<D::Form>(decoder_params)?
+            .reading(next_stream);
 
         Ok(D::respond_items(
             DecoderStream { state: Some(state) },
@@ -322,17 +352,18 @@ impl Backend {
 /// moves only where it changes type.
 ///
 /// Transition: make concrete when the gdl pipeline is the only local pipeline.
-struct DecoderStream<D: Downstream<PreprocessedRequest, LLMEngineOutput>> {
+struct DecoderStream<S, F> {
     /// `None` once the stream has ended. That drops the stream below and the decoders when this
     /// stream ends, not when its caller drops it, as `unfold` did.
-    state: Option<DecoderState<D>>,
+    state: Option<DecoderState<S, F>>,
 }
 
-impl<D> Stream for DecoderStream<D>
+impl<S, F> Stream for DecoderStream<S, F>
 where
-    D: Downstream<PreprocessedRequest, LLMEngineOutput>,
+    F: ItemForm,
+    S: Stream<Item = Item<F, LLMEngineOutput>> + AsyncEngineContextProvider + Unpin,
 {
-    type Item = D::Item<BackendOutput>;
+    type Item = Item<F, BackendOutput>;
 
     // hot path: per-item-response
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
@@ -340,7 +371,7 @@ where
             return Poll::Ready(None);
         };
         match ready!(state.poll_step(cx)) {
-            Some(output) => Poll::Ready(Some(D::map_item(output, backend_output))),
+            Some(output) => Poll::Ready(Some(F::map_item(output, backend_output))),
             None => {
                 self.state = None;
                 Poll::Ready(None)
@@ -349,12 +380,13 @@ where
     }
 }
 
-impl<D> DecoderState<D>
+impl<S, F> DecoderState<S, F>
 where
-    D: Downstream<PreprocessedRequest, LLMEngineOutput>,
+    F: ItemForm,
+    S: Stream<Item = Item<F, LLMEngineOutput>> + AsyncEngineContextProvider + Unpin,
 {
     /// The next item, detokenized in place, or `None` when the stream has ended.
-    fn poll_step(&mut self, cx: &mut TaskContext<'_>) -> Poll<Option<D::Item<LLMEngineOutput>>> {
+    fn poll_step(&mut self, cx: &mut TaskContext<'_>) -> Poll<Option<Item<F, LLMEngineOutput>>> {
         // If we've already detected a local stop condition, end the stream
         if self.finished {
             return Poll::Ready(None);
@@ -363,12 +395,12 @@ where
         // `stream` already yielded `None` once; do not poll it again (unspecified
         // behavior for most `Stream` impls). Only drain the flush queue from here on.
         if self.stream_ended {
-            return Poll::Ready(self.pending_flush.pop().map(D::from_annotated));
+            return Poll::Ready(self.pending_flush.pop().map(F::from_annotated));
         }
 
         let output = loop {
             let output = ready!(self.stream.poll_next_unpin(cx));
-            let choice_already_finished = output.as_ref().map(D::item).is_some_and(|output| {
+            let choice_already_finished = output.as_ref().map(F::item).is_some_and(|output| {
                 !output.is_event()
                     && output.data.as_ref().is_some_and(|data| {
                         self.finished_choices
@@ -382,7 +414,7 @@ where
 
         match output {
             Some(mut item) => {
-                let output = D::item_mut(&mut item);
+                let output = F::item_mut(&mut item);
                 // move to state.process_output
                 // handle any error conditions / unwraps here
 
@@ -452,7 +484,7 @@ where
                         .class(ErrorClass::BackendProtocol)
                         .message("no_stop_trim requires backend token IDs through the matched stop; the backend omitted them (also required when a parser retains the model's stop token text)")
                         .build();
-                    return Poll::Ready(Some(D::from_annotated(Annotated::from_err(error))));
+                    return Poll::Ready(Some(F::from_annotated(Annotated::from_err(error))));
                 }
 
                 // if we have a data field without an event, then we might need to update the data
@@ -722,7 +754,7 @@ where
                     };
                     self.pending_flush.push(Annotated::from_data(data));
                 }
-                Poll::Ready(self.pending_flush.pop().map(D::from_annotated))
+                Poll::Ready(self.pending_flush.pop().map(F::from_annotated))
             }
         }
     }

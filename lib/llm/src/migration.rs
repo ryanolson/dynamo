@@ -15,7 +15,7 @@ use futures::{FutureExt, Stream, stream::StreamExt};
 use crate::{
     http::service::metrics::Metrics,
     model_card::ModelDeploymentCard,
-    operator::{Downstream, DynamoDownstream, GdlDownstream, GdlOperator, native},
+    operator::{Downstream, DynamoDownstream, GdlDownstream, GdlOperator, Item, ItemForm, native},
     protocols::{
         TokenIdType,
         common::{
@@ -442,13 +442,13 @@ where
     Resp: Data + HasTokenIds,
     D: Downstream<PreprocessedRequest, Resp> + 'static,
 {
-    type Item = D::Item<Resp>;
+    type Item = Item<D::Form, Resp>;
 
     // hot path: per-item-response
     fn poll_next(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> Poll<Option<D::Item<Resp>>> {
+    ) -> Poll<Option<Item<D::Form, Resp>>> {
         let this = &mut *self;
         loop {
             match this {
@@ -465,7 +465,7 @@ where
                                 return poll;
                             }
                             Poll::Ready(Some(response)) => {
-                                if manager.accept(D::item_mut(response)) {
+                                if manager.accept(<D::Form as ItemForm>::item_mut(response)) {
                                     return poll;
                                 }
                             }
@@ -473,7 +473,7 @@ where
                         let Poll::Ready(Some(response)) = poll else {
                             unreachable!("only a failure to migrate on gets here");
                         };
-                        let response = D::into_annotated(response);
+                        let response = <D::Form as ItemForm>::into_annotated(response);
                         let Migrated::Streaming(mut manager) =
                             std::mem::replace(this, Migrated::Ended)
                         else {
@@ -505,7 +505,7 @@ where
                         Some(_) => Migrated::Streaming(manager),
                         None => Migrated::Ended,
                     };
-                    return Poll::Ready(next.map(D::from_annotated));
+                    return Poll::Ready(next.map(<D::Form as ItemForm>::from_annotated));
                 }
                 Migrated::Ended => return Poll::Ready(None),
             }
@@ -669,10 +669,13 @@ where
                 }
             };
             let mut response = response_stream.next().await?;
-            if self.accept(D::item_mut(&mut response)) {
-                return Some(D::into_annotated(response));
+            if self.accept(<D::Form as ItemForm>::item_mut(&mut response)) {
+                return Some(<D::Form as ItemForm>::into_annotated(response));
             }
-            if let Some(response) = self.migrate_on(D::into_annotated(response)).await {
+            if let Some(response) = self
+                .migrate_on(<D::Form as ItemForm>::into_annotated(response))
+                .await
+            {
                 return Some(response);
             }
         }
