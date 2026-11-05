@@ -4037,6 +4037,548 @@ async fn exhausted_migration_aborts_parked_lifecycle_with_worker_failure() {
     harness.runtime.shutdown();
 }
 
+async fn retry_dispatch_failure_releases_classifier_id(error_type: ErrorType) {
+    struct FailRetry {
+        host: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
+        calls: AtomicUsize,
+        error_type: ErrorType,
+    }
+
+    #[async_trait]
+    impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>, Error>
+        for FailRetry
+    {
+        async fn generate(
+            &self,
+            request: SingleIn<PreprocessedRequest>,
+        ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+            if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                return self.host.generate(request).await;
+            }
+            if self.error_type == ErrorType::Cancelled {
+                request.context().kill();
+            }
+            Err(DynamoError::builder()
+                .error_type(self.error_type)
+                .message("retry rejected before reaching the host")
+                .build()
+                .into())
+        }
+    }
+
+    let (observations, mut events) = mpsc::unbounded_channel();
+    let harness = two_worker_migration_harness(
+        "retry-dispatch-failure-releases-classifier-id",
+        Arc::new(RejectFirstDispatch::default()),
+        Some(RecordingClassifier {
+            calls: Arc::new(AtomicUsize::new(0)),
+            observations,
+        }),
+    )
+    .await;
+    let engine = Arc::new(FailRetry {
+        host: harness.engine.clone(),
+        calls: AtomicUsize::new(0),
+        error_type,
+    });
+    let context_id = "reuse-after-retry-dispatch-failure";
+    let first = Context::with_id_and_metadata(request(), context_id.to_owned(), Default::default());
+    let context = first.context();
+    let migration = Migration::new(1, None, "test".to_owned(), Arc::new(Metrics::new()));
+    let mut failed_stream = migration.generate(first, engine).await.unwrap();
+    let terminal = tokio::time::timeout(Duration::from_secs(5), failed_stream.next())
+        .await
+        .expect("the failed retry returns its terminal error")
+        .unwrap();
+    assert!(match_error_chain(
+        terminal.error.as_ref().unwrap(),
+        &[ErrorType::WorkerOverloaded],
+        &[],
+    ));
+    assert!(!context.is_stopped());
+    assert!(!context.is_killed());
+
+    // A caller may keep the stream after its terminal error, without another poll.
+    let second =
+        Context::with_id_and_metadata(request(), context_id.to_owned(), Default::default());
+    let reused = tokio::time::timeout(Duration::from_secs(5), harness.engine.generate(second))
+        .await
+        .expect("request-id reuse must not hang");
+    let reuse_error = match reused {
+        Ok(stream) => {
+            let responses =
+                tokio::time::timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
+                    .await
+                    .unwrap();
+            assert!(responses.iter().all(|item| item.error.is_none()));
+            None
+        }
+        Err(error) => Some(format!("{error:#}")),
+    };
+    drop(failed_stream);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap(),
+        Some(ClassifierObservation::Aborted {
+            cause: Some(error_type),
+        }),
+    );
+    harness.runtime.shutdown();
+    assert!(
+        reuse_error.is_none(),
+        "a terminal retry error must release its classifier id before another poll or drop: {reuse_error:?}",
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn rejected_retry_dispatch_releases_classifier_id_before_stream_drop() {
+    retry_dispatch_failure_releases_classifier_id(ErrorType::InvalidArgument).await;
+}
+
+/// A retry whose dispatch fails as `Cancelled` before it reaches the host, while the request
+/// goes on, releases the classifier's request id at once: a caller can hold the stream after
+/// its terminal error, and a new request with the same id must still be classified. So
+/// Migration aborts the parked lifecycle at once on such a failure, rather than defer it.
+#[tokio::test]
+#[serial_test::serial]
+async fn cancelled_retry_dispatch_releases_classifier_id_before_stream_drop() {
+    retry_dispatch_failure_releases_classifier_id(ErrorType::Cancelled).await;
+}
+
+/// The engine behind Migration in [`a_kill_during_a_retry_records_cancelled_and_its_cause`]:
+/// its first call goes to the routing host, whose worker fails in-stream with a migratable
+/// error, so the host parks the classifier lifecycle for the retry. Its later calls stand for
+/// a hop that has not reached the host yet, such as a remote prefill: they leave the lifecycle
+/// parked, wait for the request's kill, and fail as `Cancelled`, as the host does when a kill
+/// lands in its dispatch.
+struct ParkThenHoldEngine {
+    host: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
+    calls: AtomicUsize,
+    retry_entered: mpsc::UnboundedSender<()>,
+}
+
+#[async_trait]
+impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>, Error>
+    for ParkThenHoldEngine
+{
+    async fn generate(
+        &self,
+        request: SingleIn<PreprocessedRequest>,
+    ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+        if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+            return self.host.generate(request).await;
+        }
+        let context = request.context();
+        let _ = self.retry_entered.send(());
+        context.killed().await;
+        Err(DynamoError::builder()
+            .error_type(ErrorType::Cancelled)
+            .message("request killed during dispatch")
+            .build()
+            .into())
+    }
+}
+
+/// Every attempt fails at dispatch, before any item, with a migratable `WorkerUnavailable`.
+#[derive(Default)]
+struct UnavailableDispatch;
+
+#[async_trait]
+impl StreamingDispatch<PreprocessedRequest, Annotated<LLMEngineOutput>> for UnavailableDispatch {
+    async fn generate(
+        &self,
+        _request: SingleIn<AddressedRequest<PreprocessedRequest>>,
+    ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+        Err(DynamoError::builder()
+            .error_type(ErrorType::WorkerUnavailable)
+            .message("selected worker is not ready")
+            .build()
+            .into())
+    }
+
+    async fn generate_bidirectional(
+        &self,
+        _instance: Instance,
+        _address: String,
+        _input: ManyIn<PreprocessedRequest>,
+    ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+        unreachable!("the routing host dispatches unary requests")
+    }
+}
+
+/// What a client disconnect during Migration's retry records through pipeline C on
+/// `local_pipeline`, when the first attempt's worker fails through `dispatch` and the host
+/// parks the classifier lifecycle for the retry: what the caller received with every
+/// migration outcome recorded, and the classifier's terminal events.
+async fn kill_during_a_parked_retry(
+    local_pipeline: crate::entrypoint::input::LocalPipeline,
+    dispatch: Arc<dyn StreamingDispatch<PreprocessedRequest, Annotated<LLMEngineOutput>>>,
+) -> (String, String) {
+    use crate::entrypoint::input::PreprocessedRouting;
+    use crate::kv_router::{EncoderRouter, PrefillRouter};
+    use crate::model_card::ModelDeploymentCard;
+    use dynamo_runtime::metrics::prometheus_names::frontend_service::{
+        migration_outcome, migration_type,
+    };
+
+    let card = ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
+        .unwrap();
+    let (observations_tx, mut observations_rx) = mpsc::unbounded_channel();
+    let harness = two_worker_migration_harness(
+        &format!("kill-during-parked-retry-{}", local_pipeline.as_str()),
+        dispatch,
+        Some(RecordingClassifier {
+            calls: Arc::new(AtomicUsize::new(0)),
+            observations: observations_tx,
+        }),
+    )
+    .await;
+    let (retry_entered, mut retries) = mpsc::unbounded_channel();
+    let engine = Arc::new(ParkThenHoldEngine {
+        host: harness.engine.clone(),
+        calls: AtomicUsize::new(0),
+        retry_entered,
+    });
+    let metrics = Arc::new(Metrics::new());
+    let pipeline = PreprocessedRouting::new(
+        engine,
+        PrefillRouter::disabled(
+            Arc::new(crate::discovery::ModelManager::new()),
+            RouterMode::KV,
+            None,
+        ),
+        EncoderRouter::disabled(),
+    )
+    .with_local_pipeline(local_pipeline)
+    .build_preprocessed_pipeline(&card, 3, None, metrics.clone())
+    .unwrap();
+
+    let request = Context::new(request());
+    let context = request.context();
+    // The call and the read run in one task: an eager failure makes the retry part of the call.
+    let call = tokio::spawn(async move {
+        match pipeline.generate(request).await {
+            Ok(stream) => format!("{} items", stream.collect::<Vec<_>>().await.len()),
+            Err(error) => match error.downcast_ref::<DynamoError>() {
+                Some(error) => format!("error {:?}", error.error_type()),
+                None => format!("error {error:#}"),
+            },
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), retries.recv())
+        .await
+        .expect("the retry reaches its dispatch")
+        .unwrap();
+    context.kill();
+    let answer = tokio::time::timeout(Duration::from_secs(5), call)
+        .await
+        .expect("the call ends after the kill")
+        .unwrap();
+
+    let first = tokio::time::timeout(Duration::from_secs(5), observations_rx.recv())
+        .await
+        .expect("the classifier receives a terminal event")
+        .unwrap();
+    // A second terminal event would arrive on the same delivery task.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut events = vec![first];
+    while let Ok(event) = observations_rx.try_recv() {
+        events.push(event);
+    }
+    let mut recorded = Vec::new();
+    for kind in [migration_type::NEW_REQUEST, migration_type::ONGOING_REQUEST] {
+        for outcome in [
+            migration_outcome::SUCCESS,
+            migration_outcome::FAILURE,
+            migration_outcome::CANCELLED,
+        ] {
+            let count =
+                metrics.get_migration_duration_sample_count(&card.display_name, kind, outcome);
+            if count > 0 {
+                recorded.push(format!("{kind}/{outcome} x{count}"));
+            }
+        }
+    }
+    harness.runtime.shutdown();
+    let pipeline = local_pipeline.as_str();
+    (
+        format!("{pipeline}: {answer}, outcomes {recorded:?}"),
+        format!("{pipeline}: {events:?}"),
+    )
+}
+
+/// A client disconnect while Migration's retry after an eager `WorkerUnavailable` is still
+/// dispatching, with the classifier lifecycle parked for that retry: Migration records the
+/// retry's outcome as `cancelled` once, on both local pipelines.
+///
+/// The retry is part of the call, so on gdl the kill drops Migration's future in flight and
+/// the call fails as `Cancelled` (the accepted difference `kill_during_dispatch` pins). Only
+/// Migration's drop can then record the outcome.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_kill_during_a_retry_at_dispatch_records_cancelled_once() {
+    use crate::entrypoint::input::LocalPipeline;
+
+    let mut outcomes = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        let (outcome, _) =
+            kill_during_a_parked_retry(local_pipeline, Arc::new(UnavailableDispatch)).await;
+        outcomes.push(outcome);
+    }
+    assert_eq!(
+        outcomes,
+        [
+            "dynamo: error Cancelled, outcomes [\"new_request/cancelled x1\"]",
+            "gdl: error Cancelled, outcomes [\"new_request/cancelled x1\"]",
+        ]
+    );
+}
+
+/// As [`a_kill_during_a_retry_at_dispatch_records_cancelled_once`], for a retry after a
+/// mid-stream failure: the call has returned, and the retry runs while the caller reads.
+/// Nothing is dropped here: on gdl the attempt's hop answers the kill with an empty stream,
+/// and Migration records the outcome as it does on any hop that answers a kill so.
+///
+/// An accepted difference: dynamo's caller receives the failure that caused the retry, because
+/// the host fails the killed dispatch; gdl's receives nothing. The HTTP handler stops reading at
+/// the kill, so a client sees neither.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_kill_during_a_retry_mid_stream_records_cancelled_once() {
+    use crate::entrypoint::input::LocalPipeline;
+
+    let mut outcomes = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        let (outcome, _) = kill_during_a_parked_retry(
+            local_pipeline,
+            Arc::new(AlwaysOverloadedDispatch::default()),
+        )
+        .await;
+        outcomes.push(outcome);
+    }
+    assert_eq!(
+        outcomes,
+        [
+            "dynamo: 1 items, outcomes [\"ongoing_request/cancelled x1\"]",
+            "gdl: 0 items, outcomes [\"ongoing_request/cancelled x1\"]",
+        ]
+    );
+}
+
+/// The classifier's one terminal event for a kill during a retry, with the lifecycle parked
+/// for that retry, carries the cancel as its cause, on both local pipelines and for both retry
+/// shapes. Dynamo's host fails the killed dispatch as `Cancelled`, and Migration aborts the
+/// parked lifecycle with that error.
+///
+/// On gdl the kill drops Migration's future (at dispatch), or the hop answers it with an empty
+/// stream (mid-stream). Migration cannot abort the lifecycle then, because a detached prefill
+/// route's decode leg may still take it
+/// (`killed_migration_preserves_one_classifier_lifecycle_through_detached_cleanup`). So it
+/// gives the lifecycle the cancel as the cause of its drop, and the lifecycle aborts with it
+/// when it is dropped unclaimed.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_kill_during_a_retry_aborts_the_parked_lifecycle_with_its_cause() {
+    use crate::entrypoint::input::LocalPipeline;
+
+    let mut causes = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        for dispatch in [
+            Arc::new(UnavailableDispatch)
+                as Arc<dyn StreamingDispatch<PreprocessedRequest, Annotated<LLMEngineOutput>>>,
+            Arc::new(AlwaysOverloadedDispatch::default()),
+        ] {
+            let (_, cause) = kill_during_a_parked_retry(local_pipeline, dispatch).await;
+            causes.push(cause);
+        }
+    }
+    assert_eq!(
+        causes,
+        [
+            "dynamo: [Aborted { cause: Some(Cancelled) }]",
+            "dynamo: [Aborted { cause: Some(Cancelled) }]",
+            "gdl: [Aborted { cause: Some(Cancelled) }]",
+            "gdl: [Aborted { cause: Some(Cancelled) }]",
+        ]
+    );
+}
+
+/// A remote prefill's route can send its decode leg, which releases the staged KV, after
+/// Migration has seen the kill: on gdl the route outlives the kill as a detached task. That leg
+/// takes the classifier lifecycle parked for the retry, so the request is classified once, on
+/// both local pipelines and for both retry shapes, when the hop answers the kill with an empty
+/// stream. Migration must leave the parked lifecycle to it.
+#[tokio::test]
+#[serial_test::serial]
+async fn killed_migration_preserves_one_classifier_lifecycle_through_detached_cleanup() {
+    assert_eq!(
+        detached_cleanup_classifications(false).await,
+        [1; 4],
+        "cleanup must reuse the request's classification"
+    );
+}
+
+/// As [`killed_migration_preserves_one_classifier_lifecycle_through_detached_cleanup`], when the
+/// hop fails the kill as `Cancelled`. Migration aborts the parked lifecycle at once on a
+/// cancelled dispatch, so that the request id is released
+/// (`cancelled_retry_dispatch_releases_classifier_id_before_stream_drop`), and the cleanup leg
+/// then classifies a second lifecycle on dynamo. No hop does this today: dynamo's prefill router
+/// waits for its decode leg before it returns.
+#[tokio::test]
+#[serial_test::serial]
+#[ignore = "an Err(Cancelled) hop with a pending detached cleanup classifies twice on dynamo: \
+            deferring the abort would hold the request id until the stream drops"]
+async fn a_cancelled_dispatch_preserves_one_classifier_lifecycle_through_detached_cleanup() {
+    assert_eq!(
+        detached_cleanup_classifications(true).await,
+        [1; 4],
+        "cleanup must reuse the request's classification"
+    );
+}
+
+/// How many times the classifier classifies a request killed during a retry whose hop sends
+/// the decode cleanup leg after the kill, per local pipeline (dynamo first) and retry shape (at
+/// dispatch first). The hop answers the kill with a `Cancelled` error when `fail_on_kill`, else
+/// with an empty stream.
+async fn detached_cleanup_classifications(fail_on_kill: bool) -> Vec<usize> {
+    use crate::entrypoint::input::{LocalPipeline, PreprocessedRouting};
+    use crate::kv_router::{EncoderRouter, PrefillRouter};
+    use crate::model_card::ModelDeploymentCard;
+    use crate::protocols::common::timing::RequestTracker;
+
+    struct LateCleanup {
+        host: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
+        calls: AtomicUsize,
+        retry_entered: mpsc::UnboundedSender<()>,
+        release_cleanup: Arc<Notify>,
+        cleanup_finished: mpsc::UnboundedSender<()>,
+        /// Answer the kill with a `Cancelled` error rather than an empty stream.
+        fail_on_kill: bool,
+    }
+
+    #[async_trait]
+    impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>, Error>
+        for LateCleanup
+    {
+        async fn generate(
+            &self,
+            mut request: SingleIn<PreprocessedRequest>,
+        ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+            if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                return self.host.generate(request).await;
+            }
+            let context = request.context();
+            request.staged_kv_cleanup = true;
+            let tracker = Arc::new(RequestTracker::new());
+            drop(tracker.set_phase(RequestPhase::Decode).await);
+            request.tracker = Some(tracker);
+            let host = self.host.clone();
+            let release = self.release_cleanup.clone();
+            let finished = self.cleanup_finished.clone();
+            // The prefill router detaches its route on gdl; its decode cleanup survives the kill.
+            tokio::spawn(async move {
+                release.notified().await;
+                if let Ok(stream) = host.generate(request).await {
+                    stream.collect::<Vec<_>>().await;
+                }
+                finished.send(()).unwrap();
+            });
+            self.retry_entered.send(()).unwrap();
+            context.killed().await;
+            if self.fail_on_kill {
+                return Err(DynamoError::builder()
+                    .error_type(ErrorType::Cancelled)
+                    .message("request killed during dispatch")
+                    .build()
+                    .into());
+            }
+            Ok(ResponseStream::new(Box::pin(stream::empty()), context))
+        }
+    }
+
+    let card = ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
+        .unwrap();
+    let mut classifications = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        for eager_failure in [true, false] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (observations, mut events) = mpsc::unbounded_channel();
+            let dispatch: Arc<
+                dyn StreamingDispatch<PreprocessedRequest, Annotated<LLMEngineOutput>>,
+            > = if eager_failure {
+                Arc::new(UnavailableDispatch)
+            } else {
+                Arc::new(RejectFirstDispatch::default())
+            };
+            let harness = two_worker_migration_harness(
+                &format!(
+                    "late-cleanup-{}-{eager_failure}-{fail_on_kill}",
+                    local_pipeline.as_str()
+                ),
+                dispatch,
+                Some(RecordingClassifier {
+                    calls: calls.clone(),
+                    observations,
+                }),
+            )
+            .await;
+            let release_cleanup = Arc::new(Notify::new());
+            let (retry_entered, mut retries) = mpsc::unbounded_channel();
+            let (cleanup_finished, mut finished) = mpsc::unbounded_channel();
+            let engine = Arc::new(LateCleanup {
+                host: harness.engine.clone(),
+                calls: AtomicUsize::new(0),
+                retry_entered,
+                release_cleanup: release_cleanup.clone(),
+                cleanup_finished,
+                fail_on_kill,
+            });
+            let pipeline = PreprocessedRouting::new(
+                engine,
+                PrefillRouter::disabled(
+                    Arc::new(crate::discovery::ModelManager::new()),
+                    RouterMode::KV,
+                    None,
+                ),
+                EncoderRouter::disabled(),
+            )
+            .with_local_pipeline(local_pipeline)
+            .build_preprocessed_pipeline(&card, 3, None, Arc::new(Metrics::new()))
+            .unwrap();
+            let request = Context::new(request());
+            let context = request.context();
+            let call = tokio::spawn(async move {
+                if let Ok(stream) = pipeline.generate(request).await {
+                    stream.collect::<Vec<_>>().await;
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(5), retries.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            context.kill();
+            tokio::time::timeout(Duration::from_secs(5), call)
+                .await
+                .unwrap()
+                .unwrap();
+            release_cleanup.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), finished.recv())
+                .await
+                .expect("decode cleanup must finish after the kill")
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("the classifier must receive a terminal event")
+                .unwrap();
+            classifications.push(calls.load(Ordering::Acquire));
+            harness.runtime.shutdown();
+        }
+    }
+    classifications
+}
+
 /// A gracefully shutting-down worker: `Cancelled` data frame, then the reason.
 #[derive(Default)]
 struct ShutdownAfterCancelDispatch {

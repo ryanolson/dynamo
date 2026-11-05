@@ -279,8 +279,23 @@ fn pipeline_c(
     engine: Engine,
     migration_limit: u32,
 ) -> Pipeline<PreprocessedRequest, LLMEngineOutput> {
+    pipeline_c_with_metrics(
+        local_pipeline,
+        engine,
+        migration_limit,
+        Arc::new(Metrics::new()),
+    )
+}
+
+/// [`pipeline_c`], recording into `metrics`.
+fn pipeline_c_with_metrics(
+    local_pipeline: LocalPipeline,
+    engine: Engine,
+    migration_limit: u32,
+    metrics: Arc<Metrics>,
+) -> Pipeline<PreprocessedRequest, LLMEngineOutput> {
     routing(engine, local_pipeline)
-        .build_preprocessed_pipeline(&card(), migration_limit, None, Arc::new(Metrics::new()))
+        .build_preprocessed_pipeline(&card(), migration_limit, None, metrics)
         .unwrap()
 }
 
@@ -695,6 +710,259 @@ async fn a_worker_that_ignores_the_kill_is_cut_off_only_on_gdl() {
     }
     // An accepted difference: gdl ends sooner; neither sends an error.
     assert_eq!(outcomes, [(false, true, false), (true, false, false)]);
+}
+
+/// Every migration outcome `metrics` recorded, as `type/outcome xN`.
+fn migration_outcomes(metrics: &Metrics) -> Vec<String> {
+    use dynamo_runtime::metrics::prometheus_names::frontend_service::{
+        migration_outcome, migration_type,
+    };
+    let model = card().display_name;
+    let mut recorded = Vec::new();
+    for kind in [migration_type::NEW_REQUEST, migration_type::ONGOING_REQUEST] {
+        for outcome in [
+            migration_outcome::SUCCESS,
+            migration_outcome::FAILURE,
+            migration_outcome::CANCELLED,
+        ] {
+            let count = metrics.get_migration_duration_sample_count(&model, kind, outcome);
+            if count > 0 {
+                recorded.push(format!("{kind}/{outcome} x{count}"));
+            }
+        }
+    }
+    recorded
+}
+
+/// The migration outcomes a request on `turns` records through pipeline C with
+/// `migration_limit`, read after the caller has read the whole stream and dropped it and the
+/// pipeline.
+async fn outcomes_on_c(
+    local_pipeline: LocalPipeline,
+    turns: Vec<Turn>,
+    migration_limit: u32,
+) -> Vec<String> {
+    let (worker, _) = Worker::new(turns);
+    let metrics = Arc::new(Metrics::new());
+    let pipeline =
+        pipeline_c_with_metrics(local_pipeline, worker, migration_limit, metrics.clone());
+    let stream = pipeline.generate(preprocessed()).await.unwrap();
+    rest(stream).await;
+    drop(pipeline);
+    migration_outcomes(&metrics)
+}
+
+/// A migration that finishes, at dispatch or mid-stream, records one `success` and nothing
+/// else, on both local pipelines: dropping the finished stream records no second outcome.
+#[tokio::test]
+async fn a_finished_migration_records_one_success_on_both_local_pipelines() {
+    let mut outcomes = Vec::new();
+    for local_pipeline in BOTH {
+        outcomes.push(
+            outcomes_on_c(
+                local_pipeline,
+                vec![
+                    Turn::Unavailable,
+                    Turn::Stream(vec![last_token(450)], Then::End),
+                ],
+                3,
+            )
+            .await,
+        );
+        outcomes.push(
+            outcomes_on_c(
+                local_pipeline,
+                vec![
+                    Turn::Stream(vec![token(450), went_away()], Then::End),
+                    Turn::Stream(vec![last_token(4996)], Then::End),
+                ],
+                3,
+            )
+            .await,
+        );
+    }
+    let new_request = vec!["new_request/success x1".to_string()];
+    let ongoing = vec!["ongoing_request/success x1".to_string()];
+    assert_eq!(
+        outcomes,
+        [new_request.clone(), ongoing.clone(), new_request, ongoing]
+    );
+}
+
+/// A migration that runs out of attempts records one `failure` and nothing else, on both
+/// local pipelines: the caller receives the error, and dropping the stream records no second
+/// outcome.
+#[tokio::test]
+async fn a_failed_migration_records_one_failure_on_both_local_pipelines() {
+    let mut outcomes = Vec::new();
+    for local_pipeline in BOTH {
+        outcomes.push(
+            outcomes_on_c(
+                local_pipeline,
+                vec![
+                    Turn::Stream(vec![token(450), went_away()], Then::End),
+                    Turn::Unavailable,
+                ],
+                1,
+            )
+            .await,
+        );
+    }
+    let failure = vec!["ongoing_request/failure x1".to_string()];
+    assert_eq!(outcomes, [failure.clone(), failure]);
+}
+
+/// A retry whose dispatch panics unwinds a live request, with no stop or kill: Migration
+/// records no outcome for it, on both local pipelines.
+#[tokio::test]
+async fn a_retry_dispatch_panic_is_not_a_request_cancellation_on_either_local_pipeline() {
+    struct PanicOnRetry {
+        eager_failure: bool,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AsyncEngine<SingleIn<PreprocessedRequest>, Out, Error> for PanicOnRetry {
+        async fn generate(&self, request: SingleIn<PreprocessedRequest>) -> Result<Out, Error> {
+            if self.calls.fetch_add(1, Ordering::AcqRel) > 0 {
+                panic!("injected retry dispatch panic");
+            }
+            if self.eager_failure {
+                Err(worker_unavailable())
+            } else {
+                Ok(ResponseStream::new(
+                    Box::pin(stream::iter(vec![went_away()])),
+                    request.context(),
+                ))
+            }
+        }
+    }
+
+    let mut outcomes = Vec::new();
+    for local_pipeline in BOTH {
+        for eager_failure in [true, false] {
+            let engine = Arc::new(PanicOnRetry {
+                eager_failure,
+                calls: AtomicUsize::new(0),
+            });
+            let metrics = Arc::new(Metrics::new());
+            let pipeline =
+                pipeline_c_with_metrics(local_pipeline, engine.clone(), 3, metrics.clone());
+            let request = preprocessed();
+            let context = request.context();
+            let task = tokio::spawn(async move {
+                let stream = pipeline.generate(request).await.unwrap();
+                rest(stream).await;
+            });
+            let panic = task.await.expect_err("the retry must panic");
+            assert!(panic.is_panic());
+            let payload = panic.into_panic();
+            assert_eq!(
+                payload.downcast_ref::<&str>(),
+                Some(&"injected retry dispatch panic")
+            );
+            assert_eq!(engine.calls.load(Ordering::Acquire), 2);
+            assert!(!context.is_stopped());
+            assert!(!context.is_killed());
+            outcomes.push(migration_outcomes(&metrics));
+        }
+    }
+    assert_eq!(outcomes, vec![Vec::<String>::new(); 4]);
+}
+
+async fn migration_outcome_after_http_stream_drop(
+    local_pipeline: LocalPipeline,
+    kill_first: bool,
+) -> Vec<String> {
+    use dynamo_llm::http::service::disconnect::{
+        create_connection_monitor, monitor_for_disconnects,
+    };
+    use dynamo_llm::http::service::metrics::{CancellationLabels, Endpoint};
+
+    let (worker, mut arrivals) = Worker::new(vec![
+        Turn::Stream(vec![token(450), went_away()], Then::End),
+        Turn::HangUntilKilled,
+    ]);
+    let metrics = Arc::new(Metrics::new());
+    let pipeline = pipeline_c_with_metrics(local_pipeline, worker.clone(), 3, metrics.clone());
+    let request = preprocessed();
+    let context = request.context();
+    let response = pipeline.generate(request).await.unwrap();
+    let (mut connection_handle, stream_handle) = create_connection_monitor(
+        context.clone(),
+        Some(metrics.clone()),
+        CancellationLabels {
+            model: card().display_name.clone(),
+            endpoint: Endpoint::Generate.to_string(),
+            request_type: "stream".to_string(),
+        },
+    )
+    .await;
+    let inflight = metrics.clone().create_inflight_guard(
+        &card().display_name,
+        Endpoint::Generate,
+        true,
+        context.id(),
+    );
+    let monitored = monitor_for_disconnects(
+        response.map(|_| Ok(Default::default())),
+        context.clone(),
+        inflight,
+        stream_handle,
+    );
+    connection_handle.disarm();
+    drop(connection_handle);
+    let reader = tokio::spawn(async move { monitored.collect::<Vec<_>>().await });
+    for index in 0..2 {
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), arrivals.recv())
+                .await
+                .expect("the retry reaches its dispatch"),
+            Some(index),
+        );
+    }
+    assert!(!context.is_stopped());
+    assert!(!context.is_killed());
+    assert!(migration_outcomes(&metrics).is_empty());
+    if kill_first {
+        context.kill();
+    }
+    // Dropping the HTTP body drops its source and signals the disconnect monitor.
+    reader.abort();
+    let cancelled = tokio::time::timeout(Duration::from_secs(5), reader)
+        .await
+        .expect("the dropped HTTP body releases its source")
+        .expect_err("the body reader was aborted");
+    assert!(cancelled.is_cancelled());
+    tokio::time::timeout(Duration::from_secs(5), context.killed())
+        .await
+        .expect("the HTTP disconnect monitor kills the request");
+    assert_eq!(worker.calls(), 2);
+    assert_eq!(metrics.get_client_disconnect_count(), 1);
+    migration_outcomes(&metrics)
+}
+
+/// A kill delivered before the HTTP body drops records one cancelled migration.
+#[tokio::test]
+async fn a_kill_before_http_stream_drop_records_one_cancelled_migration() {
+    for local_pipeline in BOTH {
+        assert_eq!(
+            migration_outcome_after_http_stream_drop(local_pipeline, true).await,
+            ["ongoing_request/cancelled x1"],
+            "{}",
+            local_pipeline.as_str(),
+        );
+    }
+}
+
+/// An HTTP body dropped during a retry records one cancellation after its monitor kills the request.
+#[tokio::test]
+async fn an_http_stream_drop_during_a_retry_records_one_cancelled_migration() {
+    let mut outcomes = Vec::new();
+    for local_pipeline in BOTH {
+        outcomes.push(migration_outcome_after_http_stream_drop(local_pipeline, false).await);
+    }
+    assert_eq!(outcomes, vec![vec!["ongoing_request/cancelled x1"]; 2]);
 }
 
 /// A slow client: the caller reads a few items of an endless ready stream and then stops
