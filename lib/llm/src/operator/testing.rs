@@ -10,10 +10,11 @@ use std::sync::Arc;
 
 use dynamo_gdl_adapters::{Boxed, Carried, EngineSink, PipelineEngine};
 use dynamo_runtime::engine::{AsyncEngine, Data};
+use dynamo_runtime::error::DynamoError;
 use dynamo_runtime::pipeline::{Error, ManyOut, SingleIn};
 use dynamo_runtime::protocols::annotated::Annotated;
 
-use super::GdlOperator;
+use super::{GdlDownstream, GdlOperator};
 use crate::backend::Backend;
 use crate::preprocessor::{OpenAIPreprocessor, PreprocessedEmbeddingRequest, PreprocessorNode};
 use crate::protocols::common::llm_backend::{
@@ -30,6 +31,9 @@ pub(crate) type EngineStage<Req, T, R = Boxed<Req>> =
 
 /// A hop to a test's engine.
 pub(crate) type SinkHop<Req, T, R = Boxed<Req>> = gdl::Hop<(), EngineStage<Req, T, R>, ()>;
+
+/// The downstream a native operator's body gets on gdl, over a test's engine.
+pub(crate) type EngineDownstream<Req, T> = GdlDownstream<SinkHop<Req, T>, Boxed<Req>, Req>;
 
 /// `engine` as the inner end of a gdl hop, taking requests in the carrier `R`.
 pub(crate) fn sink_stage<Req: Data, T: Data, R: Carried<Req>>(
@@ -71,6 +75,40 @@ where
 {
     let (forward, backward) = gdl::around(Arc::new(GdlOperator::new(op)));
     gdl::Hop::new((forward, ()), inner, (backward, ()))
+}
+
+/// A gdl pipeline of boxed requests as a Dynamo engine, rooted as the frontend roots the
+/// routed pipelines that hold Migration and the routers: a kill of the request cancels its
+/// `Cx`.
+pub(crate) fn engine<N, Req, T>(next: N) -> Arc<DynEngine<Req, T>>
+where
+    N: gdl::Next<Boxed<Req>, Annotated<T>>,
+    Req: Data,
+    T: Data,
+{
+    Arc::new(PipelineEngine::<_, Req, T, Boxed<Req>>::new(next))
+}
+
+/// `op`, keyed by `K`, over `next`, as the frontend composes Migration and the routers: a native
+/// gdl operator over the hop to `next`, rooted as [`engine`] roots it.
+pub(crate) fn operator<O, K, Req, T, DT>(
+    op: Arc<O>,
+    next: Arc<DynEngine<Req, DT>>,
+) -> Arc<DynEngine<Req, T>>
+where
+    GdlOperator<O, K>: gdl::Operator<
+            UpReq = Boxed<Req>,
+            UpItem = Annotated<T>,
+            DownReq = Boxed<Req>,
+            DownItem = Annotated<DT>,
+        >,
+    O: Send + Sync + 'static,
+    K: 'static,
+    Req: Data,
+    T: Data,
+    DT: Data,
+{
+    engine(native::<_, K, _>(op, sink(next)))
 }
 
 /// A gdl pipeline of requests in the carrier `R` as a Dynamo engine, rooted as the frontend
@@ -138,4 +176,24 @@ pub(crate) fn embeddings_preprocessor(
             sink::<_, _, SingleIn<PreprocessedEmbeddingRequest>>(next),
         ),
     )
+}
+
+/// The downstream a native operator's body gets on gdl under `cx`, over `engine`. A test
+/// derives `cx` from the request's context as the frontend's routed pipelines do
+/// (`CxBridge::cx`: a stop stops it and a kill cancels it).
+pub(crate) fn downstream<Req: Data, T: Data>(
+    cx: gdl::Cx,
+    engine: Arc<DynEngine<Req, T>>,
+) -> EngineDownstream<Req, T> {
+    GdlDownstream::new(cx, sink(engine))
+}
+
+/// The `DynamoError` an operator body's eager error on gdl stands for. The body sees a stage's
+/// error as an `anyhow::Error` holding the `gdl::Error` that carries it; the frontend's
+/// `PipelineEngine` takes it out again on the way up. A test of the body alone finds it on the
+/// error's chain, which goes on through the `anyhow::Error` that entered gdl.
+pub(crate) fn dynamo_error(error: &anyhow::Error) -> Option<&DynamoError> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<DynamoError>())
 }
