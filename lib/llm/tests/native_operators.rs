@@ -1,13 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Dynamo's operators as native gdl operators (`GdlOperator`) against the same operators as
-//! Dynamo operators, over the same scripted terminal engine: Backend, the preprocessor,
-//! Migration, and the encoder and prefill routers.
+//! Dynamo's operators as native gdl operators (`GdlOperator`), over a scripted terminal engine:
+//! Backend, the preprocessor, Migration, and the encoder and prefill routers.
 //!
-//! Each test runs one request both ways and compares what comes out: the items, an eager
-//! error and what it downcasts to, and what the terminal saw. The gdl side is composed as
-//! the frontend composes it: `PipelineEngine` above, native stages (Backend and the chat and
+//! Each test runs one request and checks what comes out: the items, an eager error and what it
+//! downcasts to, and what the terminal saw. Where a test once compared the gdl pipeline with
+//! Dynamo's `link` chain, it compares the gdl pipeline with what that chain gave for the same
+//! request, recorded in `tests/data/native-operators.json`. The pipeline is composed as the
+//! frontend composes it: `PipelineEngine` above, native stages (Backend and the chat and
 //! completions preprocessors as around nodes of the hop below them), `EngineSink` below.
 
 use std::collections::BTreeMap;
@@ -48,8 +49,7 @@ use dynamo_renderer::PromptFormatter;
 use dynamo_runtime::engine::{AsyncEngine, AsyncEngineContext, Data, ResponseStream};
 use dynamo_runtime::error::{DynamoError, ErrorClass};
 use dynamo_runtime::pipeline::{
-    AsyncEngineContextProvider, Context, Error, ManyOut, Operator, RouterMode, SingleIn,
-    async_trait,
+    AsyncEngineContextProvider, Context, Error, ManyOut, RouterMode, SingleIn, async_trait,
 };
 use dynamo_runtime::protocols::annotated::Annotated;
 use dynamo_runtime::protocols::maybe_error::MaybeError;
@@ -60,41 +60,6 @@ use serde::Serialize;
 const MODEL_PATH: &str = "tests/data/sample-models/TinyLlama_v1.1";
 
 type Engine<Req, T> = Arc<DynEngine<Req, T>>;
-
-/// A Dynamo operator over `next`, as a Dynamo engine: the call a `link` chain makes.
-///
-/// Transition: remove when the gdl pipeline is the only local pipeline.
-struct Linked<O, DReq: Data, DT: Data> {
-    op: Arc<O>,
-    next: Engine<DReq, DT>,
-}
-
-#[async_trait]
-impl<O, Req, T, DReq, DT> AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, Error>
-    for Linked<O, DReq, DT>
-where
-    O: Operator<SingleIn<Req>, ManyOut<Annotated<T>>, SingleIn<DReq>, ManyOut<Annotated<DT>>>,
-    Req: Data,
-    T: Data,
-    DReq: Data,
-    DT: Data,
-{
-    async fn generate(&self, request: SingleIn<Req>) -> Result<ManyOut<Annotated<T>>, Error> {
-        self.op.generate(request, self.next.clone()).await
-    }
-}
-
-/// Transition: remove when the gdl pipeline is the only local pipeline.
-fn linked<O, Req, T, DReq, DT>(op: Arc<O>, next: Engine<DReq, DT>) -> Engine<Req, T>
-where
-    O: Operator<SingleIn<Req>, ManyOut<Annotated<T>>, SingleIn<DReq>, ManyOut<Annotated<DT>>>,
-    Req: Data,
-    T: Data,
-    DReq: Data,
-    DT: Data,
-{
-    Arc::new(Linked { op, next })
-}
 
 type DynEngine<Req, T> = dyn AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, Error>;
 type SinkHop<Req, T, R> = Hop<(), SinkStage<EngineSink<DynEngine<Req, T>, Req, T, R>>, ()>;
@@ -386,34 +351,30 @@ async fn collect<T: Data>(stream: ManyOut<Annotated<T>>) -> Vec<Annotated<T>> {
         .expect("the stream ends")
 }
 
-/// Runs `make()` both ways and returns the dynamo and gdl results.
-///
-/// Transition: remove the Dynamo case and keep the gdl assertions when the gdl pipeline is the only
-/// local pipeline.
-async fn both<Req: Data, T: Data>(
-    dynamo: Engine<Req, T>,
-    gdl: Engine<Req, T>,
-    make: impl Fn() -> SingleIn<Req>,
-) -> [Result<Vec<Annotated<T>>, Error>; 2] {
-    let mut out = Vec::new();
-    for engine in [dynamo, gdl] {
-        out.push(match engine.generate(make()).await {
-            Ok(stream) => Ok(collect(stream).await),
-            Err(error) => Err(error),
-        });
+/// Runs one request through `engine` and returns its items or its eager error.
+async fn run<Req: Data, T: Data>(
+    engine: &Engine<Req, T>,
+    request: SingleIn<Req>,
+) -> Result<Vec<Annotated<T>>, Error> {
+    match engine.generate(request).await {
+        Ok(stream) => Ok(collect(stream).await),
+        Err(error) => Err(error),
     }
-    out.try_into().unwrap_or_else(|_| unreachable!())
 }
 
-fn backend_both(
-    fixture: &Fixture,
-    terminal: Arc<Script>,
-) -> [Engine<PreprocessedRequest, BackendOutput>; 2] {
-    let backend = fixture.backend();
-    [
-        linked(backend.clone(), terminal.clone()),
-        backend_gdl(backend, terminal),
-    ]
+/// What Dynamo's `link` chain gave for the request of `test` named `label`, recorded with these
+/// tests when both local pipelines still ran them side by side: the normalized items
+/// (`items ...`), or the `Debug` form of what a test compared (`debug`).
+fn recorded(test: &str, label: &str) -> serde_json::Value {
+    static RECORDED: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    let recorded = RECORDED
+        .get_or_init(|| serde_json::from_str(include_str!("data/native-operators.json")).unwrap());
+    recorded[test][label].clone()
+}
+
+/// [`recorded`] for a value compared in its `Debug` form.
+fn recorded_debug(test: &str) -> String {
+    recorded(test, "debug").as_str().unwrap().to_string()
 }
 
 /// `backend` over `terminal` on the gdl path, as the frontend composes it.
@@ -431,32 +392,30 @@ fn backend_gdl(
 async fn backend_detokenizes_the_same_both_ways() {
     let fixture = Fixture::load();
     let reply = fixture.tokens("The fox crossed the river at dawn.");
-    let terminals = [
-        Script::new(Reply::Items(reply.clone())),
-        Script::new(Reply::Items(reply)),
-    ];
-    let [dynamo, _] = backend_both(&fixture, terminals[0].clone());
-    let [_, gdl] = backend_both(&fixture, terminals[1].clone());
-    let [d, g] = both(dynamo, gdl, || request(preprocessed(&fixture, false))).await;
-    let (d, g) = (d.unwrap(), g.unwrap());
+    let terminal = Script::new(Reply::Items(reply));
+    let gdl = backend_gdl(fixture.backend(), terminal.clone());
+    let g = run(&gdl, request(preprocessed(&fixture, false)))
+        .await
+        .unwrap();
     let text: String = g
         .iter()
         .filter_map(|i| i.data.as_ref()?.text.clone())
         .collect();
     assert!(text.contains("fox crossed"), "{text:?}");
-    assert_eq!(normalized(&d), normalized(&g));
+    assert_eq!(
+        serde_json::to_value(normalized(&g)).unwrap(),
+        recorded("backend_detokenizes_the_same_both_ways", "items")
+    );
 
     // The request reaches the terminal as it was sent: id, metadata and content.
-    for terminal in &terminals {
-        let calls = terminal.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].id, "req-1");
-        assert_eq!(calls[0].tenant.as_deref(), Some("a"));
-        assert_eq!(
-            calls[0].request.token_ids,
-            preprocessed(&fixture, false).token_ids
-        );
-    }
+    let calls = terminal.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].id, "req-1");
+    assert_eq!(calls[0].tenant.as_deref(), Some("a"));
+    assert_eq!(
+        calls[0].request.token_ids,
+        preprocessed(&fixture, false).token_ids
+    );
 }
 
 #[tokio::test]
@@ -476,60 +435,39 @@ async fn backend_passes_an_error_item_on_the_same_both_ways() {
             .message("worker went away")
             .build(),
     ));
-    let [dynamo, gdl] = backend_both(&fixture, Script::new(Reply::Items(reply)));
-    let [d, g] = both(dynamo, gdl, || request(preprocessed(&fixture, false))).await;
-    let (d, g) = (d.unwrap(), g.unwrap());
+    let gdl = backend_gdl(fixture.backend(), Script::new(Reply::Items(reply)));
+    let g = run(&gdl, request(preprocessed(&fixture, false)))
+        .await
+        .unwrap();
     assert!(g.last().unwrap().is_error(), "{g:?}");
-    assert_eq!(normalized(&d), normalized(&g));
+    assert_eq!(
+        serde_json::to_value(normalized(&g)).unwrap(),
+        recorded(
+            "backend_passes_an_error_item_on_the_same_both_ways",
+            "items"
+        )
+    );
 }
 
 #[tokio::test]
 async fn backend_returns_the_terminals_eager_error_both_ways() {
     let fixture = Fixture::load();
-    let [dynamo, gdl] = backend_both(&fixture, Script::new(Reply::Fail(worker_unavailable)));
-    let results = both(dynamo, gdl, || request(preprocessed(&fixture, false))).await;
-    let [d, g] = results.map(|result| {
+    let gdl = backend_gdl(
+        fixture.backend(),
+        Script::new(Reply::Fail(worker_unavailable)),
+    );
+    let result = run(&gdl, request(preprocessed(&fixture, false))).await;
+    let g = {
         let error = result.expect_err("an eager error");
         // What Migration reads to decide on a retry.
         let found = error.downcast_ref::<DynamoError>().cloned();
         (found.map(|e| e.class()), error.to_string())
-    });
-    assert!(d.0.is_some(), "{d:?}");
-    assert_eq!(d, g);
-}
-
-/// A Backend that cannot decode (no tokenizer) on the Dynamo path: it sends the request on
-/// first and checks after, so an eager error from below wins, and with none the terminal is
-/// called before the decoder's error.
-///
-/// Transition: remove when the Dynamo path checks before it sends the request on.
-#[tokio::test]
-async fn a_backend_that_cannot_decode_checks_after_dispatch_on_dynamo() {
-    let fixture = Fixture::load();
-    let blank = Backend::from_mdc(&ModelDeploymentCard::with_name_only("blank"));
-
-    let failing = Script::new(Reply::Fail(worker_unavailable));
-    let engine = linked::<_, _, BackendOutput, _, _>(blank.clone(), failing.clone());
-    let error = engine
-        .generate(request(preprocessed(&fixture, false)))
-        .await
-        .expect_err("an eager error");
-    assert!(
-        error
-            .to_string()
-            .contains("prefill routing is still activating"),
-        "the terminal's error wins: {error:#}"
+    };
+    assert!(g.0.is_some(), "{g:?}");
+    assert_eq!(
+        format!("{g:?}"),
+        recorded_debug("backend_returns_the_terminals_eager_error_both_ways")
     );
-    assert_eq!(failing.calls(), 1);
-
-    let answering = Script::new(Reply::Items(fixture.tokens("fox")));
-    let engine = linked::<_, _, BackendOutput, _, _>(blank, answering.clone());
-    let error = engine
-        .generate(request(preprocessed(&fixture, false)))
-        .await
-        .expect_err("the decoder's error");
-    assert!(error.to_string().contains("no tokenizer"), "{error:#}");
-    assert_eq!(answering.calls(), 1, "the terminal was called first");
 }
 
 /// A Backend that cannot decode (no tokenizer) on the gdl path fails before it sends the
@@ -560,22 +498,23 @@ async fn backend_stops_the_terminal_on_a_text_only_output_both_ways() {
     output.text = Some("fox".to_string());
     output.finish_reason = None;
     let reply = vec![Annotated::from_data(output)];
-    let terminals = [
-        Script::new(Reply::ItemsThenHold(reply.clone())),
-        Script::new(Reply::ItemsThenHold(reply)),
-    ];
-    let [dynamo, _] = backend_both(&fixture, terminals[0].clone());
-    let [_, gdl] = backend_both(&fixture, terminals[1].clone());
-    let [d, g] = both(dynamo, gdl, || request(preprocessed(&fixture, true))).await;
-    let (d, g) = (d.unwrap(), g.unwrap());
+    let terminal = Script::new(Reply::ItemsThenHold(reply));
+    let gdl = backend_gdl(fixture.backend(), terminal.clone());
+    let g = run(&gdl, request(preprocessed(&fixture, true)))
+        .await
+        .unwrap();
     assert_eq!(g.len(), 1, "{g:?}");
     assert!(g[0].is_error(), "{g:?}");
-    assert_eq!(normalized(&d), normalized(&g));
-    for terminal in &terminals {
-        let calls = terminal.calls.lock().unwrap();
-        assert!(calls[0].context.is_stopped());
-        assert!(!calls[0].context.is_killed());
-    }
+    assert_eq!(
+        serde_json::to_value(normalized(&g)).unwrap(),
+        recorded(
+            "backend_stops_the_terminal_on_a_text_only_output_both_ways",
+            "items"
+        )
+    );
+    let calls = terminal.calls.lock().unwrap();
+    assert!(calls[0].context.is_stopped());
+    assert!(!calls[0].context.is_killed());
 }
 
 /// A kill of the caller's context mid-stream reaches the terminal and ends the stream.
@@ -590,25 +529,20 @@ async fn a_kill_mid_stream_reaches_the_terminal_both_ways() {
         .as_mut()
         .unwrap()
         .finish_reason = None;
-    for (way, at) in [("dynamo", 0), ("gdl", 1)] {
-        let terminal = Script::new(Reply::ItemsThenHold(reply.clone()));
-        let engine = backend_both(&fixture, terminal.clone())[at].clone();
-        let request = request(preprocessed(&fixture, false));
-        let context = request.context();
-        let mut stream = engine.generate(request).await.unwrap();
-        let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await
-            .expect("the first item arrives")
-            .unwrap();
-        assert!(!first.is_error(), "{way}: {first:?}");
-        context.kill();
-        assert!(
-            terminal.calls.lock().unwrap()[0].context.is_killed(),
-            "{way}"
-        );
-        let rest = collect(stream).await;
-        assert!(rest.iter().all(|item| !item.is_error()), "{way}: {rest:?}");
-    }
+    let terminal = Script::new(Reply::ItemsThenHold(reply));
+    let engine = backend_gdl(fixture.backend(), terminal.clone());
+    let request = request(preprocessed(&fixture, false));
+    let context = request.context();
+    let mut stream = engine.generate(request).await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("the first item arrives")
+        .unwrap();
+    assert!(!first.is_error(), "{first:?}");
+    context.kill();
+    assert!(terminal.calls.lock().unwrap()[0].context.is_killed());
+    let rest = collect(stream).await;
+    assert!(rest.iter().all(|item| !item.is_error()), "{rest:?}");
 }
 
 /// A kill mid-stream through chat over Backend reaches the terminal and ends the stream. On
@@ -625,44 +559,31 @@ async fn a_kill_mid_stream_through_chat_reaches_the_terminal_both_ways() {
         .as_mut()
         .unwrap()
         .finish_reason = None;
-    for (way, at) in [("dynamo", 0), ("gdl", 1)] {
-        let terminal = Script::new(Reply::ItemsThenHold(reply.clone()));
-        let engine = chat_both(&fixture, terminal.clone())[at].clone();
-        let request = request(chat(serde_json::json!({})));
-        let context = request.context();
-        let mut stream = engine.generate(request).await.unwrap();
-        let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await
-            .expect("the first item arrives")
-            .unwrap();
-        assert!(!first.is_error(), "{way}: {first:?}");
-        context.kill();
-        assert!(
-            terminal.calls.lock().unwrap()[0].context.is_killed(),
-            "{way}"
-        );
-        let rest = tokio::time::timeout(Duration::from_secs(5), collect(stream))
-            .await
-            .unwrap_or_else(|_| panic!("{way}: the stream did not end"));
-        assert!(rest.iter().all(|item| !item.is_error()), "{way}: {rest:?}");
-    }
+    let terminal = Script::new(Reply::ItemsThenHold(reply));
+    let engine = chat_gdl(&fixture, terminal.clone());
+    let request = request(chat(serde_json::json!({})));
+    let context = request.context();
+    let mut stream = engine.generate(request).await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("the first item arrives")
+        .unwrap();
+    assert!(!first.is_error(), "{first:?}");
+    context.kill();
+    assert!(terminal.calls.lock().unwrap()[0].context.is_killed());
+    let rest = tokio::time::timeout(Duration::from_secs(5), collect(stream))
+        .await
+        .unwrap_or_else(|_| panic!("the stream did not end"));
+    assert!(rest.iter().all(|item| !item.is_error()), "{rest:?}");
 }
 
-fn chat_both(
+/// The chat preprocessor and Backend over `terminal` on the gdl path.
+fn chat_gdl(
     fixture: &Fixture,
     terminal: Arc<Script>,
-) -> [Engine<NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse>; 2] {
-    let (preprocessor, backend) = (fixture.chat_preprocessor(), fixture.backend());
-    let terminal: Engine<_, _> = terminal;
-    [
-        linked(
-            preprocessor.clone(),
-            linked::<_, _, BackendOutput, _, _>(backend.clone(), terminal.clone()),
-        ),
-        preprocessor_gdl(preprocessor, backend, terminal),
-    ]
+) -> Engine<NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse> {
+    preprocessor_gdl(fixture.chat_preprocessor(), fixture.backend(), terminal)
 }
-
 /// The preprocessor and `backend` over `terminal` on the gdl path, as the frontend composes
 /// pipeline A: one hop to the terminal, with both as its around nodes, and the speculative
 /// prefill sent to Backend's own hop.
@@ -721,75 +642,81 @@ fn chat_text(items: &[Annotated<NvCreateChatCompletionStreamResponse>]) -> (Stri
 async fn chat_is_the_same_both_ways() {
     let fixture = Fixture::load();
     let reply = fixture.tokens("The fox crossed the river at dawn.");
-    let terminals = [
-        Script::new(Reply::Items(reply.clone())),
-        Script::new(Reply::Items(reply)),
-    ];
-    let [dynamo, _] = chat_both(&fixture, terminals[0].clone());
-    let [_, gdl] = chat_both(&fixture, terminals[1].clone());
+    let terminal = Script::new(Reply::Items(reply));
+    let gdl = chat_gdl(&fixture, terminal.clone());
     for extra in [
         serde_json::json!({}),
         serde_json::json!({"stream_options": {"include_usage": true}}),
         serde_json::json!({"stream": false}),
     ] {
-        let [d, g] = both(dynamo.clone(), gdl.clone(), || request(chat(extra.clone()))).await;
-        let (d, g) = (d.unwrap(), g.unwrap());
+        let g = run(&gdl, request(chat(extra.clone()))).await.unwrap();
         let (text, finished) = chat_text(&g);
         assert!(text.contains("fox crossed") && finished, "{extra}: {g:?}");
-        assert_eq!(normalized(&d), normalized(&g), "{extra}");
+        assert_eq!(
+            serde_json::to_value(normalized(&g)).unwrap(),
+            recorded("chat_is_the_same_both_ways", &format!("items {extra}")),
+            "{extra}"
+        );
     }
-    let [d, g] = [&terminals[0], &terminals[1]].map(|t| {
-        let calls = t.calls.lock().unwrap();
+    let g = {
+        let calls = terminal.calls.lock().unwrap();
         calls
             .iter()
             .map(|c| (c.id.clone(), c.tenant.clone(), c.request.token_ids.clone()))
             .collect::<Vec<_>>()
-    });
-    assert_eq!(d.len(), 3);
-    assert_eq!(d, g);
+    };
+    assert_eq!(g.len(), 3);
+    assert_eq!(
+        format!("{g:?}"),
+        recorded_debug("chat_is_the_same_both_ways")
+    );
 }
 
 #[tokio::test]
 async fn chat_rejects_an_invalid_request_before_dispatch_both_ways() {
     let fixture = Fixture::load();
     let terminal = Script::new(Reply::Items(fixture.tokens("unused")));
-    let [dynamo, gdl] = chat_both(&fixture, terminal.clone());
-    let invalid = || {
-        request(chat(
-            serde_json::json!({"nvext": {"token_data": [4_000_000]}}),
-        ))
-    };
-    let [d, g] = both(dynamo, gdl, invalid).await.map(|result| {
-        let error = result.expect_err("an eager error");
+    let gdl = chat_gdl(&fixture, terminal.clone());
+    let invalid = request(chat(
+        serde_json::json!({"nvext": {"token_data": [4_000_000]}}),
+    ));
+    let g = {
+        let error = run(&gdl, invalid).await.expect_err("an eager error");
         let found = error
             .chain()
             .find_map(|e| e.downcast_ref::<DynamoError>())
             .map(|e| e.error_type());
         (found, format!("{error:#}"))
-    });
-    assert!(d.0.is_some(), "{d:?}");
-    assert_eq!(d, g);
+    };
+    assert!(g.0.is_some(), "{g:?}");
+    assert_eq!(
+        format!("{g:?}"),
+        recorded_debug("chat_rejects_an_invalid_request_before_dispatch_both_ways")
+    );
     assert_eq!(terminal.calls(), 0);
 }
 
-/// Tool definitions that do not validate fail the chat request before it is sent on, both ways,
-/// even against a terminal that would fail at once: the client sees the validation error.
+/// Tool definitions that do not validate fail the chat request before it is sent on, even
+/// against a terminal that would fail at once: the client sees the validation error.
 #[tokio::test]
 async fn invalid_tools_fail_before_an_eager_error_below_both_ways() {
     let fixture = Fixture::load();
     let terminal = Script::new(Reply::Fail(worker_unavailable));
-    let [dynamo, gdl] = chat_both(&fixture, terminal.clone());
-    let invalid = || request(chat(serde_json::json!({"tools": []})));
-    let [d, g] = both(dynamo, gdl, invalid).await.map(|result| {
-        let error = result.expect_err("an eager error");
+    let gdl = chat_gdl(&fixture, terminal.clone());
+    let invalid = request(chat(serde_json::json!({"tools": []})));
+    let g = {
+        let error = run(&gdl, invalid).await.expect_err("an eager error");
         let found = error
             .chain()
             .find_map(|e| e.downcast_ref::<DynamoError>())
             .map(|e| e.error_type());
         (found, format!("{error:#}"))
-    });
-    assert!(d.1.contains("tools array cannot be empty"), "{d:?}");
-    assert_eq!(d, g);
+    };
+    assert!(g.1.contains("tools array cannot be empty"), "{g:?}");
+    assert_eq!(
+        format!("{g:?}"),
+        recorded_debug("invalid_tools_fail_before_an_eager_error_below_both_ways")
+    );
     assert_eq!(terminal.calls(), 0);
 }
 
@@ -798,15 +725,15 @@ async fn invalid_tools_fail_before_an_eager_error_below_both_ways() {
 #[tokio::test]
 async fn the_terminals_http_error_crosses_both_native_stages() {
     let fixture = Fixture::load();
-    let [dynamo, gdl] = chat_both(&fixture, Script::new(Reply::Fail(forbidden)));
-    for result in both(dynamo, gdl, || request(chat(serde_json::json!({})))).await {
-        let error = result.expect_err("an eager error");
-        assert_eq!(
-            error.downcast_ref::<HttpError>().map(|e| e.code),
-            Some(403),
-            "{error:#}"
-        );
-    }
+    let gdl = chat_gdl(&fixture, Script::new(Reply::Fail(forbidden)));
+    let error = run(&gdl, request(chat(serde_json::json!({}))))
+        .await
+        .expect_err("an eager error");
+    assert_eq!(
+        error.downcast_ref::<HttpError>().map(|e| e.code),
+        Some(403),
+        "{error:#}"
+    );
 }
 
 /// The speculative prefill is sent after the turn's response ends, when the request's `Cx`
@@ -814,27 +741,21 @@ async fn the_terminals_http_error_crosses_both_native_stages() {
 #[tokio::test]
 async fn speculative_prefill_reaches_the_terminal_both_ways() {
     let fixture = Fixture::load();
-    for (way, at) in [("dynamo", 0), ("gdl", 1)] {
-        let terminal = Script::new(Reply::Items(fixture.tokens("The fox crossed the river.")));
-        let engine = chat_both(&fixture, terminal.clone())[at].clone();
-        let hint = serde_json::json!({"nvext": {"agent_hints": {"speculative_prefill": true}}});
-        let items = collect(engine.generate(request(chat(hint))).await.unwrap()).await;
-        assert!(chat_text(&items).1, "{way}: {items:?}");
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while terminal.calls() < 2 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("{way}: no speculative prefill"));
-        let calls = terminal.calls.lock().unwrap();
-        assert_eq!(calls[1].request.model, "speculative_prefill", "{way}");
-        assert_eq!(
-            calls[1].request.stop_conditions.max_tokens,
-            Some(1),
-            "{way}"
-        );
-    }
+    let terminal = Script::new(Reply::Items(fixture.tokens("The fox crossed the river.")));
+    let engine = chat_gdl(&fixture, terminal.clone());
+    let hint = serde_json::json!({"nvext": {"agent_hints": {"speculative_prefill": true}}});
+    let items = collect(engine.generate(request(chat(hint))).await.unwrap()).await;
+    assert!(chat_text(&items).1, "{items:?}");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while terminal.calls() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no speculative prefill"));
+    let calls = terminal.calls.lock().unwrap();
+    assert_eq!(calls[1].request.model, "speculative_prefill");
+    assert_eq!(calls[1].request.stop_conditions.max_tokens, Some(1));
 }
 
 /// A client disconnect before the turn finishes: no speculative prefill is sent. The prefill
@@ -846,23 +767,21 @@ async fn speculative_prefill_is_not_sent_after_a_disconnect_both_ways() {
     for item in &mut reply {
         item.data.as_mut().unwrap().finish_reason = None;
     }
-    for (way, at) in [("dynamo", 0), ("gdl", 1)] {
-        let terminal = Script::new(Reply::ItemsThenHold(reply.clone()));
-        let engine = chat_both(&fixture, terminal.clone())[at].clone();
-        let hint = serde_json::json!({"nvext": {"agent_hints": {"speculative_prefill": true}}});
-        let request = request(chat(hint));
-        let context = request.context();
-        let mut stream = engine.generate(request).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await
-            .expect("the first item arrives")
-            .unwrap();
-        // The disconnect: the HTTP handler kills the request and drops its stream.
-        context.kill();
-        drop(stream);
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(terminal.calls(), 1, "{way}: a speculative prefill was sent");
-    }
+    let terminal = Script::new(Reply::ItemsThenHold(reply));
+    let engine = chat_gdl(&fixture, terminal.clone());
+    let hint = serde_json::json!({"nvext": {"agent_hints": {"speculative_prefill": true}}});
+    let request = request(chat(hint));
+    let context = request.context();
+    let mut stream = engine.generate(request).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("the first item arrives")
+        .unwrap();
+    // The disconnect: the HTTP handler kills the request and drops its stream.
+    context.kill();
+    drop(stream);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(terminal.calls(), 1, "a speculative prefill was sent");
 }
 
 /// A stop string: Backend ends the response at the string and stops the worker's context,
@@ -874,28 +793,26 @@ async fn a_stop_string_stops_the_terminal_and_ends_the_stream_both_ways() {
     for item in &mut reply {
         item.data.as_mut().unwrap().finish_reason = None;
     }
-    let terminals = [
-        Script::new(Reply::ItemsThenStopped(reply.clone())),
-        Script::new(Reply::ItemsThenStopped(reply)),
-    ];
-    let [dynamo, _] = chat_both(&fixture, terminals[0].clone());
-    let [_, gdl] = chat_both(&fixture, terminals[1].clone());
-    let [d, g] = both(dynamo, gdl, || {
-        request(chat(serde_json::json!({"stop": ["river"]})))
-    })
-    .await;
-    let (d, g) = (d.unwrap(), g.unwrap());
+    let terminal = Script::new(Reply::ItemsThenStopped(reply));
+    let gdl = chat_gdl(&fixture, terminal.clone());
+    let g = run(&gdl, request(chat(serde_json::json!({"stop": ["river"]}))))
+        .await
+        .unwrap();
     let (text, finished) = chat_text(&g);
     assert!(
         text.contains("fox crossed") && !text.contains("river") && finished,
         "{text:?}: {g:?}"
     );
-    assert_eq!(normalized(&d), normalized(&g));
-    for terminal in &terminals {
-        let calls = terminal.calls.lock().unwrap();
-        assert!(calls[0].context.is_stopped());
-        assert!(!calls[0].context.is_killed());
-    }
+    assert_eq!(
+        serde_json::to_value(normalized(&g)).unwrap(),
+        recorded(
+            "a_stop_string_stops_the_terminal_and_ends_the_stream_both_ways",
+            "items"
+        )
+    );
+    let calls = terminal.calls.lock().unwrap();
+    assert!(calls[0].context.is_stopped());
+    assert!(!calls[0].context.is_killed());
 }
 
 #[tokio::test]
@@ -904,36 +821,36 @@ async fn completions_are_the_same_both_ways() {
     let (preprocessor, backend) = (fixture.completions_preprocessor(), fixture.backend());
     let reply = fixture.tokens(" crossed the river at dawn.");
     let terminal: Engine<_, _> = Script::new(Reply::Items(reply));
-    let dynamo: Engine<NvCreateCompletionRequest, NvCreateCompletionResponse> = linked(
-        preprocessor.clone(),
-        linked::<_, _, BackendOutput, _, _>(backend.clone(), terminal.clone()),
-    );
-    let gdl = preprocessor_gdl(preprocessor, backend, terminal);
+    let gdl: Engine<NvCreateCompletionRequest, NvCreateCompletionResponse> =
+        preprocessor_gdl(preprocessor, backend, terminal);
     for extra in [
         serde_json::json!({}),
         serde_json::json!({"echo": true}),
         serde_json::json!({"stream": false}),
     ] {
-        let make = || {
-            let mut body = serde_json::json!({
-                "model": "TinyLlama_v1.1",
-                "prompt": "The fox",
-                "max_tokens": 32,
-                "stream": true,
-            });
-            body.as_object_mut()
-                .unwrap()
-                .extend(extra.as_object().unwrap().clone());
-            request(serde_json::from_value::<NvCreateCompletionRequest>(body).unwrap())
-        };
-        let [d, g] = both(dynamo.clone(), gdl.clone(), make).await;
-        let (d, g) = (d.unwrap(), g.unwrap());
+        let mut body = serde_json::json!({
+            "model": "TinyLlama_v1.1",
+            "prompt": "The fox",
+            "max_tokens": 32,
+            "stream": true,
+        });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let make = request(serde_json::from_value::<NvCreateCompletionRequest>(body).unwrap());
+        let g = run(&gdl, make).await.unwrap();
         let text = serde_json::to_string(&normalized(&g)).unwrap();
         assert!(text.contains("crossed"), "{extra}: {text}");
-        assert_eq!(normalized(&d), normalized(&g), "{extra}");
+        assert_eq!(
+            serde_json::to_value(normalized(&g)).unwrap(),
+            recorded(
+                "completions_are_the_same_both_ways",
+                &format!("items {extra}")
+            ),
+            "{extra}"
+        );
     }
 }
-
 /// An embeddings worker that returns one vector per input.
 struct Embeddings;
 
@@ -966,42 +883,42 @@ impl
     }
 }
 
-/// Embeddings give the same response on Dynamo's chain, with Backend, and on gdl's, without
-/// it: Backend passes an embeddings response through unchanged.
+/// Embeddings on gdl's chain, without Backend, give the response Dynamo's chain gave with it:
+/// Backend passes an embeddings response through unchanged.
 #[tokio::test]
 async fn embeddings_are_the_same_both_ways() {
     let fixture = Fixture::load();
     let mut card = fixture.card.clone();
     card.model_type = ModelType::Embedding;
     let preprocessor = OpenAIPreprocessor::new_for_embeddings(card.clone()).unwrap();
-    let backend = Backend::from_mdc(&card);
     let terminal: Engine<PreprocessedEmbeddingRequest, EmbeddingsEngineOutput> =
         Arc::new(Embeddings);
-    let dynamo: Engine<NvCreateEmbeddingRequest, NvCreateEmbeddingResponse> = linked(
-        preprocessor.clone(),
-        linked::<_, _, EmbeddingsEngineOutput, _, _>(backend.clone(), terminal.clone()),
-    );
     // The gdl chain has no Backend, a pass-through for embeddings, as the frontend composes it.
-    let gdl = pipeline(native::<_, NvCreateEmbeddingRequest, _>(
-        preprocessor,
-        sink(terminal),
-    ));
+    let gdl: Engine<NvCreateEmbeddingRequest, NvCreateEmbeddingResponse> =
+        pipeline(native::<_, NvCreateEmbeddingRequest, _>(
+            preprocessor,
+            sink(terminal),
+        ));
     for format in [serde_json::json!("float"), serde_json::json!("base64")] {
-        let make = || {
-            request(
-                serde_json::from_value::<NvCreateEmbeddingRequest>(serde_json::json!({
-                    "model": "TinyLlama_v1.1",
-                    "input": ["A fox.", "A river."],
-                    "encoding_format": format,
-                }))
-                .unwrap(),
-            )
-        };
-        let [d, g] = both(dynamo.clone(), gdl.clone(), make).await;
-        let (d, g) = (d.unwrap(), g.unwrap());
+        let make = request(
+            serde_json::from_value::<NvCreateEmbeddingRequest>(serde_json::json!({
+                "model": "TinyLlama_v1.1",
+                "input": ["A fox.", "A river."],
+                "encoding_format": format,
+            }))
+            .unwrap(),
+        );
+        let g = run(&gdl, make).await.unwrap();
         assert_eq!(g.len(), 1, "{format}: {g:?}");
         assert!(!g[0].is_error(), "{format}: {g:?}");
-        assert_eq!(normalized(&d), normalized(&g), "{format}");
+        assert_eq!(
+            serde_json::to_value(normalized(&g)).unwrap(),
+            recorded(
+                "embeddings_are_the_same_both_ways",
+                &format!("items {format}")
+            ),
+            "{format}"
+        );
     }
 }
 
@@ -1014,21 +931,15 @@ fn migration(limit: u32) -> Arc<Migration> {
     )
 }
 
-/// Migration over `terminal`, on Dynamo's chain and as a native gdl operator.
-fn migration_both(
+/// Migration over `terminal` as a native gdl operator.
+fn migration_gdl(
     limit: u32,
-    terminals: [Arc<Script>; 2],
-) -> [Engine<PreprocessedRequest, LLMEngineOutput>; 2] {
-    let [dynamo, gdl] = terminals;
-    type Pre = PreprocessedRequest;
-    type Out = LLMEngineOutput;
-    [
-        linked::<_, Pre, Out, Pre, Out>(migration(limit), dynamo),
-        pipeline(native::<_, Out, _>(
-            migration(limit),
-            sink(gdl as Engine<_, _>),
-        )),
-    ]
+    terminal: Arc<Script>,
+) -> Engine<PreprocessedRequest, LLMEngineOutput> {
+    pipeline(native::<_, LLMEngineOutput, _>(
+        migration(limit),
+        sink(terminal as Engine<_, _>),
+    ))
 }
 
 fn with_session(mut request: SingleIn<PreprocessedRequest>) -> SingleIn<PreprocessedRequest> {
@@ -1072,29 +983,33 @@ fn attempts(terminal: &Script) -> Vec<Attempt> {
 #[tokio::test]
 async fn migration_retries_an_eager_worker_unavailable_the_same_both_ways() {
     let fixture = Fixture::load();
-    let replies = || {
-        Script::sequence(vec![
-            Reply::Fail(worker_unavailable),
-            Reply::Items(fixture.tokens("The fox")),
-        ])
-    };
-    let terminals = [replies(), replies()];
-    let [dynamo, gdl] = migration_both(3, terminals.clone());
-    let [d, g] = both(dynamo, gdl, || {
-        with_session(request(preprocessed(&fixture, false)))
-    })
-    .await;
-    let (d, g) = (d.unwrap(), g.unwrap());
+    let terminal = Script::sequence(vec![
+        Reply::Fail(worker_unavailable),
+        Reply::Items(fixture.tokens("The fox")),
+    ]);
+    let gdl = migration_gdl(3, terminal.clone());
+    let g = run(&gdl, with_session(request(preprocessed(&fixture, false))))
+        .await
+        .unwrap();
     assert!(!g.is_empty());
-    assert_eq!(normalized(&d), normalized(&g));
-    let [d, g] = terminals.map(|terminal| attempts(&terminal));
-    assert_eq!(d.len(), 2, "{d:?}");
-    assert_eq!(d[1].2.as_deref(), Some("session-123"));
-    assert_eq!(d, g);
+    assert_eq!(
+        serde_json::to_value(normalized(&g)).unwrap(),
+        recorded(
+            "migration_retries_an_eager_worker_unavailable_the_same_both_ways",
+            "items"
+        )
+    );
+    let g = attempts(&terminal);
+    assert_eq!(g.len(), 2, "{g:?}");
+    assert_eq!(g[1].2.as_deref(), Some("session-123"));
+    assert_eq!(
+        format!("{g:?}"),
+        recorded_debug("migration_retries_an_eager_worker_unavailable_the_same_both_ways")
+    );
 }
 
 /// A migratable error item mid-stream: Migration sends the delivered tokens again, with the
-/// rest of the token budget, on both paths.
+/// rest of the token budget.
 #[tokio::test]
 async fn migration_retries_a_stream_error_the_same_both_ways() {
     let fixture = Fixture::load();
@@ -1112,25 +1027,32 @@ async fn migration_retries_a_stream_error_the_same_both_ways() {
             .message("worker went away")
             .build(),
     ));
-    let replies = || {
-        Script::sequence(vec![
-            Reply::Items(first.clone()),
-            Reply::Items(fixture.tokens("crossed the river.")),
-        ])
-    };
-    let terminals = [replies(), replies()];
-    let [dynamo, gdl] = migration_both(3, terminals.clone());
-    let [d, g] = both(dynamo, gdl, || request(preprocessed(&fixture, false))).await;
-    let (d, g) = (d.unwrap(), g.unwrap());
+    let terminal = Script::sequence(vec![
+        Reply::Items(first),
+        Reply::Items(fixture.tokens("crossed the river.")),
+    ]);
+    let gdl = migration_gdl(3, terminal.clone());
+    let g = run(&gdl, request(preprocessed(&fixture, false)))
+        .await
+        .unwrap();
     assert!(g.iter().all(|item| !item.is_error()), "{g:?}");
-    assert_eq!(normalized(&d), normalized(&g));
-    let [d, g] = terminals.map(|terminal| attempts(&terminal));
-    assert_eq!(d.len(), 2, "{d:?}");
+    assert_eq!(
+        serde_json::to_value(normalized(&g)).unwrap(),
+        recorded(
+            "migration_retries_a_stream_error_the_same_both_ways",
+            "items"
+        )
+    );
+    let g = attempts(&terminal);
+    assert_eq!(g.len(), 2, "{g:?}");
     assert!(
-        d[1].3.len() > d[0].3.len(),
+        g[1].3.len() > g[0].3.len(),
         "the retry replays the delivered tokens"
     );
-    assert_eq!(d, g);
+    assert_eq!(
+        format!("{g:?}"),
+        recorded_debug("migration_retries_a_stream_error_the_same_both_ways")
+    );
 }
 
 /// An eager error Migration does not retry leaves the native operator as the error the
@@ -1139,59 +1061,43 @@ async fn migration_retries_a_stream_error_the_same_both_ways() {
 #[tokio::test]
 async fn migration_returns_an_eager_error_it_does_not_retry_as_itself_both_ways() {
     let fixture = Fixture::load();
-    let terminals = [
-        Script::new(Reply::Fail(forbidden)),
-        Script::new(Reply::Fail(forbidden)),
-    ];
-    let [dynamo, gdl] = migration_both(3, terminals.clone());
-    let results = both(dynamo, gdl, || request(preprocessed(&fixture, false))).await;
-    for result in results {
-        let error = result.expect_err("an eager error");
-        let status = error
-            .downcast::<HttpError>()
-            .expect("the terminal's HttpError");
-        assert_eq!(status.code, 403);
-    }
-    assert_eq!(terminals.map(|terminal| terminal.calls()), [1, 1]);
+    let terminal = Script::new(Reply::Fail(forbidden));
+    let gdl = migration_gdl(3, terminal.clone());
+    let error = run(&gdl, request(preprocessed(&fixture, false)))
+        .await
+        .expect_err("an eager error");
+    let status = error
+        .downcast::<HttpError>()
+        .expect("the terminal's HttpError");
+    assert_eq!(status.code, 403);
+    assert_eq!(terminal.calls(), 1);
 }
 
 /// With its retries spent, Migration returns the last attempt's error, still as itself.
 #[tokio::test]
 async fn migration_returns_the_last_eager_error_when_its_retries_run_out_both_ways() {
     let fixture = Fixture::load();
-    let terminals = [
-        Script::new(Reply::Fail(worker_unavailable)),
-        Script::new(Reply::Fail(worker_unavailable)),
-    ];
-    let [dynamo, gdl] = migration_both(1, terminals.clone());
-    let results = both(dynamo, gdl, || request(preprocessed(&fixture, false))).await;
-    for result in results {
-        let error = result.expect_err("an eager error");
-        let error = error
-            .downcast::<DynamoError>()
-            .expect("the terminal's DynamoError");
-        assert_eq!(error.reason().as_str(), "backend.worker_unavailable");
-    }
-    assert_eq!(terminals.map(|terminal| terminal.calls()), [2, 2]);
+    let terminal = Script::new(Reply::Fail(worker_unavailable));
+    let gdl = migration_gdl(1, terminal.clone());
+    let error = run(&gdl, request(preprocessed(&fixture, false)))
+        .await
+        .expect_err("an eager error");
+    let error = error
+        .downcast::<DynamoError>()
+        .expect("the terminal's DynamoError");
+    assert_eq!(error.reason().as_str(), "backend.worker_unavailable");
+    assert_eq!(terminal.calls(), 2);
 }
 
 /// The encoder router over the prefill router over `terminal`, both disabled as in
-/// aggregated serving, on Dynamo's chain and as native gdl operators.
-fn routers_both(terminals: [Arc<Script>; 2]) -> [Engine<PreprocessedRequest, LLMEngineOutput>; 2] {
-    let [dynamo, gdl] = terminals;
-    let prefill = || PrefillRouter::disabled(Arc::new(ModelManager::new()), RouterMode::KV, None);
+/// aggregated serving, as native gdl operators.
+fn routers_gdl(terminal: Arc<Script>) -> Engine<PreprocessedRequest, LLMEngineOutput> {
+    let prefill = PrefillRouter::disabled(Arc::new(ModelManager::new()), RouterMode::KV, None);
     type Pre = PreprocessedRequest;
-    type Out = LLMEngineOutput;
-    [
-        linked::<_, Pre, Out, Pre, Out>(
-            EncoderRouter::disabled(),
-            linked::<_, Pre, Out, Pre, Out>(prefill(), dynamo),
-        ),
-        pipeline(native::<_, Pre, _>(
-            EncoderRouter::disabled(),
-            native::<_, Pre, _>(prefill(), sink(gdl as Engine<_, _>)),
-        )),
-    ]
+    pipeline(native::<_, Pre, _>(
+        EncoderRouter::disabled(),
+        native::<_, Pre, _>(prefill, sink(terminal as Engine<_, _>)),
+    ))
 }
 
 #[tokio::test]
@@ -1207,33 +1113,33 @@ async fn the_routers_pass_a_request_through_the_same_both_ways() {
                 .build(),
         ),
     );
-    let terminals = [
-        Script::new(Reply::Items(reply.clone())),
-        Script::new(Reply::Items(reply)),
-    ];
-    let [dynamo, gdl] = routers_both(terminals.clone());
-    let [d, g] = both(dynamo, gdl, || {
-        with_session(request(preprocessed(&fixture, false)))
-    })
-    .await;
-    let (d, g) = (d.unwrap(), g.unwrap());
+    let terminal = Script::new(Reply::Items(reply));
+    let gdl = routers_gdl(terminal.clone());
+    let g = run(&gdl, with_session(request(preprocessed(&fixture, false))))
+        .await
+        .unwrap();
     assert!(g[1].is_error(), "{g:?}");
-    assert_eq!(normalized(&d), normalized(&g));
-    let [d, g] = terminals.map(|terminal| attempts(&terminal));
-    assert_eq!(d.len(), 1);
-    assert_eq!(d, g);
+    assert_eq!(
+        serde_json::to_value(normalized(&g)).unwrap(),
+        recorded(
+            "the_routers_pass_a_request_through_the_same_both_ways",
+            "items"
+        )
+    );
+    let g = attempts(&terminal);
+    assert_eq!(g.len(), 1);
+    assert_eq!(
+        format!("{g:?}"),
+        recorded_debug("the_routers_pass_a_request_through_the_same_both_ways")
+    );
 }
 
 #[tokio::test]
 async fn the_routers_return_the_terminals_eager_error_as_itself_both_ways() {
     let fixture = Fixture::load();
-    let [dynamo, gdl] = routers_both([
-        Script::new(Reply::Fail(forbidden)),
-        Script::new(Reply::Fail(forbidden)),
-    ]);
-    let results = both(dynamo, gdl, || request(preprocessed(&fixture, false))).await;
-    for result in results {
-        let error = result.expect_err("an eager error");
-        assert_eq!(error.downcast::<HttpError>().unwrap().code, 403);
-    }
+    let gdl = routers_gdl(Script::new(Reply::Fail(forbidden)));
+    let error = run(&gdl, request(preprocessed(&fixture, false)))
+        .await
+        .expect_err("an eager error");
+    assert_eq!(error.downcast::<HttpError>().unwrap().code, 403);
 }
