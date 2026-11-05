@@ -140,27 +140,27 @@ const BASELINE: &[Row] = &[
     row("a", 1, 346, 101270),
     row("a", 16, 859, 122758),
     // +2 for the boxed chat and preprocessed requests (see the module docs).
-    row("a-gdl", 1, 328, 65879),
-    row("a-gdl", 16, 841, 87367),
+    row("a-gdl", 1, 328, 65719),
+    row("a-gdl", 16, 841, 87207),
     // Transition: remove when the gdl pipeline is the only local pipeline.
     row("b", 1, 399, 224617),
     row("b", 16, 912, 246105),
     // +2 for the boxed chat and preprocessed requests (see the module docs).
-    row("b-gdl", 1, 343, 82682),
-    row("b-gdl", 16, 856, 104170),
+    row("b-gdl", 1, 343, 82522),
+    row("b-gdl", 16, 856, 104010),
     // Transition: remove when the gdl pipeline is the only local pipeline.
     row("c", 1, 71, 142051),
     row("c", 16, 86, 142111),
     // +1 for the boxed preprocessed request (see the module docs).
-    row("c-gdl", 1, 38, 28436),
-    row("c-gdl", 16, 53, 28496),
+    row("c-gdl", 1, 38, 28356),
+    row("c-gdl", 16, 53, 28416),
     row("embed-engine", 1, 8, 6548),
     row("embed-engine", 16, 23, 88868),
     // Transition: remove when the gdl pipeline is the only local pipeline.
     row("embed", 1, 199, 44438),
     row("embed", 16, 2283, 529886),
-    row("embeddings-gdl", 1, 177, 41727),
-    row("embeddings-gdl", 16, 2261, 527175),
+    row("embeddings-gdl", 1, 177, 41647),
+    row("embeddings-gdl", 16, 2261, 527095),
 ];
 
 #[global_allocator]
