@@ -572,9 +572,13 @@ where
 
 /// The drop guard of a migration in flight. On the gdl pipeline a kill drops the response in
 /// flight, and with it this manager inside [`RetryManager::new_stream`], before it records the
-/// migration's outcome or aborts the classifier lifecycle parked for the retry. Record both
-/// here, as `new_stream` does when it sees the cancel: otherwise no outcome is recorded and the
-/// lifecycle is dropped later with no cause.
+/// migration's outcome. Record it here as cancelled, as `new_stream` does when it sees the
+/// cancel.
+///
+/// The guard does not abort the classifier lifecycle parked for the retry. On gdl a remote
+/// prefill's route outlives the kill as a detached task, and its decode leg, which releases
+/// the staged KV, takes the parked lifecycle and finishes it. Aborting it here would make that
+/// leg start and classify a second one.
 impl<Resp, D> Drop for RetryManager<Resp, D>
 where
     Resp: Data + HasTokenIds,
@@ -588,7 +592,6 @@ where
             && (self.context.is_stopped() || self.context.is_killed())
         {
             self.record_migration_outcome(frontend_service::migration_outcome::CANCELLED);
-            self.abort_request_lifecycle_cancelled();
         }
     }
 }
@@ -862,7 +865,13 @@ where
                     );
                 }
                 self.record_migration_outcome(frontend_service::migration_outcome::CANCELLED);
-                let error = self.cancelled_error();
+                let error = DynamoError::builder()
+                    .error_type(ErrorType::Cancelled)
+                    .message(format!(
+                        "Context id {} is stopped or killed",
+                        self.context.id()
+                    ))
+                    .build();
                 self.abort_request_lifecycle(&error);
                 return Err(error.into());
             }
@@ -897,8 +906,8 @@ where
                     // A dispatch cancelled before its response prologue returns `Ok` empty,
                     // so a stopped context here means the client left during the handshake.
                     // The attempt can be stopped or killed on its own, so check it too.
-                    let request_cancelled = self.context.is_stopped() || self.context.is_killed();
-                    let outcome = if request_cancelled
+                    let outcome = if self.context.is_stopped()
+                        || self.context.is_killed()
                         || attempt_context.is_stopped()
                         || attempt_context.is_killed()
                     {
@@ -907,14 +916,6 @@ where
                         frontend_service::migration_outcome::SUCCESS
                     };
                     self.record_migration_outcome(outcome);
-                    // A hop that answered the cancel with an empty stream never claimed a
-                    // lifecycle parked for this retry, and no later attempt will, so abort it
-                    // with the cause now rather than let its drop abort it with none. Not on an
-                    // attempt cancelled alone: the request goes on, and a later retry may claim
-                    // the lifecycle.
-                    if request_cancelled {
-                        self.abort_request_lifecycle_cancelled();
-                    }
                     self.active_route_trace = Some(route_trace);
                     self.next_stream = Some(next_stream);
                     self.replayed_tokens = replayed_tokens;
@@ -966,25 +967,6 @@ where
         let error = Error::msg("Migration limit exhausted");
         self.abort_request_lifecycle(error.as_ref());
         Err(error)
-    }
-
-    /// Abort any classifier lifecycle parked for a retry with the request's cancel as the cause.
-    /// The cause is built only when a lifecycle can be parked.
-    fn abort_request_lifecycle_cancelled(&self) {
-        if self.request.migration_state.is_some() {
-            self.abort_request_lifecycle(&self.cancelled_error());
-        }
-    }
-
-    /// The error of a request whose context is stopped or killed.
-    fn cancelled_error(&self) -> DynamoError {
-        DynamoError::builder()
-            .error_type(ErrorType::Cancelled)
-            .message(format!(
-                "Context id {} is stopped or killed",
-                self.context.id()
-            ))
-            .build()
     }
 
     /// The attempt a failure belongs to. Prefers the attempt's own trace
