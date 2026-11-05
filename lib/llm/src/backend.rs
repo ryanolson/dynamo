@@ -1518,6 +1518,14 @@ mod tests {
     use futures::StreamExt;
     use std::sync::Arc;
 
+    /// `backend` over `engine` as the frontend's gdl pipeline runs it.
+    fn on_gdl(
+        backend: &Arc<Backend>,
+        engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
+    ) -> ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> {
+        crate::operator::testing::backend(backend.clone(), engine)
+    }
+
     #[test]
     fn decoder_params_share_prompt_and_preserve_request_copy_on_write() {
         let mut request = jailing_request(2);
@@ -1668,12 +1676,12 @@ mod tests {
                     Arc::new(SyntheticSglangStopEngine {
                         outputs: Some(outputs),
                     });
-                let outputs: Vec<_> =
-                    Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
-                        .await
-                        .unwrap()
-                        .collect()
-                        .await;
+                let outputs: Vec<_> = on_gdl(&backend, engine)
+                    .generate(SingleIn::new(request))
+                    .await
+                    .unwrap()
+                    .collect()
+                    .await;
                 let text: String = outputs
                     .iter()
                     .filter_map(|item| item.data.as_ref()?.text.as_deref())
@@ -1859,7 +1867,8 @@ mod tests {
                 engine_decodes_text,
             });
 
-        let mut stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let mut stream = on_gdl(&backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .expect("backend generation succeeds");
         let output = stream
@@ -1971,7 +1980,8 @@ mod tests {
                     ..Default::default()
                 }]),
             });
-        let mut stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let mut stream = on_gdl(&backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .unwrap();
         let output = stream.next().await.unwrap().data.unwrap();
@@ -2042,7 +2052,8 @@ mod tests {
                     },
                 ]),
             });
-        let outputs: Vec<_> = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let outputs: Vec<_> = on_gdl(&backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .unwrap()
             .filter_map(|item| async move { item.data })
@@ -2082,7 +2093,8 @@ mod tests {
         let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
             Arc::new(SyntheticSglangStopEngine::default());
 
-        let stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let stream = on_gdl(&backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .expect("backend generation succeeds");
         let mut outputs = stream.collect::<Vec<_>>().await;
@@ -2196,10 +2208,10 @@ mod tests {
                             ..Default::default()
                         }]),
                     });
-                    let mut stream =
-                        Operator::generate(backend.as_ref(), SingleIn::new(input), engine)
-                            .await
-                            .unwrap();
+                    let mut stream = on_gdl(&backend, engine)
+                        .generate(SingleIn::new(input))
+                        .await
+                        .unwrap();
                     let output = stream.next().await.unwrap();
                     if no_stop_trim == Some(true) && unsupported {
                         let error = output.error.expect("missing IDs must be rejected");
@@ -2287,7 +2299,8 @@ mod tests {
                         },
                     ]),
                 });
-            let mut stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+            let mut stream = on_gdl(&backend, engine)
+                .generate(SingleIn::new(request))
                 .await
                 .unwrap();
             let first = stream.next().await.unwrap().data.unwrap();
@@ -2654,7 +2667,8 @@ mod tests {
                 overpolled: overpolled.clone(),
             });
 
-        let stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let stream = on_gdl(&backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .expect("backend generation succeeds");
         let outputs: Vec<_> = stream.collect().await;
@@ -2750,7 +2764,8 @@ mod tests {
                 chunks,
                 dropped: dropped.clone(),
             });
-        let stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let stream = on_gdl(&backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .expect("backend generation succeeds");
         (stream, dropped)
@@ -2861,7 +2876,8 @@ mod tests {
         let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
             Arc::new(ErrorThenBareEofEngine);
 
-        let stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let stream = on_gdl(&backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .expect("backend generation succeeds");
         let outputs: Vec<_> = stream.collect().await;
@@ -2999,7 +3015,8 @@ mod tests {
         let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
             Arc::new(MixedBypassEngine);
 
-        let stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let stream = on_gdl(&backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .expect("backend generation succeeds");
         let outputs: Vec<_> = stream.collect().await;
@@ -3084,7 +3101,8 @@ mod tests {
         let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
             Arc::new(AnnotatedErrorThenBareEofEngine);
 
-        let stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let stream = on_gdl(&backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .expect("backend generation succeeds");
         let outputs: Vec<_> = stream.collect().await;
@@ -3153,7 +3171,8 @@ mod tests {
         let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
             Arc::new(ErrorWithEosEngine);
 
-        let stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let stream = on_gdl(&backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .expect("backend generation succeeds");
         let outputs: Vec<_> = stream.collect().await;
