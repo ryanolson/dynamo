@@ -526,6 +526,15 @@ mod tests {
 
     use super::*;
 
+    /// `router` over `next` as the frontend's gdl pipeline runs it: a native operator over the
+    /// hop to `next`.
+    fn on_gdl(
+        router: &Arc<EncoderRouter>,
+        next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
+    ) -> ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> {
+        crate::operator::testing::operator::<_, PreprocessedRequest, _, _, _>(router.clone(), next)
+    }
+
     fn stream_of(items: Vec<Annotated<LLMEngineOutput>>) -> ManyOut<Annotated<LLMEngineOutput>> {
         ResponseStream::new(
             Box::pin(stream::iter(items)),
@@ -594,10 +603,10 @@ mod tests {
         }
     }
 
-    async fn encoded_worker(router: &EncoderRouter) -> Option<u64> {
+    async fn encoded_worker(router: &Arc<EncoderRouter>) -> Option<u64> {
         let downstream = Arc::new(CaptureEngine::default());
-        router
-            .generate(SingleIn::new(multimodal_request()), downstream.clone())
+        on_gdl(router, downstream.clone())
+            .generate(SingleIn::new(multimodal_request()))
             .await
             .unwrap();
         downstream
@@ -950,8 +959,8 @@ mod tests {
         let next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
             downstream.clone();
 
-        let _response = router
-            .generate(SingleIn::new(multimodal_request()), next)
+        let _response = on_gdl(&router, next)
+            .generate(SingleIn::new(multimodal_request()))
             .await
             .expect("encoder failure should fall through to downstream");
 
