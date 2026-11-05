@@ -9691,8 +9691,12 @@ mod token_data_tests {
             serde_json::json!([[1, 2], [1, 128256]]),
             serde_json::json!([u32::MAX]),
         ] {
-            let Err(error) =
-                Operator::generate(preprocessor.as_ref(), embed(input), next.clone()).await
+            let Err(error) = crate::operator::testing::embeddings_preprocessor(
+                preprocessor.clone(),
+                next.clone(),
+            )
+            .generate(embed(input))
+            .await
             else {
                 panic!("an out-of-range token input must fail");
             };
@@ -9713,7 +9717,8 @@ mod token_data_tests {
             serde_json::json!([1, 128255]),
             serde_json::json!([[1, 2], [3, 128255]]),
         ] {
-            Operator::generate(preprocessor.as_ref(), embed(input), next.clone())
+            crate::operator::testing::embeddings_preprocessor(preprocessor.clone(), next.clone())
+                .generate(embed(input))
                 .await
                 .unwrap();
         }
@@ -9743,19 +9748,14 @@ mod token_data_tests {
             PipelineContext::new(request)
         };
 
-        Operator::generate(
-            preprocessor.as_ref(),
-            embed(serde_json::json!([0, 2])),
-            next.clone(),
-        )
-        .await
-        .unwrap();
-        let Err(error) = Operator::generate(
-            preprocessor.as_ref(),
-            embed(serde_json::json!([0, 3])),
-            next.clone(),
-        )
-        .await
+        crate::operator::testing::embeddings_preprocessor(preprocessor.clone(), next.clone())
+            .generate(embed(serde_json::json!([0, 2])))
+            .await
+            .unwrap();
+        let Err(error) =
+            crate::operator::testing::embeddings_preprocessor(preprocessor.clone(), next.clone())
+                .generate(embed(serde_json::json!([0, 3])))
+                .await
         else {
             panic!("an out-of-range token input must fail");
         };
@@ -16289,11 +16289,13 @@ responses_tools: None,
                 let mut request: NvCreateChatCompletionRequest =
                     serde_json::from_value(body).unwrap();
                 request.normalize_reasoning_template_args().unwrap();
-                let error = match Operator::generate(
-                    preprocessor.as_ref(),
-                    PipelineContext::new(request),
-                    Arc::new(UnreachableBackend),
+                let error = match crate::operator::testing::preprocessor::<
+                    NvCreateChatCompletionRequest,
+                    _,
+                >(
+                    preprocessor.clone(), Arc::new(UnreachableBackend)
                 )
+                .generate(PipelineContext::new(request))
                 .await
                 {
                     Ok(_) => panic!("reasoning-off request must fail before dispatch"),
@@ -16348,8 +16350,12 @@ responses_tools: None,
             dyn AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>,
         > = Arc::new(UnreachableBackend);
 
-        let result =
-            Operator::generate(preprocessor.as_ref(), PipelineContext::new(request), next).await;
+        let result = crate::operator::testing::preprocessor::<NvCreateCompletionRequest, _>(
+            preprocessor.clone(),
+            next,
+        )
+        .generate(PipelineContext::new(request))
+        .await;
         let Err(err) = result else {
             panic!("over-budget completion should fail admission");
         };
@@ -16377,8 +16383,12 @@ responses_tools: None,
             dyn AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>,
         > = Arc::new(UnreachableBackend);
 
-        let result =
-            Operator::generate(preprocessor.as_ref(), PipelineContext::new(request), next).await;
+        let result = crate::operator::testing::preprocessor::<NvCreateCompletionRequest, _>(
+            preprocessor.clone(),
+            next,
+        )
+        .generate(PipelineContext::new(request))
+        .await;
         let Err(err) = result else {
             panic!("an out-of-range token prompt should fail before dispatch");
         };
@@ -16418,8 +16428,12 @@ responses_tools: None,
             dyn AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>,
         > = Arc::new(UnreachableBackend);
 
-        let result =
-            Operator::generate(preprocessor.as_ref(), PipelineContext::new(request), next).await;
+        let result = crate::operator::testing::preprocessor::<NvCreateChatCompletionRequest, _>(
+            preprocessor.clone(),
+            next,
+        )
+        .generate(PipelineContext::new(request))
+        .await;
         let Err(err) = result else {
             panic!("invalid legacy-jail request should fail admission");
         };
@@ -16490,7 +16504,12 @@ responses_tools: None,
         let mut context = PipelineContext::new(request);
         inflight.request_metrics().attach_to(&mut context);
         let backend = Arc::new(PromptRecordingBackend::default());
-        let Err(error) = Operator::generate(preprocessor.as_ref(), context, backend.clone()).await
+        let Err(error) = crate::operator::testing::embeddings_preprocessor(
+            preprocessor.clone(),
+            backend.clone(),
+        )
+        .generate(context)
+        .await
         else {
             panic!("the recording backend must stop before producing output");
         };
@@ -16540,7 +16559,12 @@ responses_tools: None,
         inflight.request_metrics().attach_to(&mut context);
         let backend = Arc::new(PromptRecordingBackend::default());
 
-        let result = Operator::generate(preprocessor.as_ref(), context, backend.clone()).await;
+        let result = crate::operator::testing::preprocessor::<NvCreateChatCompletionRequest, _>(
+            preprocessor.clone(),
+            backend.clone(),
+        )
+        .generate(context)
+        .await;
 
         assert!(result.is_err());
         let dispatched = backend.0.lock().unwrap().clone();
