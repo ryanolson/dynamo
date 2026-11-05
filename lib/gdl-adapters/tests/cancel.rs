@@ -812,9 +812,9 @@ async fn a_failed_migration_records_one_failure_on_both_local_pipelines() {
     assert_eq!(outcomes, [failure.clone(), failure]);
 }
 
-/// A retry panic unwinds a live request without a stop or kill.
+/// A retry whose dispatch panics unwinds a live request, with no stop or kill: Migration
+/// records no outcome for it, on both local pipelines.
 #[tokio::test]
-#[ignore = "R1: a retry panic records cancelled while the request remains live"]
 async fn a_retry_dispatch_panic_is_not_a_request_cancellation_on_either_local_pipeline() {
     struct PanicOnRetry {
         eager_failure: bool,
