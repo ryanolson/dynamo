@@ -812,6 +812,64 @@ async fn a_failed_migration_records_one_failure_on_both_local_pipelines() {
     assert_eq!(outcomes, [failure.clone(), failure]);
 }
 
+/// A retry panic unwinds a live request without a stop or kill.
+#[tokio::test]
+#[ignore = "R1: a retry panic records cancelled while the request remains live"]
+async fn a_retry_dispatch_panic_is_not_a_request_cancellation_on_either_local_pipeline() {
+    struct PanicOnRetry {
+        eager_failure: bool,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AsyncEngine<SingleIn<PreprocessedRequest>, Out, Error> for PanicOnRetry {
+        async fn generate(&self, request: SingleIn<PreprocessedRequest>) -> Result<Out, Error> {
+            if self.calls.fetch_add(1, Ordering::AcqRel) > 0 {
+                panic!("injected retry dispatch panic");
+            }
+            if self.eager_failure {
+                Err(worker_unavailable())
+            } else {
+                Ok(ResponseStream::new(
+                    Box::pin(stream::iter(vec![went_away()])),
+                    request.context(),
+                ))
+            }
+        }
+    }
+
+    let mut outcomes = Vec::new();
+    for local_pipeline in BOTH {
+        for eager_failure in [true, false] {
+            let engine = Arc::new(PanicOnRetry {
+                eager_failure,
+                calls: AtomicUsize::new(0),
+            });
+            let metrics = Arc::new(Metrics::new());
+            let pipeline =
+                pipeline_c_with_metrics(local_pipeline, engine.clone(), 3, metrics.clone());
+            let request = preprocessed();
+            let context = request.context();
+            let task = tokio::spawn(async move {
+                let stream = pipeline.generate(request).await.unwrap();
+                rest(stream).await;
+            });
+            let panic = task.await.expect_err("the retry must panic");
+            assert!(panic.is_panic());
+            let payload = panic.into_panic();
+            assert_eq!(
+                payload.downcast_ref::<&str>(),
+                Some(&"injected retry dispatch panic")
+            );
+            assert_eq!(engine.calls.load(Ordering::Acquire), 2);
+            assert!(!context.is_stopped());
+            assert!(!context.is_killed());
+            outcomes.push(migration_outcomes(&metrics));
+        }
+    }
+    assert_eq!(outcomes, vec![Vec::<String>::new(); 4]);
+}
+
 /// A slow client: the caller reads a few items of an endless ready stream and then stops
 /// reading. Neither local pipeline reads ahead of its caller: the worker has produced at most
 /// one item more than the caller took (Migration's stream polls its source once per item).
