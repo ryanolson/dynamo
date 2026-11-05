@@ -272,8 +272,13 @@ impl PrefillTask {
 /// Cancel prefill when decode dispatch fails with an admission refusal, or because the decode
 /// router refused the request's unknown policy class at class entry. Neither has a receiver
 /// waiting for staged KV.
+///
+/// The refusal is an `anyhow` context, which a walk of the chain does not see; on the gdl
+/// pipeline it arrives inside a `gdl::Error`, so look through [`dynamo_gdl_adapters::entered`].
 fn cancel_prefill_on_decode_error(error: &anyhow::Error, prefill_context: &dyn AsyncEngineContext) {
-    if error.downcast_ref::<UnknownPolicyClassRefusal>().is_some() {
+    if dynamo_gdl_adapters::entered(error)
+        .any(|error| error.downcast_ref::<UnknownPolicyClassRefusal>().is_some())
+    {
         tracing::debug!(request_id = %prefill_context.id(), %error,
             "Cancelling remote prefill after decode refused an unknown policy class");
         prefill_context.stop_generating();

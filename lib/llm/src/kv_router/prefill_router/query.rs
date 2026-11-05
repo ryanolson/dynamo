@@ -692,6 +692,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gdl_unknown_class_decode_refusal_stops_pending_prefill() {
+        use super::super::handoff::PrefillTask;
+        use crate::operator::{Downstream, GdlDownstream};
+        use crate::protocols::response_merge::PrefillNeed;
+        use dynamo_gdl_adapters::Boxed;
+        use dynamo_runtime::engine::AsyncEngineContextProvider;
+        use dynamo_runtime::error::{DynamoError, ErrorType};
+
+        type Gdl = GdlDownstream<
+            gdl::Hop<(), gdl::SinkStage<RoutingHost>, ()>,
+            Boxed<PreprocessedRequest>,
+            PreprocessedRequest,
+        >;
+
+        let (decode, _chooser) = tracked_binding("gdl-decode-refusal").await;
+        let prefill_context = Arc::new(Controller::default());
+        let task_context = prefill_context.clone();
+        let (cleaned_tx, cleaned_rx) = tokio::sync::oneshot::channel();
+        let prefill = PrefillTask::spawn(
+            async move {
+                task_context.stopped().await;
+                let _ = cleaned_tx.send(());
+                Ok(None)
+            },
+            prefill_context.clone(),
+        );
+        let request = Context::with_id_and_metadata(
+            request(),
+            "gdl-decode-refusal".to_string(),
+            std::collections::BTreeMap::from([(
+                "policy-class".to_string(),
+                "priority".to_string(),
+            )]),
+        );
+        let request_context = request.context();
+        let next = Gdl::new(
+            gdl::Cx::new(),
+            gdl::Hop::new((), gdl::SinkStage::new(decode.router.clone()), ()),
+        );
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            prefill.forward_decode::<Gdl>(
+                next.send_cleanup(request),
+                request_context,
+                PrefillNeed::None,
+                prefill_context.clone(),
+            ),
+        )
+        .await
+        .expect("decode class refusal must return promptly")
+        .err()
+        .expect("decode routing must refuse the unknown class");
+        let refusal = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<DynamoError>())
+            .expect("the refusal keeps its DynamoError");
+        assert_eq!(refusal.error_type(), ErrorType::InvalidArgument);
+        assert_eq!(refusal.message(), "unknown policy class \"priority\"");
+        assert!(
+            prefill_context.is_stopped(),
+            "gdl decode's class refusal left prefill running"
+        );
+        tokio::time::timeout(Duration::from_secs(1), cleaned_rx)
+            .await
+            .expect("stopped prefill must finish its cleanup")
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn rr_prefill_queries_and_reservations_do_not_advance_dispatch_cursor() {
         let runtime = Runtime::from_current().unwrap();
         let discovery_root = tempfile::tempdir().unwrap();

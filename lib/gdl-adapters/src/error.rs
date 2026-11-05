@@ -50,6 +50,22 @@ pub fn enter(error: anyhow::Error) -> gdl::Error {
     gdl::Error::node(error.to_string()).with_source(Entered(Arc::new(error)))
 }
 
+/// The Dynamo errors `error` stands for: `error` itself, then each `anyhow::Error` inside its
+/// chain that entered gdl through [`enter`].
+///
+/// An operator body inside a gdl pipeline sees a stage's eager error as an `anyhow::Error`
+/// holding the `gdl::Error`, not as the `anyhow::Error` the stage raised. A walk of the chain
+/// finds the errors that error holds, but not an `anyhow` context, which only
+/// `anyhow::Error::downcast_ref` sees. A check that downcasts to a context type tries each.
+pub fn entered(error: &anyhow::Error) -> impl Iterator<Item = &anyhow::Error> {
+    std::iter::once(error).chain(
+        error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<Entered>())
+            .map(|entered| &*entered.0),
+    )
+}
+
 /// A gdl error leaving gdl.
 ///
 /// An error that entered through [`enter`] leaves as the `anyhow::Error` it
@@ -150,6 +166,38 @@ mod tests {
         let entered = enter(worker_unavailable().context("dispatch failed"));
         let found = find_dynamo(&entered).expect("a DynamoError behind context");
         assert_eq!(found.reason().as_str(), WORKER_UNAVAILABLE);
+    }
+
+    /// An operator body inside a gdl pipeline sees a stage's error as an `anyhow::Error`
+    /// holding the `gdl::Error`. An `anyhow` context, such as the router's unknown policy
+    /// class refusal, is not on the chain as its own type, so only [`entered`] finds it.
+    #[test]
+    fn entered_finds_an_anyhow_context_inside_a_gdl_error() {
+        #[derive(Debug)]
+        struct Refusal;
+
+        impl fmt::Display for Refusal {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("refused")
+            }
+        }
+
+        let refused = || anyhow::Error::new(Status(400)).context(Refusal);
+        let in_body = anyhow::Error::new(enter(refused()));
+        assert!(in_body.downcast_ref::<Refusal>().is_none());
+        assert!(entered(&in_body).any(|e| e.downcast_ref::<Refusal>().is_some()));
+
+        // A Dynamo error that never entered gdl is its own first item.
+        let error = refused();
+        assert!(
+            entered(&error)
+                .next()
+                .is_some_and(|e| e.downcast_ref::<Refusal>().is_some())
+        );
+
+        // An error with no context of the type has none.
+        let other = anyhow::Error::new(enter(anyhow::Error::new(Status(400))));
+        assert!(entered(&other).all(|e| e.downcast_ref::<Refusal>().is_none()));
     }
 
     #[test]
