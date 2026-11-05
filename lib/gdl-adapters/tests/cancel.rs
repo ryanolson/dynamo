@@ -870,6 +870,102 @@ async fn a_retry_dispatch_panic_is_not_a_request_cancellation_on_either_local_pi
     assert_eq!(outcomes, vec![Vec::<String>::new(); 4]);
 }
 
+async fn migration_outcome_after_http_stream_drop(
+    local_pipeline: LocalPipeline,
+    kill_first: bool,
+) -> Vec<String> {
+    use dynamo_llm::http::service::disconnect::{
+        create_connection_monitor, monitor_for_disconnects,
+    };
+    use dynamo_llm::http::service::metrics::{CancellationLabels, Endpoint};
+
+    let (worker, mut arrivals) = Worker::new(vec![
+        Turn::Stream(vec![token(450), went_away()], Then::End),
+        Turn::HangUntilKilled,
+    ]);
+    let metrics = Arc::new(Metrics::new());
+    let pipeline = pipeline_c_with_metrics(local_pipeline, worker.clone(), 3, metrics.clone());
+    let request = preprocessed();
+    let context = request.context();
+    let response = pipeline.generate(request).await.unwrap();
+    let (mut connection_handle, stream_handle) = create_connection_monitor(
+        context.clone(),
+        Some(metrics.clone()),
+        CancellationLabels {
+            model: card().display_name.clone(),
+            endpoint: Endpoint::Generate.to_string(),
+            request_type: "stream".to_string(),
+        },
+    )
+    .await;
+    let inflight = metrics.clone().create_inflight_guard(
+        &card().display_name,
+        Endpoint::Generate,
+        true,
+        context.id(),
+    );
+    let monitored = monitor_for_disconnects(
+        response.map(|_| Ok(Default::default())),
+        context.clone(),
+        inflight,
+        stream_handle,
+    );
+    connection_handle.disarm();
+    drop(connection_handle);
+    let reader = tokio::spawn(async move { monitored.collect::<Vec<_>>().await });
+    for index in 0..2 {
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), arrivals.recv())
+                .await
+                .expect("the retry reaches its dispatch"),
+            Some(index),
+        );
+    }
+    assert!(!context.is_stopped());
+    assert!(!context.is_killed());
+    assert!(migration_outcomes(&metrics).is_empty());
+    if kill_first {
+        context.kill();
+    }
+    // Dropping the HTTP body drops its source and signals the disconnect monitor.
+    reader.abort();
+    let cancelled = tokio::time::timeout(Duration::from_secs(5), reader)
+        .await
+        .expect("the dropped HTTP body releases its source")
+        .expect_err("the body reader was aborted");
+    assert!(cancelled.is_cancelled());
+    tokio::time::timeout(Duration::from_secs(5), context.killed())
+        .await
+        .expect("the HTTP disconnect monitor kills the request");
+    assert_eq!(worker.calls(), 2);
+    assert_eq!(metrics.get_client_disconnect_count(), 1);
+    migration_outcomes(&metrics)
+}
+
+/// A kill delivered before the HTTP body drops records one cancelled migration.
+#[tokio::test]
+async fn a_kill_before_http_stream_drop_records_one_cancelled_migration() {
+    for local_pipeline in BOTH {
+        assert_eq!(
+            migration_outcome_after_http_stream_drop(local_pipeline, true).await,
+            ["ongoing_request/cancelled x1"],
+            "{}",
+            local_pipeline.as_str(),
+        );
+    }
+}
+
+/// An HTTP body dropped during a retry records one cancellation after its monitor kills the request.
+#[tokio::test]
+#[ignore = "R3: HTTP body drop destroys Migration before the disconnect monitor kills the request"]
+async fn an_http_stream_drop_during_a_retry_records_one_cancelled_migration() {
+    let mut outcomes = Vec::new();
+    for local_pipeline in BOTH {
+        outcomes.push(migration_outcome_after_http_stream_drop(local_pipeline, false).await);
+    }
+    assert_eq!(outcomes, vec![vec!["ongoing_request/cancelled x1"]; 2]);
+}
+
 /// A slow client: the caller reads a few items of an endless ready stream and then stops
 /// reading. Neither local pipeline reads ahead of its caller: the worker has produced at most
 /// one item more than the caller took (Migration's stream polls its source once per item).
