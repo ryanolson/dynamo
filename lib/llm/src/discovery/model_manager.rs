@@ -2970,6 +2970,20 @@ fn has_required_kv_transfer_policy(configs: &HashMap<WorkerId, ModelRuntimeConfi
 }
 
 #[cfg(test)]
+impl ModelManager {
+    /// Set the runtime configs of `endpoint_id`'s workers, as their discovery would, for a test
+    /// of a stage that reads them without discovery behind it.
+    pub(crate) fn set_runtime_configs(
+        &self,
+        endpoint_id: &EndpointId,
+        configs: HashMap<WorkerId, ModelRuntimeConfig>,
+    ) {
+        let (_tx, rx) = tokio::sync::watch::channel(configs);
+        self.runtime_configs.insert(endpoint_id.clone(), rx);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;

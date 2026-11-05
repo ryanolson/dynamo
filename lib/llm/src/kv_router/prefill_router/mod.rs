@@ -2827,4 +2827,146 @@ mod tests {
             ]
         );
     }
+
+    /// A client disconnect while the prefill leg is still dispatching, with the prefill router
+    /// as the frontend's native gdl operator. When the prefill worker and the decode worker set
+    /// both advertise `disagg_prefill_cancel_anytime_v1`, the route ties the prefill leg's own
+    /// context to the client's, so the kill reaches the prefill worker and it can free its
+    /// work. Without both, the kill does not reach it: the prefill leg runs on, as on a worker
+    /// that cannot cancel a prefill at any time. Nothing here depends on how gdl's edge ends
+    /// the caller's call.
+    #[tokio::test]
+    async fn a_client_kill_cancels_a_prefill_that_both_worker_sets_can_cancel_on_gdl() {
+        use crate::kv_router::{RouterLoadSource, RoutingLoadContext};
+        use crate::local_model::runtime_config::ModelRuntimeConfig;
+        use dynamo_runtime::pipeline::AsyncEngineContext;
+        use dynamo_runtime::{DistributedRuntime, Runtime, distributed::DistributedConfig};
+        use std::time::Duration;
+
+        /// A prefill dispatch that sends the context it got, then waits until it is killed.
+        struct HeldPrefill {
+            entered: tokio::sync::mpsc::UnboundedSender<Arc<dyn AsyncEngineContext>>,
+        }
+
+        #[async_trait]
+        impl
+            dynamo_runtime::pipeline::StreamingDispatch<
+                PreprocessedRequest,
+                Annotated<LLMEngineOutput>,
+            > for HeldPrefill
+        {
+            async fn generate(
+                &self,
+                request: SingleIn<dynamo_runtime::pipeline::AddressedRequest<PreprocessedRequest>>,
+            ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+                let context = request.context();
+                self.entered.send(context.clone()).unwrap();
+                context.killed().await;
+                Ok(ResponseStream::new(Box::pin(stream::empty()), context))
+            }
+
+            async fn generate_bidirectional(
+                &self,
+                _: dynamo_runtime::component::Instance,
+                _: String,
+                _: dynamo_runtime::pipeline::ManyIn<PreprocessedRequest>,
+            ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+                unreachable!("prefill dispatch takes a single request")
+            }
+        }
+
+        let runtime = Runtime::from_current().unwrap();
+        let distributed =
+            DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+                .await
+                .unwrap();
+        let mut seen = Vec::new();
+        for (prefill_can_cancel, decode_can_cancel) in [(true, true), (true, false), (false, true)]
+        {
+            let endpoint = distributed
+                .namespace(format!(
+                    "prefill-cancel-{prefill_can_cancel}-{decode_can_cancel}"
+                ))
+                .unwrap()
+                .component("workers")
+                .unwrap()
+                .endpoint("prefill");
+            let client = endpoint.client().await.unwrap();
+            endpoint.register_endpoint_instance().await.unwrap();
+            client.wait_for_instances().await.unwrap();
+            let mut config = ModelRuntimeConfig::default();
+            config.runtime_data.insert(
+                DISAGG_PREFILL_CANCEL_ANYTIME_V1.to_string(),
+                serde_json::Value::Bool(prefill_can_cancel),
+            );
+            let model_manager = Arc::new(ModelManager::new());
+            model_manager.set_runtime_configs(
+                &endpoint.id(),
+                client
+                    .instance_ids()
+                    .into_iter()
+                    .map(|id| (id, config.clone()))
+                    .collect(),
+            );
+            let load_context = RoutingLoadContext::start(
+                client.clone(),
+                RouterLoadSource::Prefill,
+                crate::discovery::LoadThresholdHandle::new(Default::default()),
+                &distributed.child_token(),
+                None,
+            )
+            .await
+            .unwrap();
+            let (entered, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+            let host = Arc::new(
+                RoutingHost::builder(client, RouterMode::RoundRobin)
+                    .load_context(load_context)
+                    .dispatch(Arc::new(HeldPrefill { entered }) as crate::kv_router::LlmDispatch)
+                    .build()
+                    .await
+                    .unwrap(),
+            );
+            let mut router = PrefillRouter::disabled(model_manager, RouterMode::RoundRobin, None);
+            Arc::get_mut(&mut router)
+                .unwrap()
+                .decode_supports_prefill_cancellation = decode_can_cancel;
+            router.binding.store(Some(Arc::new(PrefillBinding {
+                target_id: WorkerSetTargetId::Legacy(endpoint.id()),
+                endpoint_id: endpoint.id(),
+                router: host,
+                prefill_router_mode: RouterMode::RoundRobin,
+            })));
+            router.lifecycle.store(
+                PrefillLifecycleState::Active as u8,
+                std::sync::atomic::Ordering::Release,
+            );
+            let pipeline = on_gdl(&router, Arc::new(CleanupDecode::default()));
+
+            let request = Context::new(inference_request());
+            let caller = request.context();
+            let call = tokio::spawn(async move { outcome(pipeline.generate(request)).await });
+            let prefill = tokio::time::timeout(Duration::from_secs(5), arrivals.recv())
+                .await
+                .expect("prefill enters dispatch")
+                .unwrap();
+            assert!(!prefill.is_stopped(), "the prefill leg starts live");
+            caller.kill();
+            let cancelled = tokio::time::timeout(Duration::from_secs(1), prefill.killed())
+                .await
+                .is_ok();
+            // Lets a prefill that was not cancelled end, so its route ends too.
+            prefill.kill();
+            let _ = tokio::time::timeout(Duration::from_secs(5), call).await;
+            seen.push(((prefill_can_cancel, decode_can_cancel), cancelled));
+        }
+        runtime.shutdown();
+        assert_eq!(
+            seen,
+            [
+                ((true, true), true),
+                ((true, false), false),
+                ((false, true), false)
+            ]
+        );
+    }
 }
