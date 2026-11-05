@@ -1181,7 +1181,27 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use tokio::sync::mpsc;
 
+    use crate::operator::testing::{self, EngineDownstream};
+
     const TEST_MODEL: &str = "test-model";
+
+    /// `next` as the downstream Migration's body gets on gdl for a request with `context`: under
+    /// a `Cx` that follows `context`, as the frontend's routed pipelines root it.
+    fn gdl_next<Resp: Data>(
+        context: &dyn AsyncEngineContext,
+        next: ServerStreamingEngine<PreprocessedRequest, Annotated<Resp>>,
+    ) -> EngineDownstream<PreprocessedRequest, Resp> {
+        testing::downstream(dynamo_gdl_adapters::CxBridge::cx(context), next)
+    }
+
+    /// `migration` over `next` as the frontend's gdl pipeline runs it: a native operator over the
+    /// hop to `next`.
+    fn on_gdl(
+        migration: &Arc<Migration>,
+        next: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>>,
+    ) -> ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> {
+        testing::operator::<_, BackendOutput, _, _, _>(migration.clone(), next)
+    }
 
     fn migration_duration_count(metrics: &Metrics, migration_type: &str, outcome: &str) -> u64 {
         metrics.get_migration_duration_sample_count(TEST_MODEL, migration_type, outcome)
@@ -1499,11 +1519,13 @@ mod tests {
         let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> = Arc::new(
             MockEngine::new(MockBehavior::Success, 1, 100, context_id.clone()),
         );
+        let ctx = Arc::new(Controller::new(context_id));
+        let next = gdl_next(&*ctx, engine);
         let manager = RetryManager::build(
-            Arc::new(Controller::new(context_id)),
+            ctx,
             BTreeMap::new(),
             request,
-            DynamoDownstream(engine),
+            next,
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2066,11 +2088,12 @@ mod tests {
 
         let ctx = Arc::new(Controller::new(context_id.clone()));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            DynamoDownstream(next_generate),
+            next,
             0,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2101,7 +2124,7 @@ mod tests {
         behavior: MockBehavior,
         migration_limit: u32,
     ) -> (
-        RetryManager<BackendOutput, DynamoDownstream<PreprocessedRequest, BackendOutput>>,
+        RetryManager<BackendOutput, EngineDownstream<PreprocessedRequest, BackendOutput>>,
         std::sync::Weak<Vec<TokenIdType>>,
     ) {
         let context_id = uuid::Uuid::new_v4().to_string();
@@ -2109,11 +2132,13 @@ mod tests {
         let prompt = Arc::downgrade(&request.token_ids);
         let next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
             Arc::new(MockEngine::new(behavior, 10, 100, context_id.clone()));
+        let ctx = Arc::new(Controller::new(context_id));
+        let next = gdl_next(&*ctx, next_generate);
         let retry_manager = RetryManager::build(
-            Arc::new(Controller::new(context_id)),
+            ctx,
             BTreeMap::new(),
             request,
-            DynamoDownstream(next_generate),
+            next,
             migration_limit,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2186,8 +2211,8 @@ mod tests {
             Arc::new(Metrics::new()),
         );
 
-        let responses = migration
-            .generate(request, mock_engine)
+        let responses = on_gdl(&migration, mock_engine)
+            .generate(request)
             .await
             .unwrap()
             .collect::<Vec<_>>()
@@ -2216,7 +2241,10 @@ mod tests {
         );
 
         let migration = Migration::new(1, None, TEST_MODEL.to_string(), Arc::new(Metrics::new()));
-        let mut stream = migration.generate(request, mock_engine).await.unwrap();
+        let mut stream = on_gdl(&migration, mock_engine)
+            .generate(request)
+            .await
+            .unwrap();
         while stream.next().await.is_some() {}
 
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -2282,7 +2310,7 @@ mod tests {
         let request =
             Context::with_id_and_metadata(create_mock_request(2), context_id, BTreeMap::new());
         let migration = Migration::new(1, None, TEST_MODEL.to_string(), Arc::new(Metrics::new()));
-        let mut stream = migration.generate(request, engine).await.unwrap();
+        let mut stream = on_gdl(&migration, engine).generate(request).await.unwrap();
 
         assert!(stream.next().await.is_some());
         assert!(stream.next().await.is_some());
@@ -2313,7 +2341,7 @@ mod tests {
         let request = Context::with_id_and_metadata(content, context_id, BTreeMap::new());
 
         let migration = Migration::new(3, None, TEST_MODEL.to_string(), Arc::new(Metrics::new()));
-        let result = migration.generate(request, mock_engine).await;
+        let result = on_gdl(&migration, mock_engine).generate(request).await;
 
         assert!(result.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -2335,7 +2363,10 @@ mod tests {
             Context::with_id_and_metadata(create_mock_request(1), context_id, BTreeMap::new());
 
         let migration = Migration::new(2, None, TEST_MODEL.to_string(), Arc::new(Metrics::new()));
-        let mut stream = migration.generate(request, mock_engine).await.unwrap();
+        let mut stream = on_gdl(&migration, mock_engine)
+            .generate(request)
+            .await
+            .unwrap();
         let responses = stream.by_ref().collect::<Vec<_>>().await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 3);
@@ -2365,11 +2396,12 @@ mod tests {
 
         let ctx = Arc::new(Controller::new(context_id.clone()));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            DynamoDownstream(next_generate),
+            next,
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2427,11 +2459,12 @@ mod tests {
 
         let ctx = Arc::new(Controller::new(context_id.clone()));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            DynamoDownstream(next_generate),
+            next,
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2487,8 +2520,8 @@ mod tests {
         let request = Context::with_id_and_metadata(request, context_id, BTreeMap::new());
         let migration = Migration::new(1, None, TEST_MODEL.to_string(), Arc::new(Metrics::new()));
 
-        let responses = migration
-            .generate(request, mock_engine)
+        let responses = on_gdl(&migration, mock_engine)
+            .generate(request)
             .await
             .unwrap()
             .collect::<Vec<_>>()
@@ -2520,11 +2553,12 @@ mod tests {
         // Should fail to build due to initial stream creation failure after exhausting all 3 retries
         let ctx = Arc::new(Controller::new(context_id.clone()));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let retry_manager_result = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            DynamoDownstream(next_generate),
+            next,
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2570,11 +2604,12 @@ mod tests {
 
         let ctx = Arc::new(Controller::new(context_id.clone()));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            DynamoDownstream(next_generate),
+            next,
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2639,11 +2674,12 @@ mod tests {
 
         let ctx = Arc::new(Controller::new(context_id.clone()));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            DynamoDownstream(next_generate),
+            next,
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2721,11 +2757,12 @@ mod tests {
 
         // Should fail to build due to stopped context
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let retry_manager_result = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            DynamoDownstream(next_generate),
+            next,
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2774,11 +2811,12 @@ mod tests {
             mock_engine;
         let metrics = Arc::new(Metrics::new());
 
+        let next = gdl_next(&*ctx, next_generate);
         let result = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            DynamoDownstream(next_generate),
+            next,
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2829,11 +2867,13 @@ mod tests {
             mock_engine;
         let metrics = Arc::new(Metrics::new());
 
+        let ctx = Arc::new(Controller::new(context_id));
+        let next = gdl_next(&*ctx, next_generate);
         let result = RetryManager::build(
-            Arc::new(Controller::new(context_id)),
+            ctx,
             BTreeMap::new(),
             request,
-            DynamoDownstream(next_generate),
+            next,
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2846,9 +2886,7 @@ mod tests {
             Ok(_) => panic!("cancelled migration must fail"),
             Err(error) => error,
         };
-        let dynamo_error = error
-            .downcast_ref::<DynamoError>()
-            .expect("error should be a DynamoError");
+        let dynamo_error = testing::dynamo_error(&error).expect("error should be a DynamoError");
         assert_eq!(dynamo_error.error_type(), ErrorType::Cancelled);
         assert_eq!(metrics.get_migration_new_request_count(TEST_MODEL), 1);
         assert_eq!(
@@ -2910,11 +2948,12 @@ mod tests {
         };
 
         let consume = async {
+            let next = gdl_next(&*ctx, next_generate);
             let mut retry_manager = RetryManager::build(
                 ctx.clone(),
                 BTreeMap::new(),
                 create_mock_request(10),
-                DynamoDownstream(next_generate),
+                next,
                 3,
                 None,
                 Arc::new(TEST_MODEL.to_string()),
@@ -3037,11 +3076,12 @@ mod tests {
 
         let ctx = Arc::new(Controller::new(context_id.clone()));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            DynamoDownstream(next_generate),
+            next,
             3, // migration_limit=3 — should be ignored for guided-decoding requests
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -3116,11 +3156,12 @@ mod tests {
 
         let ctx = Arc::new(Controller::new(context_id.clone()));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            DynamoDownstream(next_generate),
+            next,
             3,
             Some(5), // prompt(3) + 3 generated = 6 > 5 → disables migration
             Arc::new(TEST_MODEL.to_string()),
@@ -3189,11 +3230,12 @@ mod tests {
 
         let ctx = Arc::new(Controller::new(context_id.clone()));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            DynamoDownstream(next_generate),
+            next,
             3,
             Some(5), // prompt(3) + 2 generated = 5 == max_seq_len → still migratable
             Arc::new(TEST_MODEL.to_string()),
@@ -3254,11 +3296,12 @@ mod tests {
 
         let ctx = Arc::new(Controller::new(context_id.clone()));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            DynamoDownstream(next_generate),
+            next,
             3,
             Some(2), // prompt(3) > max_seq_len(2) → migration disabled at build time
             Arc::new(TEST_MODEL.to_string()),
@@ -3336,11 +3379,12 @@ mod tests {
 
         let ctx = Arc::new(Controller::new(context_id.clone()));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            DynamoDownstream(next_generate),
+            next,
             1,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -3451,11 +3495,12 @@ mod tests {
 
         let ctx = Arc::new(Controller::new(context_id.clone()));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            DynamoDownstream(next_generate),
+            next,
             1,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -3557,11 +3602,13 @@ mod tests {
                 failing_attempts,
                 context_id: context_id.clone(),
             });
+        let ctx = Arc::new(Controller::new(context_id));
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
-            Arc::new(Controller::new(context_id)),
+            ctx,
             BTreeMap::new(),
             request,
-            DynamoDownstream(next_generate),
+            next,
             failing_attempts.max(1),
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -3699,11 +3746,12 @@ mod tests {
                 root: root.clone(),
                 context_id,
             });
+        let next = gdl_next(&*root, next_generate);
         let mut retry_manager = RetryManager::build(
             root,
             BTreeMap::new(),
             create_mock_request(5),
-            DynamoDownstream(next_generate),
+            next,
             2,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -3848,11 +3896,12 @@ mod tests {
 
         let ctx = Arc::new(Controller::new(context_id));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            DynamoDownstream(next_generate),
+            next,
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -4031,11 +4080,12 @@ mod tests {
         let retries = 1;
         let manager = tracing::subscriber::with_default(subscriber, || {
             futures::executor::block_on(async {
+                let next = gdl_next(&*root, next_generate);
                 let mut manager = RetryManager::build(
                     root,
                     BTreeMap::new(),
                     create_mock_request(50),
-                    DynamoDownstream(next_generate),
+                    next,
                     retries,
                     None,
                     Arc::new(TEST_MODEL.to_string()),
@@ -4215,7 +4265,9 @@ mod tests {
             &self,
             request: SingleIn<PreprocessedRequest>,
         ) -> Result<ManyOut<Annotated<BackendOutput>>> {
-            Operator::generate(self.backend.as_ref(), request, self.raw_engine.clone()).await
+            crate::operator::testing::backend(self.backend.clone(), self.raw_engine.clone())
+                .generate(request)
+                .await
         }
     }
 
@@ -4243,11 +4295,12 @@ mod tests {
 
         let ctx = Arc::new(Controller::new(context_id.clone()));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
             ctx,
             BTreeMap::new(),
             jail_request(stop),
-            DynamoDownstream(next_generate),
+            next,
             1,
             None,
             Arc::new(TEST_MODEL.to_string()),
