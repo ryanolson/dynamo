@@ -32,6 +32,9 @@ use dynamo_runtime::protocols::annotated::Annotated;
 use futures::{FutureExt, Stream, StreamExt};
 use tracing::Instrument;
 
+#[cfg(test)]
+pub(crate) mod testing;
+
 /// The stage below an operator, as the operator's body calls it.
 ///
 /// Transition: remove when the gdl pipeline is the only local pipeline.
