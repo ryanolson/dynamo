@@ -36,7 +36,6 @@ from tests.utils.router_logs import (
     parse_kv_event_diagnostics,
     select_kv_event_diagnostics,
     wait_for_kv_event_diagnostics,
-    wait_for_local_pipeline_records,
 )
 from tests.utils.router_nvext import parse_sse_json_chunks
 
@@ -551,31 +550,6 @@ def _test_router_two_routers(
             kv_router.__exit__(None, None, None)
 
 
-# Transition: remove when the gdl pipeline is the only local pipeline.
-def local_pipeline_env(local_pipeline: str | None) -> dict[str, str | None]:
-    """Frontend environment that selects ``local_pipeline`` (``None`` removes
-    ``DYN_LOCAL_PIPELINE``, so an inherited value cannot select gdl) and logs
-    JSONL, so the pipeline the frontend built can be read back. The console
-    format is set, not the legacy ``DYN_LOGGING_JSONL``, which an inherited
-    ``DYN_LOGGING_CONSOLE_FORMAT`` would override."""
-
-    return {
-        "DYN_LOCAL_PIPELINE": local_pipeline,
-        "DYN_LOGGING_CONSOLE_FORMAT": "jsonl",
-        "DYN_LOG": "info",
-    }
-
-
-# Transition: remove when the gdl pipeline is the only local pipeline.
-def assert_local_pipeline(frontend, local_pipeline: str | None) -> None:
-    """Fail unless the frontend built every routed pipeline on ``local_pipeline``
-    (``None`` means the default, Dynamo's). A flag the frontend ignored fails here."""
-
-    expected = local_pipeline or "dynamo"
-    records = wait_for_local_pipeline_records(frontend, timeout_s=30)
-    assert {record.local_pipeline for record in records} == {expected}, records
-
-
 def _test_session_affinity(
     engine_workers,
     block_size: int,
@@ -583,7 +557,6 @@ def _test_session_affinity(
     router_ports: list[int],
     test_payload: dict[str, Any],
     store_backend: str = "etcd",
-    local_pipeline: str | None = None,
 ):
     """Verify replica affinity overrides conflicting per-frontend KV placement."""
     with (
@@ -597,8 +570,7 @@ def _test_session_affinity(
             min_initial_workers=engine_workers.num_workers,
             event_plane="nats",
             session_affinity_ttl_secs=300,
-            extra_env=local_pipeline_env(local_pipeline),
-        ) as frontend_a,
+        ),
         FrontendRouterProcess(
             request,
             block_size,
@@ -609,8 +581,7 @@ def _test_session_affinity(
             min_initial_workers=engine_workers.num_workers,
             event_plane="nats",
             session_affinity_ttl_secs=300,
-            extra_env=local_pipeline_env(local_pipeline),
-        ) as frontend_b,
+        ),
     ):
         urls = [f"http://localhost:{port}/v1/chat/completions" for port in router_ports]
 
@@ -634,8 +605,6 @@ def _test_session_affinity(
                     store_backend=store_backend,
                     request_plane="nats",
                 )
-            for frontend in (frontend_a, frontend_b):
-                assert_local_pipeline(frontend, local_pipeline)
 
             suffix = uuid.uuid4().hex
             prefix_a = " ".join([f"affinity-alpha-{suffix}"] * (block_size * 2))
@@ -774,7 +743,6 @@ def _test_repeated_prompt_cache_hit(
     frontend_port: int,
     test_payload: dict[str, Any],
     store_backend: str = "etcd",
-    local_pipeline: str | None = None,
 ):
     """Send the same chat prompt twice through the HTTP frontend with KV routing.
     Both requests stream content. The second must be routed by its KV overlap
@@ -789,8 +757,7 @@ def _test_repeated_prompt_cache_hit(
         router_mode="kv",
         min_initial_workers=engine_workers.num_workers,
         event_plane="nats",
-        extra_env=local_pipeline_env(local_pipeline),
-    ) as frontend:
+    ):
         url = f"http://localhost:{frontend_port}/v1/chat/completions"
 
         async def run_test() -> None:
@@ -802,7 +769,6 @@ def _test_repeated_prompt_cache_hit(
                 store_backend=store_backend,
                 request_plane="nats",
             )
-            assert_local_pipeline(frontend, local_pipeline)
 
             # Several KV blocks long: cached tokens count only whole blocks.
             content = " ".join([f"cache-hit-{uuid.uuid4().hex}"] * (block_size * 4))
@@ -868,9 +834,8 @@ def _test_repeated_prompt_cache_hit(
                     )
                 assert (second["cached_tokens"] or 0) > 0, second["body"]
                 logger.info(
-                    "local_pipeline=%s requests=%s cached_tokens first=%s last=%s "
+                    "requests=%s cached_tokens first=%s last=%s "
                     "kv_hit_rate last=%s worker first=%s last=%s",
-                    local_pipeline or "dynamo",
                     requests,
                     first["cached_tokens"],
                     second["cached_tokens"],

@@ -599,14 +599,6 @@ def test_mocker_two_kv_router(
         )
 
 
-# Transition: keep only the gdl case when the gdl pipeline is the only local pipeline.
-LOCAL_PIPELINES = (
-    pytest.param(None, id="dynamo"),
-    pytest.param("gdl", id="gdl"),
-)
-
-
-@pytest.mark.parametrize("local_pipeline", LOCAL_PIPELINES)
 @pytest.mark.parametrize("store_backend", ["etcd", "file"])
 @pytest.mark.timeout(180)
 def test_mocker_session_affinity(
@@ -615,7 +607,6 @@ def test_mocker_session_affinity(
     predownload_tokenizers,
     file_storage_backend,
     store_backend,
-    local_pipeline,
 ):
     """Replica affinity overrides conflicting per-frontend KV-prefix placement."""
     mocker_args = {
@@ -636,11 +627,9 @@ def test_mocker_session_affinity(
             router_ports=allocate_frontend_ports(request, 2),
             test_payload=TEST_PAYLOAD,
             store_backend=store_backend,
-            local_pipeline=local_pipeline,
         )
 
 
-@pytest.mark.parametrize("local_pipeline", LOCAL_PIPELINES)
 # The frontend subscribes to KV events over NATS; the mockers must publish there.
 @pytest.mark.parametrize("event_plane", ["nats"], indirect=True)
 @pytest.mark.timeout(180)
@@ -650,10 +639,9 @@ def test_mocker_repeated_prompt_cache_hit(
     predownload_tokenizers,
     file_storage_backend,
     event_plane,
-    local_pipeline,
 ):
     """The same chat prompt twice through the HTTP frontend's routed pipeline:
-    the second hits the prefix cache, on Dynamo's local pipeline and on gdl's."""
+    the second hits the prefix cache."""
     mocker_args = {
         "speedup_ratio": SPEEDUP_RATIO,
         "block_size": BLOCK_SIZE,
@@ -672,7 +660,6 @@ def test_mocker_repeated_prompt_cache_hit(
             frontend_port=allocate_frontend_ports(request, 1)[0],
             test_payload=TEST_PAYLOAD,
             store_backend="file",
-            local_pipeline=local_pipeline,
         )
 
 
