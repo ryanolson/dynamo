@@ -120,10 +120,10 @@ The paths these scripts guard, and the profiles that found them, are in
 [hot-paths.md](hot-paths.md).
 
 `hotpath.sh` prints the hot-path table: allocations, instructions and `memcpy` calls per
-request, for each pipeline (A, B, C, embeddings, and the worker's `Ingress`) in both forms. The
-dynamo form is the default path (`DYN_LOCAL_PIPELINE` unset); the gdl form is
-`DYN_LOCAL_PIPELINE=gdl`. The engine rows are the test engines alone, so a pipeline's own cost
-is its row minus its engine's row. Needs `valgrind` and `jq`.
+request, for each pipeline of the frontend (A, B, C and embeddings, form `gdl`: the gdl local
+pipeline, the only one the frontend composes) and the worker's `Ingress` (form `dynamo`). The
+engine rows are the test engines alone, so a pipeline's own cost is its row minus its engine's
+row. Needs `valgrind` and `jq`.
 
 ```bash
 lib/llm/benches/hotpath.sh > table.txt              # the table
@@ -144,19 +144,26 @@ three times. One such move costs 100 to 200 instructions, less than the per-item
 tolerance, so this column, not `instr/item`, is the guard against moves coming back. The count
 is the same in every run of one build.
 
-A dynamo row's allocations are its typical request's. A gdl row's are its highest request's:
-at gdl `79bcc11d`, under CPU load, some gdl requests make 2 allocations fewer in their window,
-so the typical count moves between runs. `range` shows how far.
+A gdl row's allocations are its highest request's: at gdl `79bcc11d`, under CPU load, some gdl
+requests make 2 allocations fewer in their window, so the typical count moves between runs.
+`range` shows how far. The other rows' are their typical request's.
 
-With `--base`, the script marks a row `RISE` when the default path got worse and `WORSE` when a
-gdl row did, and exits 1 if it marked any row. A row gets worse when its allocations or `memcpy`
-calls at 1 or at 16 items rise at all, or when its instructions rise by more than the tolerance
-(see below). It compares the raw counts, not the rounded per-item figures.
+With `--base`, the script marks a row `RISE` when it got worse, and exits 1 if it marked any
+row. A row gets worse when its allocations or `memcpy` calls at 1 or at 16 items rise at all,
+or when its instructions rise by more than the tolerance (see below). It compares the raw
+counts, not the rounded per-item figures.
+
+A base from before the gdl pipeline became the only one has a dynamo row for A, B, C and
+embeddings, which the script no longer measures. The script skips each of these retired rows,
+names it on stderr, and compares the rest. Such a table marks a worse gdl row `WORSE`, which
+the parser still reads in a base. The last table with both forms is in
+[hot-paths.md](hot-paths.md).
 
 The table's first line is its provenance: `# hotpath format=3 arch=x86_64 gdl=<rev>
 commit=<rev>`. One strict parser reads the base and the new table, and fails the run before
 any valgrind run on any line it cannot read in full: a stray line, a non-number in a count, a
-missing, extra or repeated row, or a base with another table format or arch. A base it could
+missing, extra or repeated row (a retired row is the only extra one allowed in a base), or a
+base with another table format or arch. A base it could
 not read in full could let a rise pass. A table written with `--base` is a valid base. The
 commit and gdl rev are printed, not checked.
 
@@ -164,7 +171,7 @@ commit and gdl rev are printed, not checked.
 
 ```bash
 lib/llm/benches/callgrind.sh            # every row at 1 and 16 items
-lib/llm/benches/callgrind.sh b 1 b 16   # selected rows
+lib/llm/benches/callgrind.sh b-gdl 1 b-gdl 16   # selected rows
 ```
 
 ### How it counts
@@ -221,7 +228,7 @@ share of the base and a floor:
 | Rows | Per request | Per item |
 |---|---|---|
 | all but embeddings | 1%, at least 300 | 2%, at least 50 |
-| `embed`, `embeddings-gdl` | 3%, at least 300 | 6%, at least 50 |
+| `embeddings-gdl` | 3%, at least 300 | 6%, at least 50 |
 
 `HOTPATH_FLOOR` and `HOTPATH_ITEM_FLOOR` set the floors. For a merge gate, run with
 `HOTPATH_RUNS=3`: the script keeps each row's lowest count. A rise smaller than the tolerance

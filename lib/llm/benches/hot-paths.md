@@ -15,13 +15,12 @@ decoder stream, then the preprocessor's response transform, through the stream l
 the stages.
 
 - **Entry points:** `DecoderStream::poll_next` in `lib/llm/src/backend.rs` (Backend's stream over
-  the engine's stream, built by `Backend::generate_tokens` on the Dynamo pipeline and by the
-  backward half of Backend's around node on gdl), and
+  the engine's stream, built by the backward half of Backend's around node), and
   `transform_postprocessor_stream_with_image_tokens` in `lib/llm/src/preprocessor.rs`, with the
   in-place edits of `lib/llm/src/preprocessor/edit.rs` after the parsers, and
   `Migrated::poll_next` in `lib/llm/src/migration.rs` (Migration's stream over the active
   attempt, built by `Migration::migrate`).
-- **Guard:** `lib/llm/benches/hotpath.sh`, rows A, B and C in both forms: the `memcpy/item` and
+- **Guard:** `lib/llm/benches/hotpath.sh`, rows A, B and C (form `gdl`): the `memcpy/item` and
   `memcpy@16` columns, with no tolerance (the count is the same in every run of one build), and
   the `instr/item` column, tolerance 2% per item, at least 50 instructions. Two builds of the
   same tree agree within 0.25% per row (aarch64). One more move of an item costs about 100 to
@@ -167,6 +166,35 @@ the stages.
   So a new shape of `migrate` moves the copy and does not remove it. Two changes can remove
   it: keep the request in its box until `RetryManager` takes it, so that no 2 KB request
   moves when the future is built, or change how gdl's `compose::build` makes the future.
+
+- **The switch to one local pipeline:** the last table with both forms, before Dynamo's `link`
+  chain stopped composing the frontend's pipelines. Rows of form `dynamo` for A, B, C and
+  embeddings are Dynamo's local pipeline; from the switch on, `hotpath.sh` measures the gdl
+  form alone and skips those rows in a base. Measured on the x86_64 bench host, `hotpath.sh
+  --base` with `HOTPATH_RUNS=3`, head `fab21e5fac` (the same tree as the gdl port at
+  `220310d4e4`) against `cecbba9cdc`, 2026-11-05, unchanged:
+
+  ```text
+  # hotpath format=3 arch=x86_64 gdl=83319c8fb235 commit=fab21e5facc6
+  # base format=3 arch=x86_64 gdl=cbe60da85546 commit=accda4b4e3ff
+  pipeline     form    allocs allocs/item     instr instr/item memcpy memcpy/item allocs@16   instr@16 memcpy@16  range                change allocs@16    instr instr/item memcpy memcpy@16  mark
+  engine       -            7        1.00      8540        607     23        4.00        22      17650        83  7..7,22..22               0         0       -6         +0      0         0
+  A            dynamo     346       34.20    168580      19779    362       41.20       859     465259       980  346..346,859..859         0         0      +30       -206      0         0
+  A            gdl        328       34.20    162056      21118    338       51.20       841     478828      1106  328..328,841..841         0         0     -424        -24     -2        -2
+  B            dynamo     399       34.20    271438      20091    455       42.20       912     572803      1088  399..399,912..912         0         0     +136        +73      0         0
+  B            gdl        343       34.20    186412      21392    378       53.20       856     507289      1176  343..343,856..856         0         0      +28         +2      0         0
+  C            dynamo      71        1.00    117923        783    134        5.00        86     129671       209  71..71,86..86             0         0      +61         -5      0         0
+  C            gdl         38        1.00     27173       1389     74       10.00        53      48002       224  38..38,53..53             0         0      +14         +0      0         0
+  embed-engine -            8        1.00      5425        768      6        3.00        23      16943        51  8..8,23..23               0         0      +12         -0      0         0
+  embeddings   dynamo     199      138.93    103571      79941    168       90.80      2283    1302689      1530  199..199,2283..2284       0         0      -26        -49      0         0
+  embeddings   gdl        177      139.00     97903      79933    123       90.80      2262    1296892      1485  177..177,2261..2262       0         0      -45       -128      0         0
+  ingress      dynamo      49        3.00     49770       2755    139        7.00        94      91091       244  49..49,94..94             0         0      +36         -2      0         0
+  ```
+
+  Native gdl against Dynamo's chain in this table, per request at 1 item: A −3.9%, B −31%,
+  C −77%, embeddings −5.5% in instructions, and fewer allocations on every pipeline. Per extra
+  item: A +6.8%, B +6.5%, C +606 instructions, embeddings equal; most of the per-item gap is
+  `memcpy` (A and B 10 to 11 more calls per item).
 
 - **Not covered:** the window starts where the HTTP handler calls the engine. HTTP parsing, the
   handler's request metrics and SSE encoding are outside it, and the reasoning and tool-call

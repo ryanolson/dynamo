@@ -14,7 +14,7 @@
 #
 # Usage: lib/llm/benches/callgrind.sh [ROW ITEMS]...
 #   With no arguments it measures every row at 1 and 16 items.
-#   ROW is engine, a, a-gdl, b, b-gdl, c, c-gdl, embed-engine, embed, embeddings-gdl (see
+#   ROW is engine, a-gdl, b-gdl, c-gdl, embed-engine, embeddings-gdl (see
 #   tests/allocations.rs) or ingress (see lib/runtime/tests/ingress_allocations.rs).
 #   CALLGRIND_REQUESTS sets N (default 200). CALLGRIND_JOBS sets how many rows run at once
 #   (default: the number of CPUs). CALLGRIND_PROFILE sets the cargo profile (default
@@ -42,7 +42,7 @@
 # writes its counts, and a binary whose client requests did nothing writes only the count of the
 # whole run, so a number from either would be wrong.
 #
-# The gdl rows die with SIGSEGV under valgrind unless built with `--cfg rustix_use_libc`; see
+# The pipeline rows die with SIGSEGV under valgrind unless built with `--cfg rustix_use_libc`; see
 # the "callgrind.sh and hotpath.sh" section of benches/README.md for the build.
 
 set -euo pipefail
@@ -58,9 +58,8 @@ crate_dir=$(cd "$(dirname "$0")/.." && pwd)
 out_dir=$(mktemp -d "${TMPDIR:-/tmp}/callgrind.XXXXXX")
 
 if [[ $# -eq 0 ]]; then
-    set -- engine 1 engine 16 a 1 a 16 a-gdl 1 a-gdl 16 b 1 b 16 b-gdl 1 b-gdl 16 \
-        c 1 c 16 c-gdl 1 c-gdl 16 embed-engine 1 embed-engine 16 embed 1 embed 16 \
-        embeddings-gdl 1 embeddings-gdl 16 ingress 1 ingress 16
+    set -- engine 1 engine 16 a-gdl 1 a-gdl 16 b-gdl 1 b-gdl 16 c-gdl 1 c-gdl 16 \
+        embed-engine 1 embed-engine 16 embeddings-gdl 1 embeddings-gdl 16 ingress 1 ingress 16
 fi
 if (( $# % 2 != 0 )); then
     echo "callgrind.sh: arguments must be ROW ITEMS pairs" >&2

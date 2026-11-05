@@ -2,18 +2,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# The hot-path table: allocations and instructions per request, for each pipeline in both
-# forms, the dynamo form (`DYN_LOCAL_PIPELINE` unset, the default path) and the gdl form
-# (`DYN_LOCAL_PIPELINE=gdl`). It runs callgrind.sh for every row at 1 and 16 items.
+# The hot-path table: allocations and instructions per request, for each pipeline of the
+# frontend (form gdl, its only local pipeline), the stand-in engines (form -) and the worker's
+# Ingress (form dynamo). It runs callgrind.sh for every row at 1 and 16 items.
 #
 # Usage: lib/llm/benches/hotpath.sh [--base FILE]
 #   FILE is an earlier output of this script, with or without its change columns. With it, each
-#   row also shows its change, and the script marks
-#     RISE   a default-path row (form dynamo, or a stand-in engine) that got worse,
-#     WORSE  a gdl row that got worse,
-#   and exits 1 if it marked any row. "Worse" means any rise in allocations or memcpy calls, or
-#   a rise in instructions above the row's tolerance (below).
+#   row also shows its change, and the script marks RISE on every row that got worse and exits
+#   1 if it marked any. "Worse" means any rise in allocations or memcpy calls, or a rise in
+#   instructions above the row's tolerance (below).
 #   The environment variables of callgrind.sh apply, and HOTPATH_RUNS (below).
+#
+# A base may hold rows this script no longer measures: the dynamo form of A, B, C and
+# embeddings, from before gdl became the only local pipeline. The script skips them, names
+# each on stderr, and compares the rest. Tables of that time also mark a worse gdl row WORSE;
+# the parser still reads that mark in a base.
 #
 # The table's first line is its provenance: "# hotpath format=N arch=A gdl=REV commit=REV".
 # One strict parser reads the base and the new table. Each line must be the provenance, the
@@ -21,7 +24,7 @@
 # form must be one of the table's, once each, with none missing. The base must have the same
 # format and arch as this run. The script checks the base before the runs and fails on any
 # difference: a base it cannot compare would let a rise pass. Commit and gdl rev are printed,
-# not checked.
+# not checked. A retired row (above) is the only row a base may have that the table does not.
 #
 # Columns, per request:
 #   allocs, instr, memcpy    at 1 item
@@ -32,9 +35,9 @@
 #   range                    the lowest and highest allocations of a single request, at 1 and
 #                            at 16 items
 # For the embeddings rows, an item is an input; their stream has one item for any number.
-# A dynamo row's allocations are its typical request's. A gdl row's are its highest request's:
-# a gdl request can lose an allocation or two from its window, so its typical count moves
-# between runs.
+# A gdl row's allocations are its highest request's: a gdl request can lose an allocation or
+# two from its window, so its typical count moves between runs. The other rows' are their
+# typical request's.
 #
 # memcpy is the calls to memcpy and memmove (see callgrind.sh): each one is a move of a large
 # value, such as a stream item, that the compiler did not elide. One more move per item costs
@@ -74,16 +77,19 @@ fi
 # The embeddings rows' batch encode runs on rayon, whose idle threads spin a varying number of
 # times; their tolerance is wider.
 table_rows="engine - engine 1 2
-A dynamo a 1 2
 A gdl a-gdl 1 2
-B dynamo b 1 2
 B gdl b-gdl 1 2
-C dynamo c 1 2
 C gdl c-gdl 1 2
 embed-engine - embed-engine 1 2
-embeddings dynamo embed 3 6
 embeddings gdl embeddings-gdl 3 6
 ingress dynamo ingress 1 2"
+
+# pipeline form of the rows a base may hold and this script no longer measures: Dynamo's local
+# pipeline, retired when gdl became the only one. The last table with them is in hot-paths.md.
+retired_rows="A dynamo
+B dynamo
+C dynamo
+embeddings dynamo"
 
 runs=${HOTPATH_RUNS:-1}
 
@@ -108,9 +114,10 @@ trap 'rm -rf "$work"' EXIT
 # Reads one table strictly. Prints "prov FORMAT ARCH GDL COMMIT", then one
 # "row PIPELINE FORM ALLOCS ALLOCS@16 INSTR INSTR@16 MEMCPY MEMCPY@16" per row. Fails, naming the file and line,
 # on anything else. Every count it prints matched a whole-number pattern, so no count comes from
-# awk's reading of a number at the start of a field.
+# awk's reading of a number at the start of a field. With a second argument of 1 (a base), it
+# skips a retired row, and names it on stderr.
 parse_table() {
-    awk -v file="$1" -v table_rows="$table_rows" '
+    awk -v file="$1" -v table_rows="$table_rows" -v retired_rows="${2:+$retired_rows}" '
     function bad(msg) {
         printf "hotpath.sh: %s:%d: %s\n", file, FNR, msg > "/dev/stderr"
         failed = 1
@@ -122,6 +129,8 @@ parse_table() {
             split(lines[i], f, " ")
             want[f[1] " " f[2]] = 1
         }
+        n = split(retired_rows, lines, "\n")
+        for (i = 1; i <= n; i++) retired[lines[i]] = 1
         num = "[0-9]+"; dec = "-?[0-9]+[.][0-9][0-9]"; whole = "-?[0-9]+"; chg = "[+-]?[0-9]+"
         range = num "[.][.]" num "," num "[.][.]" num
         row = "^[^ ]+ +[^ ]+ +" num " +" dec " +" num " +" whole " +" num " +" dec " +" num " +" num
@@ -154,6 +163,10 @@ parse_table() {
     $0 ~ row {
         if (!header) bad("a row before the header")
         key = $1 " " $2
+        if (key in retired) {
+            printf "hotpath.sh: %s:%d: skipping %s, a retired row\n", file, FNR, key > "/dev/stderr"
+            next
+        }
         if (!(key in want)) bad("no such row in the table: " key)
         if (key in seen) bad("a second row for " key)
         seen[key] = 1
@@ -176,7 +189,7 @@ parse_table() {
 
 # Checks the base before the runs, which take minutes.
 if [[ -n $base ]]; then
-    parse_table "$base" >"$work/base.parsed" || exit 1
+    parse_table "$base" 1 >"$work/base.parsed" || exit 1
     read -r _ base_format base_arch base_gdl base_commit < <(grep '^prov ' "$work/base.parsed")
     if [[ $base_format != "$format" ]]; then
         echo "hotpath.sh: $base is table format $base_format; this script writes format $format" >&2
@@ -228,7 +241,7 @@ done
                 continue
             }
             # A gdl row can lose an allocation or two from some windows, so it reports its
-            # highest request. The dynamo rows report their typical request.
+            # highest request. The other rows report their typical request.
             if (form == "gdl") {
                 a = high[row, 1]; a16 = high[row, 16]
             } else {
@@ -288,7 +301,7 @@ FILENAME == ARGV[2] { next }
         || (r - br[key]) * 100 > tolerance100(br[key], pct[key], floor) \
         || (d - b_d) * 100 > tolerance100(b_d, item_pct[key], item_floor * 15)
     mark = ""
-    if (worse) { mark = $2 == "gdl" ? "WORSE" : "RISE"; marked++ }
+    if (worse) { mark = "RISE"; marked++ }
     printf "%s  %6s %9s %8s %10s %6s %9s  %s\n", $0, change(a, ba[key]), change(a16, ba16[key]),
         change(r, br[key]), sprintf("%+.0f", (d - b_d) / 15), change(m, bm[key]),
         change(m16, bm16[key]), mark

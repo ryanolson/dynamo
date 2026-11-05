@@ -165,23 +165,25 @@ for mode in segv logonly nosummary nowindow noallocs; do
 done
 
 # Rows run in parallel but print in argument order.
-FAKE_VALGRIND_MODE=ok run "$here/callgrind.sh" embeddings-gdl 16 a 1 c 1 b 16
-if [[ $status -ne 0 ]] || [[ $(awk 'NR > 1 { printf "%s ", $1 }' "$work/stdout") != "embeddings-gdl a c b " ]]; then
+FAKE_VALGRIND_MODE=ok run "$here/callgrind.sh" embeddings-gdl 16 a-gdl 1 c-gdl 1 b-gdl 16
+if [[ $status -ne 0 ]] || [[ $(awk 'NR > 1 { printf "%s ", $1 }' "$work/stdout") != "embeddings-gdl a-gdl c-gdl b-gdl " ]]; then
     fail order "exit status $status, want 0 and rows in argument order"
 else
     echo "ok callgrind.sh order"
 fi
 
-# hotpath.sh: the table. A dynamo: 1 + 1 = 2 allocations, 1010 instructions and 3 memcpy calls
-# at 1 item, 17, 1160 and 18 at 16, so 1.00 allocations, 10 instructions and 1.00 memcpy calls
-# per extra item.
+# hotpath.sh: the table. A gdl (a-gdl): 5 + 1 = 6 allocations, 5010 instructions and 11 memcpy
+# calls at 1 item, 21, 5160 and 26 at 16, so 1.00 allocations, 10 instructions and 1.00 memcpy
+# calls per extra item. No row of Dynamo's retired local pipeline.
 FAKE_VALGRIND_MODE=ok run "$here/hotpath.sh"
 if [[ $status -ne 0 ]]; then
     fail table "exit status $status, want 0"
-elif ! grep -Eq '^A +dynamo +2 +1\.00 +1010 +10 +3 +1\.00 +17 +1160 +18 +2\.\.2,17\.\.17 *$' "$work/stdout"; then
-    fail table "no 'A dynamo 2 1.00 1010 10 3 1.00 17 1160 18 2..2,17..17' row"
-elif [[ $(grep -Ec '^(engine|A|B|C|embed-engine|embeddings|ingress) ' "$work/stdout") -ne 11 ]]; then
-    fail table "want 11 rows"
+elif ! grep -Eq '^A +gdl +6 +1\.00 +5010 +10 +11 +1\.00 +21 +5160 +26 +6\.\.6,21\.\.21 *$' "$work/stdout"; then
+    fail table "no 'A gdl 6 1.00 5010 10 11 1.00 21 5160 26 6..6,21..21' row"
+elif [[ $(grep -Ec '^(engine|A|B|C|embed-engine|embeddings|ingress) ' "$work/stdout") -ne 7 ]]; then
+    fail table "want 7 rows"
+elif grep -Eq '^(A|B|C|embeddings) +dynamo ' "$work/stdout"; then
+    fail table "a retired row is in the table"
 else
     echo "ok hotpath.sh table"
 fi
@@ -205,18 +207,18 @@ else
 fi
 
 # One more allocation per request on the default path: RISE, exit 1.
-FAKE_RISE_ROW=b FAKE_RISE_ALLOCS=1 run "$here/hotpath.sh" --base "$work/base"
-if [[ $status -ne 1 ]] || ! grep -Eq '^B +dynamo .* RISE$' "$work/stdout" \
+FAKE_RISE_ROW=b-gdl FAKE_RISE_ALLOCS=1 run "$here/hotpath.sh" --base "$work/base"
+if [[ $status -ne 1 ]] || ! grep -Eq '^B +gdl .* RISE$' "$work/stdout" \
     || [[ $(grep -Ec 'RISE|WORSE' "$work/stdout") -ne 1 ]]; then
-    fail rise "exit status $status, want 1 and one RISE on B dynamo"
+    fail rise "exit status $status, want 1 and one RISE on B gdl"
 else
     echo "ok hotpath.sh rise"
 fi
 
 # One more memcpy call per request at 16 items, a move of an item in one of 15 requests' worth
-# of items: far below the instruction tolerance, but RISE on the default path and WORSE on a
-# gdl row.
-for memcpy_case in "b B dynamo RISE" "a-gdl A gdl WORSE"; do
+# of items: far below the instruction tolerance, but RISE, on a gdl row and on the worker's
+# Ingress row alike.
+for memcpy_case in "b-gdl B gdl RISE" "ingress ingress dynamo RISE"; do
     read -r rise_row pipeline form want_mark <<<"$memcpy_case"
     FAKE_RISE_ROW=$rise_row FAKE_RISE_ITEMS=16 FAKE_RISE_MEMCPY=1 FAKE_RISE_INSTR=150 \
         run "$here/hotpath.sh" --base "$work/base"
@@ -229,28 +231,28 @@ for memcpy_case in "b B dynamo RISE" "a-gdl A gdl WORSE"; do
 done
 
 # A single extra copy in the measured window must survive request-count normalization.
-FAKE_RISE_ROW=b FAKE_RISE_ITEMS=16 FAKE_RISE_WINDOW_MEMCPY=1 \
+FAKE_RISE_ROW=b-gdl FAKE_RISE_ITEMS=16 FAKE_RISE_WINDOW_MEMCPY=1 \
     run "$here/hotpath.sh" --base "$work/base"
 if [[ $status -eq 0 ]]; then
-    fail memcpy-window-rise "the window gained one memcpy call across four requests (72 to 73), want non-zero exit; got exit 0"
+    fail memcpy-window-rise "the window gained one memcpy call across four requests (104 to 105), want non-zero exit; got exit 0"
 else
     echo "ok hotpath.sh memcpy-window-rise"
 fi
 
-# A gdl row with more instructions than the tolerance: WORSE, exit 1.
+# A gdl row with more instructions than the tolerance: RISE, exit 1.
 FAKE_RISE_ROW=c-gdl FAKE_RISE_INSTR=2000 run "$here/hotpath.sh" --base "$work/base"
-if [[ $status -ne 1 ]] || ! grep -Eq '^C +gdl .* WORSE$' "$work/stdout"; then
-    fail worse "exit status $status, want 1 and WORSE on C gdl"
+if [[ $status -ne 1 ]] || ! grep -Eq '^C +gdl .* RISE$' "$work/stdout"; then
+    fail instructions "exit status $status, want 1 and RISE on C gdl"
 else
-    echo "ok hotpath.sh worse"
+    echo "ok hotpath.sh instructions"
 fi
 
 # An instruction rise within the tolerance (300 instructions for a row this small): shown, not
 # marked.
-FAKE_RISE_ROW=a FAKE_RISE_INSTR=200 run "$here/hotpath.sh" --base "$work/base"
+FAKE_RISE_ROW=a-gdl FAKE_RISE_INSTR=200 run "$here/hotpath.sh" --base "$work/base"
 if [[ $status -ne 0 ]] || grep -Eq 'RISE|WORSE' "$work/stdout" \
-    || ! grep -Eq '^A +dynamo .* \+200 ' "$work/stdout"; then
-    fail tolerance "exit status $status, want 0, no mark, and +200 on A dynamo"
+    || ! grep -Eq '^A +gdl .* \+200 ' "$work/stdout"; then
+    fail tolerance "exit status $status, want 0, no mark, and +200 on A gdl"
 else
     echo "ok hotpath.sh tolerance"
 fi
@@ -264,18 +266,18 @@ else
 fi
 
 # A gdl row whose typical request makes 2 allocations fewer reports its highest request, and
-# its range shows the low one: no change, no mark. A dynamo row reports its typical request.
+# its range shows the low one: no change, no mark. Another row reports its typical request.
 FAKE_FLIP_ROW=b-gdl run "$here/hotpath.sh" --base "$work/base"
 if [[ $status -ne 0 ]] || ! grep -Eq '^B +gdl +6 .* 4\.\.6,19\.\.21 +0 ' "$work/stdout"; then
     fail gdl-highest "exit status $status, want 0 and B gdl at 6 with range 4..6,19..21"
 else
     echo "ok hotpath.sh gdl-highest"
 fi
-FAKE_FLIP_ROW=b run "$here/hotpath.sh"
-if [[ $status -ne 0 ]] || ! grep -Eq '^B +dynamo +0 .* 0\.\.2,15\.\.17 *$' "$work/stdout"; then
-    fail dynamo-typical "exit status $status, want 0 and B dynamo at its typical 0"
+FAKE_FLIP_ROW=ingress run "$here/hotpath.sh"
+if [[ $status -ne 0 ]] || ! grep -Eq '^ingress +dynamo +6 .* 6\.\.8,21\.\.23 *$' "$work/stdout"; then
+    fail other-typical "exit status $status, want 0 and ingress at its typical 6"
 else
-    echo "ok hotpath.sh dynamo-typical"
+    echo "ok hotpath.sh other-typical"
 fi
 
 # A failed run fails the table.
@@ -287,15 +289,15 @@ else
 fi
 
 # A one-allocation rise at 16 items must survive the displayed slope's rounding.
-FAKE_RISE_ROW=b FAKE_RISE_ITEMS=16 FAKE_RISE_ALLOCS=1 run "$here/hotpath.sh"
+FAKE_RISE_ROW=b-gdl FAKE_RISE_ITEMS=16 FAKE_RISE_ALLOCS=1 run "$here/hotpath.sh"
 if [[ $status -ne 0 ]]; then
     fail item-allocations-base "exit status $status, want 0"
 else
     cp "$work/stdout" "$work/item-base"
-    FAKE_RISE_ROW=b FAKE_RISE_ITEMS=16 FAKE_RISE_ALLOCS=2 \
+    FAKE_RISE_ROW=b-gdl FAKE_RISE_ITEMS=16 FAKE_RISE_ALLOCS=2 \
         run "$here/hotpath.sh" --base "$work/item-base"
-    if [[ $status -ne 1 ]] || ! grep -Eq '^B +dynamo .* RISE$' "$work/stdout"; then
-        fail item-allocations "16-item allocations rose from 18 to 19, want exit 1 and RISE on B dynamo"
+    if [[ $status -ne 1 ]] || ! grep -Eq '^B +gdl .* RISE$' "$work/stdout"; then
+        fail item-allocations "16-item allocations rose from 22 to 23, want exit 1 and RISE on B gdl"
     else
         echo "ok hotpath.sh item-allocations"
     fi
@@ -305,17 +307,17 @@ fi
 : >"$work/empty-base"
 awk '{ print $1, $2, $3, $4, $5, $6 }' "$work/base" >"$work/six-column-base"
 for base_case in empty six-column; do
-    FAKE_RISE_ROW=b FAKE_RISE_ALLOCS=1 \
+    FAKE_RISE_ROW=b-gdl FAKE_RISE_ALLOCS=1 \
         run "$here/hotpath.sh" --base "$work/$base_case-base"
     if [[ $status -eq 0 ]]; then
-        fail "base-$base_case" "accepted a base without comparable rows despite B dynamo gaining an allocation"
+        fail "base-$base_case" "accepted a base without comparable rows despite B gdl gaining an allocation"
     else
         echo "ok hotpath.sh base-$base_case"
     fi
 done
 
 # A truncated base cannot establish whether the missing row regressed.
-head -n 11 "$work/base" >"$work/truncated-base"
+sed '$d' "$work/base" >"$work/truncated-base"
 FAKE_RISE_ROW=ingress FAKE_RISE_ALLOCS=1 \
     run "$here/hotpath.sh" --base "$work/truncated-base"
 if [[ $status -eq 0 ]]; then
@@ -327,7 +329,7 @@ fi
 # A rise equal to the instruction tolerance must pass, including fractional per-item counts.
 for boundary_case in "floor 62 750" "percent 37450 752"; do
     read -r boundary_name base_rise allowed_rise <<<"$boundary_case"
-    FAKE_RISE_ROW=b FAKE_RISE_ITEMS=16 FAKE_RISE_INSTR=$base_rise \
+    FAKE_RISE_ROW=b-gdl FAKE_RISE_ITEMS=16 FAKE_RISE_INSTR=$base_rise \
         run "$here/hotpath.sh"
     if [[ $status -ne 0 ]]; then
         fail "item-$boundary_name-base" "exit status $status, want 0"
@@ -337,15 +339,15 @@ for boundary_case in "floor 62 750" "percent 37450 752"; do
     for offset in -1 0 1; do
         want=0
         ((offset > 0)) && want=1
-        FAKE_RISE_ROW=b FAKE_RISE_ITEMS=16 \
+        FAKE_RISE_ROW=b-gdl FAKE_RISE_ITEMS=16 \
             FAKE_RISE_INSTR=$((base_rise + allowed_rise + offset)) \
             run "$here/hotpath.sh" --base "$work/boundary-base"
         if [[ $status -ne $want ]]; then
             fail "item-$boundary_name-$offset" "exit status $status, want $want at tolerance offset $offset/15"
         elif [[ $want -eq 0 ]] && grep -Eq 'RISE|WORSE' "$work/stdout"; then
             fail "item-$boundary_name-$offset" "marked a rise within the tolerance"
-        elif [[ $want -eq 1 ]] && ! grep -Eq '^B +dynamo .* RISE$' "$work/stdout"; then
-            fail "item-$boundary_name-$offset" "did not mark B dynamo above the tolerance"
+        elif [[ $want -eq 1 ]] && ! grep -Eq '^B +gdl .* RISE$' "$work/stdout"; then
+            fail "item-$boundary_name-$offset" "did not mark B gdl above the tolerance"
         else
             echo "ok hotpath.sh item-$boundary_name-$offset"
         fi
@@ -354,20 +356,20 @@ done
 
 # Conflicting duplicate rows must not hide an allocation rise behind the last row.
 cp "$work/base" "$work/duplicate-base"
-awk '$1 == "B" && $2 == "dynamo" { $3++; $9++; $12 = $3 ".." $3 "," $9 ".." $9; print }' "$work/base" \
+awk '$1 == "B" && $2 == "gdl" { $3++; $9++; $12 = $3 ".." $3 "," $9 ".." $9; print }' "$work/base" \
     >>"$work/duplicate-base"
-FAKE_RISE_ROW=b FAKE_RISE_ALLOCS=1 \
+FAKE_RISE_ROW=b-gdl FAKE_RISE_ALLOCS=1 \
     run "$here/hotpath.sh" --base "$work/duplicate-base"
 if [[ $status -eq 0 ]]; then
-    fail base-duplicate "accepted conflicting B dynamo rows and hid allocation rises from 2 to 3 and 17 to 18"
+    fail base-duplicate "accepted conflicting B gdl rows and hid allocation rises from 6 to 7 and 21 to 22"
 else
     echo "ok hotpath.sh base-duplicate"
 fi
 
 # A nonnumeric instruction count cannot establish the per-item tolerance.
-awk '$1 == "B" && $2 == "dynamo" { $10 = "999999junk" } { print }' "$work/base" \
+awk '$1 == "B" && $2 == "gdl" { $10 = "999999junk" } { print }' "$work/base" \
     >"$work/nonnumeric-instructions-base"
-FAKE_RISE_ROW=b FAKE_RISE_ITEMS=16 FAKE_RISE_INSTR=751 \
+FAKE_RISE_ROW=b-gdl FAKE_RISE_ITEMS=16 FAKE_RISE_INSTR=751 \
     run "$here/hotpath.sh" --base "$work/nonnumeric-instructions-base"
 if [[ $status -eq 0 ]]; then
     fail base-nonnumeric-instructions "accepted a nonnumeric instr@16 and hid an instruction rise of 751/15 above the floor of 50 per item"
@@ -387,10 +389,10 @@ fi
 # has a rise it would otherwise mark. Each case: name, then a sed script applied to the base.
 while IFS='|' read -r case_name edit; do
     sed -e "$edit" "$work/base" >"$work/bad-base"
-    FAKE_RISE_ROW=b FAKE_RISE_ALLOCS=1 run "$here/hotpath.sh" --base "$work/bad-base"
+    FAKE_RISE_ROW=b-gdl FAKE_RISE_ALLOCS=1 run "$here/hotpath.sh" --base "$work/bad-base"
     if [[ $status -eq 0 ]]; then
         fail "base-$case_name" "accepted the base"
-    elif grep -Eq '^B +dynamo ' "$work/stdout"; then
+    elif grep -Eq '^B +gdl ' "$work/stdout"; then
         fail "base-$case_name" "printed a table from a base it should reject"
     elif grep -q 'callgrind output:' "$work/stderr"; then
         fail "base-$case_name" "ran callgrind before rejecting the base"
@@ -399,8 +401,8 @@ while IFS='|' read -r case_name edit; do
     fi
 done <<'CASES'
 garbage-line|$a hello
-unexpected-row|/^C  *dynamo /{p;s/^C /D /}
-renamed-row|s/^C  *dynamo /D      dynamo /
+unexpected-row|/^C  *gdl /{p;s/^C /D /}
+renamed-row|s/^C  *gdl /D      gdl /
 no-provenance|1d
 second-provenance|1p
 arch|1s/arch=[^ ]*/arch=riscv64/
@@ -420,12 +422,51 @@ FAKE_VALGRIND_MODE=ok run "$here/hotpath.sh" --base "$work/compared-base"
 if [[ $status -ne 0 ]] || grep -Eq 'RISE|WORSE' "$work/stdout"; then
     fail compared-base "exit status $status against a --base table, want 0 and no marks"
 else
-    FAKE_RISE_ROW=b FAKE_RISE_ALLOCS=1 run "$here/hotpath.sh" --base "$work/compared-base"
-    if [[ $status -ne 1 ]] || ! grep -Eq '^B +dynamo .* RISE$' "$work/stdout"; then
-        fail compared-base "exit status $status, want 1 and RISE on B dynamo"
+    FAKE_RISE_ROW=b-gdl FAKE_RISE_ALLOCS=1 run "$here/hotpath.sh" --base "$work/compared-base"
+    if [[ $status -ne 1 ]] || ! grep -Eq '^B +gdl .* RISE$' "$work/stdout"; then
+        fail compared-base "exit status $status, want 1 and RISE on B gdl"
     else
         echo "ok hotpath.sh compared-base"
     fi
+fi
+
+# A base from before gdl became the only local pipeline: it has the dynamo rows of A, B, C and
+# embeddings, which this script no longer measures, and a gdl row marked WORSE, as tables of
+# that time marked a worse gdl row. The script skips each retired row, names it on stderr,
+# and compares the rest: unchanged counts pass, and a rise is still marked.
+awk '
+    { print }
+    $1 ~ /^(A|B|C|embeddings)$/ && $2 == "gdl" { $2 = "dynamo"; print }
+' "$work/compared-base" | sed -E '/^C +gdl /s/ *$/  WORSE/' >"$work/both-forms-base"
+if [[ $(grep -Ec '^(A|B|C|embeddings) +dynamo ' "$work/both-forms-base") -ne 4 ]] \
+    || ! grep -Eq '^C +gdl .* WORSE$' "$work/both-forms-base"; then
+    fail both-forms-base "the test did not build a both-forms base"
+fi
+FAKE_VALGRIND_MODE=ok run "$here/hotpath.sh" --base "$work/both-forms-base"
+if [[ $status -ne 0 ]] || grep -Eq 'RISE|WORSE' "$work/stdout"; then
+    fail both-forms-base "exit status $status against a both-forms base, want 0 and no marks"
+elif [[ $(grep -Ec 'skipping (A|B|C|embeddings) dynamo, a retired row' "$work/stderr") -ne 4 ]]; then
+    fail both-forms-base "stderr does not name each of the 4 retired rows"
+elif grep -Eq '^(A|B|C|embeddings) +dynamo ' "$work/stdout"; then
+    fail both-forms-base "a retired row is in the table"
+else
+    FAKE_RISE_ROW=b-gdl FAKE_RISE_ALLOCS=1 run "$here/hotpath.sh" --base "$work/both-forms-base"
+    if [[ $status -ne 1 ]] || ! grep -Eq '^B +gdl .* RISE$' "$work/stdout" \
+        || [[ $(grep -Ec 'RISE|WORSE' "$work/stdout") -ne 1 ]]; then
+        fail both-forms-base "exit status $status, want 1 and one RISE on B gdl"
+    else
+        echo "ok hotpath.sh both-forms-base"
+    fi
+fi
+
+# Only a retired row is skipped: a base row of the dynamo form for a pipeline that never had
+# one is still an error.
+sed -E '/^engine +- /{p;s/^engine +- /engine dynamo /}' "$work/base" >"$work/unknown-dynamo-base"
+FAKE_VALGRIND_MODE=ok run "$here/hotpath.sh" --base "$work/unknown-dynamo-base"
+if [[ $status -eq 0 ]] || ! grep -q 'no such row in the table: engine dynamo' "$work/stderr"; then
+    fail base-unknown-dynamo "exit status $status, want non-zero and the unknown row named"
+else
+    echo "ok hotpath.sh base-unknown-dynamo"
 fi
 
 if ((failures > 0)); then
