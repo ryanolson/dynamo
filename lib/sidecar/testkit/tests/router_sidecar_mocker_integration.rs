@@ -5,12 +5,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dynamo_backend_common::{BackendError, DisaggregationMode, FinishReason, LLMEngine};
+use dynamo_gdl_adapters::{Boxed, EngineSink, PipelineEngine};
 use dynamo_llm::discovery::{LoadThresholdHandle, ModelManager};
 use dynamo_llm::kv_router::PrefillRouter;
 use dynamo_llm::model_card::TokenizerKind;
+use dynamo_llm::operator::GdlOperator;
+use dynamo_llm::protocols::common::llm_backend::{LLMEngineOutput, PreprocessedRequest};
 use dynamo_llm::session_affinity::SessionAffinityMode;
 use dynamo_llm::worker_type::WorkerType;
-use dynamo_runtime::pipeline::{AsyncEngine, AsyncEngineContextProvider, Operator, RouterMode};
+use dynamo_runtime::pipeline::{
+    AsyncEngine, AsyncEngineContextProvider, ManyOut, RouterMode, SingleIn,
+};
+use dynamo_runtime::protocols::annotated::Annotated;
 use dynamo_sidecar_testkit::{
     assert::{failure, terminal},
     bounded,
@@ -724,6 +730,31 @@ async fn load_loss_withdraws_worker_and_fails_the_process() {
     peer.shutdown().await;
 }
 
+/// `router` over `decode` as the frontend's gdl pipeline runs it: a native operator over the
+/// hop to `decode`, rooted as the routed pipelines are.
+fn prefill_on_gdl(
+    router: &Arc<PrefillRouter>,
+    decode: Arc<process::Router>,
+) -> Arc<
+    dyn AsyncEngine<
+            SingleIn<PreprocessedRequest>,
+            ManyOut<Annotated<LLMEngineOutput>>,
+            anyhow::Error,
+        >,
+> {
+    type Pre = PreprocessedRequest;
+    let decode = gdl::Hop::new(
+        (),
+        gdl::SinkStage::new(Arc::new(EngineSink::<_, Pre, _, Boxed<Pre>>::new(decode))),
+        (),
+    );
+    let prefill =
+        gdl::OperatorStage::new(Arc::new(GdlOperator::<_, Pre>::new(router.clone())), decode);
+    Arc::new(PipelineEngine::<_, Pre, LLMEngineOutput, Boxed<Pre>>::new(
+        gdl::Hop::new((), prefill, ()),
+    ))
+}
+
 async fn ready(router: &PrefillRouter) {
     bounded("real PrefillRouter availability", async {
         loop {
@@ -831,7 +862,7 @@ async fn prefill_router_preserves_handoff_failure_and_cancellation<
         let observed_decode = decode_control.request(id, RequestPlan::default());
         let stream = bounded(
             "prefill/decode handoff",
-            router.generate(env.request(id, 3), decode_router.clone()),
+            prefill_on_gdl(&router, decode_router.clone()).generate(env.request(id, 3)),
         )
         .await
         .unwrap();
@@ -869,7 +900,7 @@ async fn prefill_router_preserves_handoff_failure_and_cancellation<
     let unsubmitted = decode_control.request("failed-prefill", RequestPlan::default());
     let result = bounded(
         "failed prefill",
-        router.generate(env.request("failed-prefill", 3), decode_router.clone()),
+        prefill_on_gdl(&router, decode_router.clone()).generate(env.request("failed-prefill", 3)),
     )
     .await;
     if !P::HAS_BOOTSTRAP {
@@ -912,7 +943,8 @@ async fn prefill_router_preserves_handoff_failure_and_cancellation<
     );
     let request = env.request("cancel-handoff", 3);
     let context = request.context();
-    let generation = router.generate(request, decode_router.clone());
+    let pipeline = prefill_on_gdl(&router, decode_router.clone());
+    let generation = pipeline.generate(request);
     tokio::pin!(generation);
     let stream = bounded("decode request accepted during handoff", async {
         tokio::select! {
@@ -975,11 +1007,8 @@ async fn prefill_router_preserves_handoff_failure_and_cancellation<
     decode_peer.scheduler_idle().await;
     let p = prefill_control.request("after-handoff-cancel", RequestPlan::default());
     let d = decode_control.request("after-handoff-cancel", RequestPlan::default());
-    let stream = router
-        .generate(
-            env.request("after-handoff-cancel", 3),
-            decode_router.clone(),
-        )
+    let stream = prefill_on_gdl(&router, decode_router.clone())
+        .generate(env.request("after-handoff-cancel", 3))
         .await
         .unwrap();
     terminal(outputs(stream).await, &d.tokens(), 4, FinishReason::Length);
