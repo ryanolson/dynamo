@@ -1060,11 +1060,11 @@ mod tests {
 
     /// Once the encode worker has emitted a transfer handle, the encoder router hands it to the
     /// stage below even when the caller is killed as the handle arrives: the receiver owns the
-    /// transfer and its buffer. On pipeline C composed on gdl the kill cancels the pipeline's
-    /// `Cx`, so the handle must still go on, as it does on Dynamo's chain.
+    /// transfer and its buffer. On pipeline C the kill cancels the pipeline's `Cx`, so the handle
+    /// must still go on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn routed_pipelines_hand_the_encode_result_on_after_a_kill_at_the_encode_hop() {
-        use crate::entrypoint::input::{LocalPipeline, PreprocessedRouting};
+        use crate::entrypoint::input::PreprocessedRouting;
         use crate::http::service::metrics::Metrics;
         use crate::kv_router::PrefillRouter;
         use dynamo_runtime::pipeline::PushRouterOptions;
@@ -1075,87 +1075,78 @@ mod tests {
                 .await
                 .unwrap();
         let card = ModelDeploymentCard::with_name_only("model");
-        let mut seen = Vec::new();
-        // Transition: remove the Dynamo case and keep the gdl assertions when the gdl pipeline is
-        // the only local pipeline.
-        for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
-            let name = local_pipeline.as_str();
-            let endpoint = distributed
-                .namespace(format!("encode-kill-{name}"))
-                .unwrap()
-                .component("workers")
-                .unwrap()
-                .endpoint("encode");
-            let client = endpoint.client().await.unwrap();
-            endpoint.register_endpoint_instance().await.unwrap();
-            client.wait_for_instances().await.unwrap();
+        let endpoint = distributed
+            .namespace("encode-kill")
+            .unwrap()
+            .component("workers")
+            .unwrap()
+            .endpoint("encode");
+        let client = endpoint.client().await.unwrap();
+        endpoint.register_endpoint_instance().await.unwrap();
+        client.wait_for_instances().await.unwrap();
 
-            let request = Context::new(multimodal_request());
-            let caller = request.context();
-            let options = PushRouterOptions {
-                dispatch: Some(Arc::new(KillOnEncode {
-                    caller: caller.clone(),
-                }) as Arc<_>),
-                ..Default::default()
-            };
-            let push =
-                EncodePushRouter::from_client_with_options(client, RouterMode::RoundRobin, options)
-                    .await
-                    .unwrap();
-            // The router's view of the instances can lag the client's: wait until it can
-            // select the worker, or the encode hop falls back without encoding.
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while push
-                    .selectable_worker_ids()
-                    .map_or(true, |ids| ids.is_empty())
-                {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-            })
-            .await
-            .expect("the encode router sees its worker");
-            let encoder = EncoderRouter::disabled();
-            encoder.binding.store(Some(Arc::new(EncoderBinding {
-                target_id: WorkerSetTargetId::Legacy(endpoint.id()),
-                router: Arc::new(push),
-            })));
-            encoder
-                .lifecycle
-                .store(EncoderLifecycleState::Active as u8, Ordering::Release);
-            let receiver = Arc::new(HandleReceiver::default());
-            let pipeline = PreprocessedRouting::new(
-                receiver.clone(),
-                PrefillRouter::disabled(
-                    Arc::new(crate::discovery::ModelManager::new()),
-                    RouterMode::RoundRobin,
-                    None,
-                ),
-                encoder,
-            )
-            .with_local_pipeline(local_pipeline)
-            .build_preprocessed_pipeline(&card, 0, None, Arc::new(Metrics::new()))
-            .unwrap();
-
-            let call = tokio::time::timeout(Duration::from_secs(5), pipeline.generate(request))
+        let request = Context::new(multimodal_request());
+        let caller = request.context();
+        let options = PushRouterOptions {
+            dispatch: Some(Arc::new(KillOnEncode {
+                caller: caller.clone(),
+            }) as Arc<_>),
+            ..Default::default()
+        };
+        let push =
+            EncodePushRouter::from_client_with_options(client, RouterMode::RoundRobin, options)
                 .await
-                .expect("the call ends");
-            if let Ok(stream) = call {
-                let _: Vec<_> = stream.collect().await;
+                .unwrap();
+        // The router's view of the instances can lag the client's: wait until it can
+        // select the worker, or the encode hop falls back without encoding.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while push
+                .selectable_worker_ids()
+                .map_or(true, |ids| ids.is_empty())
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
-            assert!(caller.is_killed(), "the encode worker kills the caller");
-            let _ = tokio::time::timeout(Duration::from_secs(5), async {
-                while receiver.results.lock().unwrap().is_empty() {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-            })
-            .await;
-            let results = receiver.results.lock().unwrap().clone();
-            seen.push((name, results));
+        })
+        .await
+        .expect("the encode router sees its worker");
+        let encoder = EncoderRouter::disabled();
+        encoder.binding.store(Some(Arc::new(EncoderBinding {
+            target_id: WorkerSetTargetId::Legacy(endpoint.id()),
+            router: Arc::new(push),
+        })));
+        encoder
+            .lifecycle
+            .store(EncoderLifecycleState::Active as u8, Ordering::Release);
+        let receiver = Arc::new(HandleReceiver::default());
+        let pipeline = PreprocessedRouting::new(
+            receiver.clone(),
+            PrefillRouter::disabled(
+                Arc::new(crate::discovery::ModelManager::new()),
+                RouterMode::RoundRobin,
+                None,
+            ),
+            encoder,
+        )
+        .build_preprocessed_pipeline(&card, 0, None, Arc::new(Metrics::new()))
+        .unwrap();
+
+        let call = tokio::time::timeout(Duration::from_secs(5), pipeline.generate(request))
+            .await
+            .expect("the call ends");
+        if let Ok(stream) = call {
+            let _: Vec<_> = stream.collect().await;
         }
+        assert!(caller.is_killed(), "the encode worker kills the caller");
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            while receiver.results.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        let results = receiver.results.lock().unwrap().clone();
         runtime.shutdown();
 
-        let handed_on = vec![Some(json!({"handle": "staged-embeddings"}))];
-        assert_eq!(seen, [("dynamo", handed_on.clone()), ("gdl", handed_on)]);
+        assert_eq!(results, [Some(json!({"handle": "staged-embeddings"}))]);
     }
 
     /// Discovery may activate the encoder between the native shim and its body. An encode

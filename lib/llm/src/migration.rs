@@ -35,7 +35,7 @@ use dynamo_runtime::engine::Data;
 use dynamo_runtime::error::{self, DynamoError, ErrorReason, ErrorType};
 use dynamo_runtime::metrics::prometheus_names::frontend_service;
 use dynamo_runtime::pipeline::{
-    AsyncEngineContext, AsyncEngineContextProvider, Context, ManyOut, Operator, PipelineOperator,
+    AsyncEngineContext, AsyncEngineContextProvider, Context, ManyOut, Operator,
     ServerStreamingEngine, SingleIn, attach_first_response_guard,
     network::egress::route_span::{RouteTraceContext, attach_route_trace_context, error_type_name},
 };
@@ -283,26 +283,6 @@ impl Migration {
             mdc.display_name.clone(),
             metrics,
         )
-    }
-
-    /// Wrap as a `PipelineOperator` over the given response type to
-    /// disambiguate between the `Operator` impls on `Migration` since
-    /// the response type doesn't appear in the struct.
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn into_operator_for<Resp>(
-        self: &Arc<Self>,
-    ) -> Arc<
-        PipelineOperator<
-            SingleIn<PreprocessedRequest>,
-            ManyOut<Annotated<Resp>>,
-            SingleIn<PreprocessedRequest>,
-            ManyOut<Annotated<Resp>>,
-        >,
-    >
-    where
-        Resp: Data + HasTokenIds,
-    {
-        Operator::into_operator(self)
     }
 }
 

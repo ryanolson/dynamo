@@ -1,10 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Allocations per request through the adapters, against Dynamo's `link`
-//! chain over the same engine and the same identity operators, and against
-//! native gdl operators that read their downstream as Dynamo's native
-//! operators do (`dynamo_llm::operator`).
+//! Allocations per request through the adapters and native gdl operators
+//! that read their downstream as Dynamo's native operators do
+//! (`dynamo_llm::operator`), over an engine alone.
 //!
 //! Run with `--nocapture` to see the table. The counts are per request after
 //! a warm-up, on a current-thread runtime, so every allocation is the
@@ -18,8 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use dynamo_gdl_adapters::{AnnotatedItems, CxBridge, EngineSink, PipelineEngine};
 use dynamo_runtime::engine::{AsyncEngine, ResponseStream};
 use dynamo_runtime::pipeline::{
-    AsyncEngineContextProvider, Context, Error, ManyOut, Operator, ServiceBackend, ServiceFrontend,
-    SingleIn, Source as _, async_trait,
+    AsyncEngineContextProvider, Context, Error, ManyOut, SingleIn, async_trait,
 };
 use dynamo_runtime::protocols::annotated::Annotated;
 use futures::{StreamExt, stream};
@@ -83,23 +81,6 @@ impl AsyncEngine<SingleIn<u32>, Out, Error> for Repeat {
     }
 }
 
-/// Calls `next` and re-wraps its stream with the same context, as Dynamo's
-/// operators do.
-struct Identity;
-
-#[async_trait]
-impl Operator<SingleIn<u32>, Out, SingleIn<u32>, Out> for Identity {
-    async fn generate(
-        &self,
-        request: SingleIn<u32>,
-        next: Arc<dyn AsyncEngine<SingleIn<u32>, Out, Error>>,
-    ) -> Result<Out, Error> {
-        let stream = next.generate(request).await?;
-        let context = stream.context();
-        Ok(ResponseStream::new(Box::pin(stream), context))
-    }
-}
-
 /// The identity as a native gdl operator, shaped as Backend's and the
 /// preprocessor's are: it keeps the request's Dynamo context, reads its
 /// downstream through `AnnotatedItems`, and boxes its response once.
@@ -127,38 +108,6 @@ impl gdl::Operator for NativeIdentity {
             AnnotatedItems::new(items, root, context).map(Ok),
         ))
     }
-}
-
-/// `stages` identity operators above `engine` in one `link` chain, as
-/// `lib/llm/src/entrypoint/input/common.rs` builds its pipelines.
-///
-/// Transition: remove when the gdl pipeline is the only local pipeline.
-fn link(stages: usize, engine: Engine) -> Engine {
-    let operators: Vec<_> = (0..stages)
-        .map(|_| Operator::into_operator(&Arc::new(Identity)))
-        .collect();
-    let frontend = ServiceFrontend::<SingleIn<u32>, Out>::new();
-    let backend = ServiceBackend::from_engine(engine);
-    let Some((first, rest)) = operators.split_first() else {
-        return frontend
-            .link(backend)
-            .unwrap()
-            .link_terminal(frontend)
-            .unwrap();
-    };
-    let mut forward = frontend.link(first.forward_edge()).unwrap();
-    for operator in rest {
-        forward = forward.link(operator.forward_edge()).unwrap();
-    }
-    let mut backward = forward
-        .link(backend)
-        .unwrap()
-        .link(operators[stages - 1].backward_edge())
-        .unwrap();
-    for operator in operators[..stages - 1].iter().rev() {
-        backward = backward.link(operator.backward_edge()).unwrap();
-    }
-    backward.link_terminal(frontend).unwrap()
 }
 
 /// `stages` native gdl operators above an adapted engine.
@@ -226,24 +175,17 @@ fn allocations_per_request() {
         .build()
         .unwrap();
 
-    println!("items stages | engine | link: allocs reallocs bytes | native: allocs reallocs bytes");
+    println!("items stages | engine | native: allocs reallocs bytes");
     let mut native_by_items = Vec::new();
     for items in [1, 16] {
         let engine: Engine = Arc::new(Repeat(items));
         let alone = measure(&runtime, &engine);
         let mut native_row = Vec::new();
         for stages in 0..=MAX_STAGES {
-            let linked = measure(&runtime, &link(stages, engine.clone()));
             let natively = measure(&runtime, &native(stages, engine.clone()));
             println!(
-                "{items:>5} {stages:>6} | {:>6.1} | {:>6.1} {:>4.1} {:>7.0} | {:>6.1} {:>4.1} {:>7.0}",
-                alone.allocations,
-                linked.allocations,
-                linked.reallocations,
-                linked.bytes,
-                natively.allocations,
-                natively.reallocations,
-                natively.bytes,
+                "{items:>5} {stages:>6} | {:>6.1} | {:>6.1} {:>4.1} {:>7.0}",
+                alone.allocations, natively.allocations, natively.reallocations, natively.bytes,
             );
             native_row.push(natively);
         }

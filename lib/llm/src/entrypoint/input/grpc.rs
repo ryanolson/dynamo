@@ -92,32 +92,19 @@ pub async fn run(
             let checksum = model.card().mdcsum();
 
             let tokenizer = model.card().tokenizer()?;
-            // Transition: remove when the gdl pipeline is the only local pipeline.
-            let local_pipeline = common::LocalPipeline::configured()?;
             let chat_pipeline = common::build_pipeline::<
                 NvCreateChatCompletionRequest,
                 NvCreateChatCompletionStreamResponse,
-            >(
-                model.card(),
-                inner_engine.clone(),
-                tokenizer.clone(),
-                local_pipeline,
-            )
+            >(model.card(), inner_engine.clone(), tokenizer.clone())
             .await?;
             manager.add_chat_completions_model(model.service_name(), checksum, chat_pipeline)?;
 
             let cmpl_pipeline = common::build_pipeline::<
                 NvCreateCompletionRequest,
                 NvCreateCompletionResponse,
-            >(model.card(), inner_engine, tokenizer, local_pipeline)
+            >(model.card(), inner_engine, tokenizer)
             .await?;
             manager.add_completions_model(model.service_name(), checksum, cmpl_pipeline)?;
-            // Transition: remove when the gdl pipeline is the only local pipeline.
-            tracing::info!(
-                model = model.service_name(),
-                local_pipeline = local_pipeline.as_str(),
-                "Built the in-process local pipeline"
-            );
             grpc_service
         }
     };

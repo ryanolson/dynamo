@@ -411,15 +411,6 @@ pub mod llm {
     /// Enable LoRA adapter support (set to "true" to enable)
     pub const DYN_LORA_ENABLED: &str = "DYN_LORA_ENABLED";
 
-    /// The local pipeline that composes the frontend's routed pipelines (chat,
-    /// completions, Generate, and the Python `chat_engine_factory`'s), its
-    /// token-input embeddings pipeline, and the in-process pipeline of the HTTP
-    /// and gRPC inputs: `dynamo` (the default) or `gdl`. Read once per process;
-    /// any other value fails the pipeline build.
-    ///
-    /// Transition: remove when the gdl pipeline is the only local pipeline.
-    pub const DYN_LOCAL_PIPELINE: &str = "DYN_LOCAL_PIPELINE";
-
     /// LoRA cache directory path
     pub const DYN_LORA_PATH: &str = "DYN_LORA_PATH";
 
@@ -1230,8 +1221,6 @@ mod tests {
             llm::DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS,
             llm::DYN_HTTP_PRE_COMMIT_ERROR_PEEK_MS,
             llm::DYN_LORA_ENABLED,
-            // Transition: remove when the gdl pipeline is the only local pipeline.
-            llm::DYN_LOCAL_PIPELINE,
             llm::DYN_LORA_PATH,
             llm::DYN_ENABLE_ANTHROPIC_API,
             llm::DYN_SERVING_LOAD_PUBLISH,

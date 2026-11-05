@@ -10,21 +10,21 @@
 //! | Row | Pipeline | Terminal |
 //! |---|---|---|
 //! | `engine` | the test LLM engine, called directly | itself |
-//! | `a` | `build_pipeline`: preprocessor, backend | test LLM engine |
-//! | `a-gdl` | `a` composed as a gdl local pipeline | test LLM engine |
-//! | `b` | `PreprocessedRouting::build_pipeline`: preprocessor, migration, backend, encoder router, prefill router | test LLM engine, in place of `RoutingHost` |
-//! | `b-gdl` | `b` composed as a gdl local pipeline (`LocalPipeline::Gdl`, what `DYN_LOCAL_PIPELINE=gdl` selects) | test LLM engine, in place of `RoutingHost`, through `EngineSink` |
-//! | `c` | `PreprocessedRouting::build_preprocessed_pipeline`: migration, encoder router, prefill router | test LLM engine, in place of `RoutingHost` |
-//! | `c-gdl` | `c` composed as a gdl local pipeline | test LLM engine, in place of `RoutingHost`, through `EngineSink` |
+//! | `a-gdl` | `build_pipeline`: preprocessor, backend | test LLM engine |
+//! | `b-gdl` | `PreprocessedRouting::build_pipeline`: preprocessor, migration, backend, encoder router, prefill router | test LLM engine, in place of `RoutingHost`, through `EngineSink` |
+//! | `c-gdl` | `PreprocessedRouting::build_preprocessed_pipeline`: migration, encoder router, prefill router | test LLM engine, in place of `RoutingHost`, through `EngineSink` |
 //! | `embed-engine` | the test embeddings engine, called directly | itself |
-//! | `embed` | `build_embeddings_pipeline`: preprocessor, backend | test embeddings engine, in place of `PushRouter` |
-//! | `embeddings-gdl` | `embed` composed as a gdl local pipeline, without the backend (a pass-through for embeddings) | test embeddings engine, in place of `PushRouter` |
+//! | `embeddings-gdl` | `build_embeddings_pipeline`: preprocessor (an embeddings response needs no backend) | test embeddings engine, in place of `PushRouter` |
+//!
+//! The rows are gdl local pipelines, the only local pipeline the frontend composes. Until the
+//! switch, `a`, `b`, `c` and `embed` measured the same pipelines composed as Dynamo's `link`
+//! chains, and the gdl rows kept their `-gdl` names so their records carry on.
 //!
 //! The second number of a row is stream items: 1 and 16. For the embeddings rows it is
 //! inputs per request instead, because an embeddings stream carries one item for any number of
 //! inputs.
 //!
-//! The terminal stands in for everything behind it: in `b` and `c`, `RoutingHost` (worker
+//! The terminal stands in for everything behind it: in `b-gdl` and `c-gdl`, `RoutingHost` (worker
 //! selection, `PushRouter`, the request plane and the worker). The `engine` rows give the
 //! stand-in's own cost, so a pipeline's cost is its row minus the `engine` row.
 //!
@@ -41,8 +41,7 @@
 //! `block_in_place`. It has one blocking thread, so a window can wait for the blocking work a
 //! request leaves. No tracing subscriber is installed. `main` removes every `DYN_` variable and
 //! `TOKENIZERS_PARALLELISM`, and sets `RAYON_NUM_THREADS=4`, so neither the shell nor the host's
-//! core count changes the counts. A pipeline that an environment variable selects must be
-//! selected in code here.
+//! core count changes the counts.
 //!
 //! Measured on a 20-core aarch64 Linux host, Rust 1.99.0, 200 requests after 50 of warm-up,
 //! for the typical request. Debug and release builds give the same numbers:
@@ -50,19 +49,17 @@
 //! | Row | Allocations, 1 item | Bytes, 1 item | Allocations, 16 items | Bytes, 16 items |
 //! |---|---:|---:|---:|---:|
 //! | `engine` | 7 | 2,752 | 22 | 2,812 |
-//! | `a` | 346 | 100,886 | 859 | 122,374 |
 //! | `a-gdl` | 328 | 65,615 | 841 | 87,103 |
-//! | `b` | 399 | 222,953 | 912 | 244,441 |
 //! | `b-gdl` | 343 | 82,306 | 856 | 103,794 |
-//! | `c` | 71 | 140,579 | 86 | 140,639 |
 //! | `c-gdl` | 38 | 28,148 | 53 | 28,208 |
 //! | `embed-engine` | 8 | 6,548 | 23 | 88,868 |
-//! | `embed` | 199 | 44,438 | 2,283 | 529,886 |
 //! | `embeddings-gdl` | 177 | 41,647 | 2,261 | 527,095 |
 //!
-//! Each gdl row differs from its dynamo row by the same number of allocations at both item
-//! counts, so nothing per item: `a-gdl` −18, `b-gdl` −56, `c-gdl` −33, `embeddings-gdl` −22.
-//! The gdl rows carry the chat and preprocessed requests boxed (`dynamo_gdl_adapters::Boxed`),
+//! At the switch the Dynamo `link` chains made more allocations than these rows at both item
+//! counts, the same number more at each, so nothing per item: `a` +18 (346 and 859), `b` +56
+//! (399 and 912), `c` +33 (71 and 86), `embed` +22 (199 and 2,283).
+//!
+//! The rows carry the chat and preprocessed requests boxed (`dynamo_gdl_adapters::Boxed`),
 //! accepted at one allocation per box: `a-gdl` and `b-gdl` +2 (the chat request where it enters
 //! the pipeline, the preprocessed request where the preprocessor builds it; Migration sends its
 //! first attempt in that box), `c-gdl` +1 (the preprocessed request where it enters). Unboxed,
@@ -71,18 +68,16 @@
 //! 7,394 fewer instructions (4.6%), `b-gdl` 45 and 20,276 (10.6%), `c-gdl` 27 and 9,529 (23%),
 //! with nothing per item. Callgrind leaves out the system allocator; a `malloc` and `free` pair
 //! costs about 170 instructions.
-//! `lib/gdl-adapters/tests/allocations.rs` measures the parts in isolation: 14 allocations
-//! for a `link` stage, 2 for a native gdl operator nested under the request's scope, and 21 against 19 at the boundary
-//! (`PipelineEngine` above, `EngineSink` below). Every operator in the gdl rows is native, and
+//! `lib/gdl-adapters/tests/allocations.rs` measures the parts in isolation: 2 allocations for
+//! a native gdl operator nested under the request's scope, and 21 against 19 at the boundary
+//! (`PipelineEngine` above, `EngineSink` below); a `link` stage made 14. Every operator in the gdl rows is native, and
 //! Backend and the chat preprocessor are around nodes of the hop below them; the test engine
 //! at the terminal enters through `EngineSink`, where the frontend's `RoutingHost` is a gdl
 //! sink of its own.
-//! Each gdl row asks for fewer bytes than its dynamo row: the `link` chain boxes a future per
-//! edge, the gdl composition one per stage, and `embeddings-gdl` has no backend stage.
-//!
-//! The largest allocation of `b` and `c` is Migration's boxed future, 59,592 bytes per request;
-//! the largest of `b-gdl` was 13,376 bytes and of `c-gdl` 12,256 (debug build, gdl 165b166c). `a` and `embed`,
-//! which have no Migration, make neither.
+//! Each gdl row asked for fewer bytes than the `link` chain it replaced: the `link` chain boxed a
+//! future per edge, the gdl composition one per stage, and `embeddings-gdl` has no backend stage.
+//! The largest allocation of `b` and `c` was Migration's boxed future, 59,592 bytes per request;
+//! the largest of `b-gdl` was 13,376 bytes and of `c-gdl` 12,256 (debug build, gdl 165b166c).
 //!
 //! Run: `cargo test -p dynamo-llm --test allocations`. For instructions and `memcpy` calls per
 //! request, see `lib/llm/benches/callgrind.sh` and `hotpath.sh`, which run this binary under
@@ -104,7 +99,7 @@ use futures::StreamExt;
 use dynamo_llm::backend::ExecutionContext;
 use dynamo_llm::discovery::ModelManager;
 use dynamo_llm::entrypoint::input::{
-    LocalPipeline, PreprocessedRouting, build_embeddings_pipeline, build_pipeline,
+    PreprocessedRouting, build_embeddings_pipeline, build_pipeline,
 };
 use dynamo_llm::http::service::metrics::Metrics;
 use dynamo_llm::kv_router::{EncoderRouter, PrefillRouter};
@@ -136,29 +131,17 @@ const REQUESTS: usize = 200;
 const BASELINE: &[Row] = &[
     row("engine", 1, 7, 2752),
     row("engine", 16, 22, 2812),
-    // Transition: remove when the gdl pipeline is the only local pipeline.
-    row("a", 1, 346, 100886),
-    row("a", 16, 859, 122374),
     // +2 for the boxed chat and preprocessed requests (see the module docs).
     row("a-gdl", 1, 328, 65615),
     row("a-gdl", 16, 841, 87103),
-    // Transition: remove when the gdl pipeline is the only local pipeline.
-    row("b", 1, 399, 222953),
-    row("b", 16, 912, 244441),
     // +2 for the boxed chat and preprocessed requests (see the module docs).
     row("b-gdl", 1, 343, 82306),
     row("b-gdl", 16, 856, 103794),
-    // Transition: remove when the gdl pipeline is the only local pipeline.
-    row("c", 1, 71, 140579),
-    row("c", 16, 86, 140639),
     // +1 for the boxed preprocessed request (see the module docs).
     row("c-gdl", 1, 38, 28148),
     row("c-gdl", 16, 53, 28208),
     row("embed-engine", 1, 8, 6548),
     row("embed-engine", 16, 23, 88868),
-    // Transition: remove when the gdl pipeline is the only local pipeline.
-    row("embed", 1, 199, 44438),
-    row("embed", 16, 2283, 529886),
     row("embeddings-gdl", 1, 177, 41647),
     row("embeddings-gdl", 16, 2261, 527095),
 ];
@@ -582,24 +565,15 @@ async fn measure_engine(fixture: &Fixture, items: usize, requests: usize) -> Mea
     .await
 }
 
-async fn measure_a(
-    fixture: &Fixture,
-    name: &'static str,
-    local_pipeline: LocalPipeline,
-    items: usize,
-    requests: usize,
-) -> Measured {
+async fn measure_a(fixture: &Fixture, items: usize, requests: usize) -> Measured {
     let engine: ExecutionContext = fixture.llm_engine(items);
-    let pipeline =
-        build_pipeline::<NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse>(
-            &fixture.card,
-            engine,
-            fixture.tokenizer.clone(),
-            local_pipeline,
-        )
-        .await
-        .expect("pipeline a");
-    measure(name, items, requests, || {
+    let pipeline = build_pipeline::<
+        NvCreateChatCompletionRequest,
+        NvCreateChatCompletionStreamResponse,
+    >(&fixture.card, engine, fixture.tokenizer.clone())
+    .await
+    .expect("pipeline a");
+    measure("a-gdl", items, requests, || {
         let pipeline = pipeline.clone();
         let request = chat_request();
         async move { drain(pipeline.generate(Context::new(request)).await.unwrap()).await }
@@ -607,14 +581,8 @@ async fn measure_a(
     .await
 }
 
-async fn measure_b(
-    fixture: &Fixture,
-    name: &'static str,
-    local_pipeline: LocalPipeline,
-    items: usize,
-    requests: usize,
-) -> Measured {
-    let routing = fixture.routing(items).with_local_pipeline(local_pipeline);
+async fn measure_b(fixture: &Fixture, items: usize, requests: usize) -> Measured {
+    let routing = fixture.routing(items);
     let cancel = tokio_util::sync::CancellationToken::new();
     let dynamo_renderer::PromptFormatter::OAI(formatter) =
         prompt_formatter_from_mdc(&fixture.card).expect("formatter");
@@ -635,7 +603,7 @@ async fn measure_b(
             Arc::new(Metrics::new()),
         )
         .expect("pipeline b");
-    measure(name, items, requests, || {
+    measure("b-gdl", items, requests, || {
         let pipeline = pipeline.clone();
         let request = chat_request();
         async move { drain(pipeline.generate(Context::new(request)).await.unwrap()).await }
@@ -643,19 +611,12 @@ async fn measure_b(
     .await
 }
 
-async fn measure_c(
-    fixture: &Fixture,
-    name: &'static str,
-    local_pipeline: LocalPipeline,
-    items: usize,
-    requests: usize,
-) -> Measured {
+async fn measure_c(fixture: &Fixture, items: usize, requests: usize) -> Measured {
     let pipeline = fixture
         .routing(items)
-        .with_local_pipeline(local_pipeline)
         .build_preprocessed_pipeline(&fixture.card, 0, None, Arc::new(Metrics::new()))
         .expect("pipeline c");
-    measure(name, items, requests, || {
+    measure("c-gdl", items, requests, || {
         let pipeline = pipeline.clone();
         let request = preprocessed_request(fixture);
         async move { drain(pipeline.generate(Context::new(request)).await.unwrap()).await }
@@ -690,21 +651,13 @@ async fn measure_embed_engine(fixture: &Fixture, inputs: usize, requests: usize)
     .await
 }
 
-async fn measure_embed(
-    fixture: &Fixture,
-    name: &'static str,
-    local_pipeline: LocalPipeline,
-    inputs: usize,
-    requests: usize,
-) -> Measured {
+async fn measure_embed(fixture: &Fixture, inputs: usize, requests: usize) -> Measured {
     let mut card = fixture.card.clone();
     card.model_type = ModelType::Embedding;
     let preprocessor =
-        OpenAIPreprocessor::new_for_embeddings(card.clone()).expect("embeddings preprocessor");
-    let pipeline =
-        build_embeddings_pipeline(&card, preprocessor, embeddings_engine(), local_pipeline)
-            .expect("pipeline embed");
-    measure(name, inputs, requests, || {
+        OpenAIPreprocessor::new_for_embeddings(card).expect("embeddings preprocessor");
+    let pipeline = build_embeddings_pipeline(preprocessor, embeddings_engine());
+    measure("embeddings-gdl", inputs, requests, || {
         let pipeline = pipeline.clone();
         let request = embedding_request(inputs);
         async move { drain(pipeline.generate(Context::new(request)).await.unwrap()).await }
@@ -715,24 +668,11 @@ async fn measure_embed(
 async fn measure_row(fixture: &Fixture, name: &str, items: usize, requests: usize) -> Measured {
     match name {
         "engine" => measure_engine(fixture, items, requests).await,
-        "a" => measure_a(fixture, "a", LocalPipeline::Dynamo, items, requests).await,
-        "a-gdl" => measure_a(fixture, "a-gdl", LocalPipeline::Gdl, items, requests).await,
-        "b" => measure_b(fixture, "b", LocalPipeline::Dynamo, items, requests).await,
-        "b-gdl" => measure_b(fixture, "b-gdl", LocalPipeline::Gdl, items, requests).await,
-        "c" => measure_c(fixture, "c", LocalPipeline::Dynamo, items, requests).await,
-        "c-gdl" => measure_c(fixture, "c-gdl", LocalPipeline::Gdl, items, requests).await,
+        "a-gdl" => measure_a(fixture, items, requests).await,
+        "b-gdl" => measure_b(fixture, items, requests).await,
+        "c-gdl" => measure_c(fixture, items, requests).await,
         "embed-engine" => measure_embed_engine(fixture, items, requests).await,
-        "embed" => measure_embed(fixture, "embed", LocalPipeline::Dynamo, items, requests).await,
-        "embeddings-gdl" => {
-            measure_embed(
-                fixture,
-                "embeddings-gdl",
-                LocalPipeline::Gdl,
-                items,
-                requests,
-            )
-            .await
-        }
+        "embeddings-gdl" => measure_embed(fixture, items, requests).await,
         other => panic!("unknown row {other}"),
     }
 }
@@ -787,7 +727,7 @@ async fn check_counter() {
 /// row in a child process with tokenizer parallelism set explicitly and an odd rayon thread
 /// count, and compare it with the record.
 fn check_environment() {
-    let (name, items) = ("embed", 16);
+    let (name, items) = ("embeddings-gdl", 16);
     let output = std::process::Command::new(std::env::current_exe().expect("current exe"))
         .args(["row", name, &items.to_string(), "50"])
         .env("TOKENIZERS_PARALLELISM", "true")
@@ -815,26 +755,14 @@ fn check_environment() {
 const ROWS: &[(&str, usize)] = &[
     ("engine", 1),
     ("engine", 16),
-    // Transition: remove when the gdl pipeline is the only local pipeline.
-    ("a", 1),
-    ("a", 16),
     ("a-gdl", 1),
     ("a-gdl", 16),
-    // Transition: remove when the gdl pipeline is the only local pipeline.
-    ("b", 1),
-    ("b", 16),
     ("b-gdl", 1),
     ("b-gdl", 16),
-    // Transition: remove when the gdl pipeline is the only local pipeline.
-    ("c", 1),
-    ("c", 16),
     ("c-gdl", 1),
     ("c-gdl", 16),
     ("embed-engine", 1),
     ("embed-engine", 16),
-    // Transition: remove when the gdl pipeline is the only local pipeline.
-    ("embed", 1),
-    ("embed", 16),
     ("embeddings-gdl", 1),
     ("embeddings-gdl", 16),
 ];

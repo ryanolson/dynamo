@@ -749,10 +749,6 @@ impl ModelWatcher {
                 None
             };
 
-            // Whether `PreprocessedRouting` built a chat, completions or Generate engine, so
-            // the local pipeline they composed on is logged once for the model.
-            let mut routed_pipeline_built = false;
-
             // Add chat engine only if the model supports chat
             if card.model_type.supports_chat() {
                 let routing = preprocessed_routing.as_ref().ok_or_else(|| {
@@ -767,7 +763,6 @@ impl ModelWatcher {
                             self.metrics.clone(),
                         )
                         .context("PreprocessedRouting::build_preprocessed_pipeline")?;
-                    routed_pipeline_built = true;
                     Some(
                         factory(mcid.clone(), card.clone(), routed_engine)
                             .await
@@ -779,7 +774,6 @@ impl ModelWatcher {
                         Some(preprocessor) => preprocessor,
                         None => worker_set_chat_preprocessor(card, tk.clone(), &cancellation)?,
                     };
-                    routed_pipeline_built = true;
                     Some(
                         routing
                             .build_pipeline::<
@@ -836,7 +830,6 @@ impl ModelWatcher {
                         )
                         .context("PreprocessedRouting::build_pipeline")?;
                     worker_set.completions_engine = Some(completions_engine);
-                    routed_pipeline_built = true;
                     tracing::info!("Completions is ready");
                 } else {
                     tracing::warn!(
@@ -861,19 +854,7 @@ impl ModelWatcher {
                     )
                     .context("build generate (preprocessed) pipeline")?;
                 worker_set.generate_engine = Some(generate_engine);
-                routed_pipeline_built = true;
                 tracing::info!("Generate (token-in/token-out) is ready");
-            }
-
-            // Transition: remove when the gdl pipeline is the only local pipeline.
-            if let Some(routing) = preprocessed_routing.as_ref()
-                && routed_pipeline_built
-            {
-                tracing::info!(
-                    model = card.name(),
-                    local_pipeline = routing.local_pipeline().as_str(),
-                    "Built the routed local pipeline"
-                );
             }
 
             // Verify we built at least one serving engine. Generate can be the
@@ -1035,11 +1016,9 @@ impl ModelWatcher {
             worker_set.set_load_context(load_context);
         } else if card.model_input == ModelInput::Tokens && card.model_type.supports_embedding() {
             // Case 4: Tokens + Embeddings
-            // Build the preprocessor and read the local pipeline first: a router started for a
-            // card that fails here would leave its discovery watch running.
+            // Build the preprocessor first: a router started for a card that fails here would
+            // leave its discovery watch running.
             let preprocessor = OpenAIPreprocessor::new_for_embeddings(card.clone())?;
-            // Transition: remove when the gdl pipeline is the only local pipeline.
-            let local_pipeline = entrypoint::input::LocalPipeline::configured()?;
             let router = PushRouter::<
                 PreprocessedEmbeddingRequest,
                 Annotated<EmbeddingsEngineOutput>,
@@ -1049,18 +1028,8 @@ impl ModelWatcher {
             .await?;
 
             // Note: Embeddings don't need KV routing complexity or load monitoring
-            let embedding_engine = entrypoint::input::build_embeddings_pipeline(
-                card,
-                preprocessor,
-                Arc::new(router),
-                local_pipeline,
-            )?;
-            // Transition: remove when the gdl pipeline is the only local pipeline.
-            tracing::info!(
-                model = card.name(),
-                local_pipeline = local_pipeline.as_str(),
-                "Built the embeddings local pipeline"
-            );
+            let embedding_engine =
+                entrypoint::input::build_embeddings_pipeline(preprocessor, Arc::new(router));
 
             worker_set.embeddings_engine = Some(embedding_engine);
         } else if card.model_input == ModelInput::Tensor && card.model_type.supports_tensor() {
