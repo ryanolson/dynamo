@@ -5,6 +5,7 @@
 
 use std::{future::Future, sync::Arc};
 
+use dynamo_gdl_adapters::AnnotatedItems;
 use dynamo_runtime::{
     error::{DynamoError, ErrorClass},
     pipeline::{AsyncEngineContext, AsyncEngineContextProvider},
@@ -15,9 +16,8 @@ use tokio::task::JoinHandle;
 use tracing::Instrument;
 
 use super::PrefillError;
-use crate::operator::Downstream;
 use crate::protocols::{
-    common::llm_backend::{FinishReason, LLMEngineOutput, PreprocessedRequest},
+    common::llm_backend::{FinishReason, LLMEngineOutput},
     response_merge::{PREFILL_OUTPUT_ANNOTATION, PrefillNeed},
 };
 
@@ -108,18 +108,13 @@ impl PrefillTask {
     /// held until prefill finishes so a late failure cannot follow success.
     /// `output` sends prefill's output into the stream as soon as prefill
     /// finishes (`BeforeLast`), or before any decode output (`BeforeFirst`).
-    ///
-    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
-    pub(super) async fn forward_decode<D>(
+    pub(super) async fn forward_decode(
         self,
-        decode: impl Future<Output = anyhow::Result<D::Stream>>,
+        decode: impl Future<Output = anyhow::Result<AnnotatedItems<LLMEngineOutput>>>,
         request_context: Arc<dyn AsyncEngineContext>,
         output: PrefillNeed,
         prefill_context: Arc<dyn AsyncEngineContext>,
-    ) -> anyhow::Result<D::Response<LLMEngineOutput>>
-    where
-        D: Downstream<PreprocessedRequest, LLMEngineOutput>,
-    {
+    ) -> anyhow::Result<gdl::Items<Annotated<LLMEngineOutput>>> {
         let emit = output != PrefillNeed::None;
         let mut completion = Box::pin(self.wait());
         tokio::pin!(decode);
@@ -129,11 +124,10 @@ impl PrefillTask {
                 let prefill = result.inspect_err(|_| request_context.stop_generating())?;
                 let response = decode.await?;
                 if !emit {
-                    return Ok(D::pass(response));
+                    return Ok(gdl::items(response.map(Ok)));
                 }
-                let context = response.context();
                 let stream = stream::iter(output_item(prefill)).chain(response);
-                return Ok(D::respond(stream, context));
+                return Ok(gdl::items(stream.map(Ok)));
             }
             result = &mut decode => match result {
                 Ok(response) => response,
@@ -145,8 +139,7 @@ impl PrefillTask {
         };
         // Move the completion future into the response stream. The task itself
         // keeps running if this stream is dropped during client cancellation.
-        let context = response.context();
-        let stream_context = context.clone();
+        let stream_context = response.context();
         let stream = async_stream::stream! {
             if output == PrefillNeed::BeforeFirst {
                 // Admission refusals are the first decode stream item on this path.
@@ -255,7 +248,7 @@ impl PrefillTask {
                 }
             }
         };
-        Ok(D::respond(stream, context))
+        Ok(gdl::items(stream.map(Ok)))
     }
 }
 
@@ -284,8 +277,8 @@ fn cancel_prefill_on_decode_rejection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operator::testing::{self, EngineDownstream};
-    use dynamo_gdl_adapters::{AnnotatedItems, CxBridge};
+    use crate::operator::testing;
+    use dynamo_gdl_adapters::CxBridge;
     use dynamo_runtime::pipeline::{ManyOut, ResponseStream};
 
     impl PrefillTask {
@@ -311,12 +304,7 @@ mod tests {
                 ))
             };
             let response = self
-                .forward_decode::<EngineDownstream<PreprocessedRequest, LLMEngineOutput>>(
-                    decode,
-                    request_context.clone(),
-                    output,
-                    prefill_context,
-                )
+                .forward_decode(decode, request_context.clone(), output, prefill_context)
                 .await?;
             Ok(testing::read(response, cx, request_context))
         }

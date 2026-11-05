@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::atomic::AtomicU8;
 use std::sync::{Arc, OnceLock};
 
@@ -21,8 +20,8 @@ use dynamo_kv_router::{
 use dynamo_runtime::{
     error::{DynamoError, ErrorClass, ErrorType, match_error_chain},
     pipeline::{
-        AsyncEngineContextProvider, Context, ManyOut, Operator, ResponseStream, RouterMode,
-        ServerStreamingEngine, SingleIn, propagate_first_response_guard,
+        AsyncEngineContextProvider, Context, ManyOut, ResponseStream, RouterMode, SingleIn,
+        propagate_first_response_guard,
     },
     protocols::{EndpointId, annotated::Annotated},
 };
@@ -32,7 +31,7 @@ use futures::stream::{self, StreamExt};
 use crate::{
     discovery::{ModelManager, WorkerSetTarget, WorkerSetTargetId},
     kv_router::{RoutingHost, SelectionPolicySource, routing_host::PrefillDispatch},
-    operator::{Downstream, DynamoDownstream, GdlDownstream, GdlOperator, detached, native},
+    operator::{Downstream, GdlDownstream, GdlOperator, detached, native},
     protocols::common::{
         extensions::{SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId},
         llm_backend::{LLMEngineOutput, PreprocessedRequest},
@@ -405,29 +404,9 @@ impl Drop for PrefillRouter {
     }
 }
 
-// Transition: remove when the gdl pipeline is the only local pipeline.
-impl
-    Operator<
-        SingleIn<PreprocessedRequest>,
-        ManyOut<Annotated<LLMEngineOutput>>,
-        SingleIn<PreprocessedRequest>,
-        ManyOut<Annotated<LLMEngineOutput>>,
-    > for PrefillRouter
-{
-    fn generate<'life0, 'async_trait>(
-        &'life0 self,
-        request: SingleIn<PreprocessedRequest>,
-        next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
-    ) -> Pin<
-        Box<dyn Future<Output = Result<ManyOut<Annotated<LLMEngineOutput>>>> + Send + 'async_trait>,
-    >
-    where
-        'life0: 'async_trait,
-        Self: 'async_trait,
-    {
-        Box::pin(self.route(request, DynamoDownstream(next), None))
-    }
-}
+/// The stage below the prefill router, as its route calls it: gdl's `cx` and `next`, which
+/// takes the preprocessed request boxed.
+type RouteDownstream<N> = GdlDownstream<N, Boxed<PreprocessedRequest>, PreprocessedRequest>;
 
 impl gdl::Operator for GdlOperator<PrefillRouter, PreprocessedRequest> {
     type UpReq = Boxed<PreprocessedRequest>;
@@ -466,7 +445,7 @@ impl gdl::Operator for GdlOperator<PrefillRouter, PreprocessedRequest> {
                 gate @ PrefillGate::Prefill => {
                     let (request, spare) = request.take();
                     let next = GdlDownstream::with_spare(cx, next, spare);
-                    detached(async move { router.route(request, next, Some(gate)).await }).await
+                    detached(async move { router.route(request, next, gate).await }).await
                 }
             }
         }
@@ -521,21 +500,18 @@ impl PrefillRouter {
         }
     }
 
-    /// Route `request` through remote prefill when the router is active, then send its decode
-    /// leg on: the body of the prefill router's Dynamo and gdl operators. `gate` is the
-    /// router's decision for the request when the caller has read it already, so the route
-    /// acts on the decision the caller acted on.
-    ///
-    /// Transition: make concrete, and take `gate` always, when the gdl pipeline is the only
-    /// local pipeline.
-    async fn route<D>(
+    /// Route `request` through remote prefill, then send its decode leg on: the body of the
+    /// prefill router's native gdl operator for a request it routes. `gate` is the router's
+    /// decision for the request, as its caller read it, so the route acts on the decision the
+    /// caller acted on.
+    async fn route<N>(
         &self,
         request: SingleIn<PreprocessedRequest>,
-        next: D,
-        gate: Option<PrefillGate>,
-    ) -> Result<D::Response<LLMEngineOutput>>
+        next: RouteDownstream<N>,
+        gate: PrefillGate,
+    ) -> Result<gdl::Items<Annotated<LLMEngineOutput>>>
     where
-        D: Downstream<PreprocessedRequest, LLMEngineOutput>,
+        N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<LLMEngineOutput>>,
     {
         // Extract request data while preserving context
         let (mut req, mut context) = request.into_parts();
@@ -547,11 +523,6 @@ impl PrefillRouter {
         // Save original max_tokens for decode
         let original_max_tokens = req.stop_conditions.max_tokens;
 
-        let gate = gate.unwrap_or_else(|| {
-            // Query-only requests are owned by the decode RoutingHost. In particular,
-            // do not turn an advisory worker lookup into conditional local execution.
-            self.gate(req.get_annotation_value("query_instance_id").is_some())
-        });
         match gate {
             PrefillGate::Prefill => {}
             PrefillGate::Pending => return Err(self.reject_while_activating(&request_id)),
@@ -602,7 +573,7 @@ impl PrefillRouter {
                         response_stream.into_many_out(),
                         client_requested_bypass_marker,
                     )
-                    .map(D::adopt);
+                    .map(|stream| gdl::items(stream.map(Ok)));
                 }
                 Ok(None) => {
                     (req, context) = conditional_request.into_parts();
@@ -772,7 +743,7 @@ impl PrefillRouter {
         let outcome = match outcome {
             PrefillOutcome::Terminal { output } => {
                 let output = strip_terminal_disaggregated_params(*output);
-                return Ok(D::respond(stream::once(async move { output }), engine_ctx));
+                return Ok(gdl::items(stream::once(async move { Ok(output) })));
             }
             outcome => outcome,
         };
@@ -829,10 +800,10 @@ impl PrefillRouter {
         match prefill_completion {
             Some(completion) => {
                 completion
-                    .forward_decode::<D>(decode, engine_ctx, output, prefill_engine_ctx)
+                    .forward_decode(decode, engine_ctx, output, prefill_engine_ctx)
                     .await
             }
-            None => decode.await.map(D::pass),
+            None => decode.await.map(|stream| gdl::items(stream.map(Ok))),
         }
     }
 }
@@ -987,7 +958,7 @@ mod tests {
     use dynamo_kv_router::config::{KvRouterConfig, RouterConfigOverride};
     use dynamo_runtime::{
         engine::AsyncEngine,
-        pipeline::{Error, async_trait},
+        pipeline::{Error, ServerStreamingEngine, async_trait},
     };
     use futures::StreamExt;
     use std::{
@@ -2075,7 +2046,7 @@ mod tests {
             next,
         );
         let response = router
-            .route(request, next, Some(PrefillGate::PassThrough))
+            .route(request, next, PrefillGate::PassThrough)
             .await
             .unwrap();
         drop(response);

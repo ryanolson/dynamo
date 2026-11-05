@@ -26,7 +26,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use dynamo_gdl_adapters::{AnnotatedItems, Carried, CheckedItems, CxBridge, enter};
-use dynamo_runtime::engine::{AsyncEngine, AsyncEngineContext, Data, ResponseStream};
+use dynamo_runtime::engine::{AsyncEngine, Data};
 use dynamo_runtime::pipeline::{AsyncEngineContextProvider, Error, ManyOut, SingleIn};
 use dynamo_runtime::protocols::annotated::Annotated;
 use futures::{FutureExt, Stream, StreamExt};
@@ -75,24 +75,10 @@ pub(crate) trait Downstream<Req: Data, T: Data>: Send + Sync {
     /// Transition: remove when the gdl pipeline is the only local pipeline.
     type Response<U: Data>;
 
-    /// Box the operator's response stream once, for its caller. `context` is the request's.
-    ///
-    /// Transition: remove when the gdl pipeline is the only local pipeline.
-    fn respond<U, S>(stream: S, context: Arc<dyn AsyncEngineContext>) -> Self::Response<U>
-    where
-        U: Data,
-        S: Stream<Item = Annotated<U>> + Send + 'static;
-
     /// A stream from [`send`](Self::send) as the operator's response, unchanged.
     ///
     /// Transition: remove when the gdl pipeline is the only local pipeline.
     fn pass(stream: Self::Stream) -> Self::Response<T>;
-
-    /// The response stream of a Dynamo engine that the operator calls itself, not through the
-    /// stage below, as the operator's response.
-    ///
-    /// Transition: remove when the gdl pipeline is the only local pipeline.
-    fn adopt<U: Data>(stream: ManyOut<Annotated<U>>) -> Self::Response<U>;
 }
 
 /// The `Annotated` value of an item read through [`CheckedItems`], which is always `Ok`. An
@@ -164,19 +150,7 @@ impl<Req: Data, T: Data> Downstream<Req, T> for DynamoDownstream<Req, T> {
 
     type Response<U: Data> = ManyOut<Annotated<U>>;
 
-    fn respond<U, S>(stream: S, context: Arc<dyn AsyncEngineContext>) -> ManyOut<Annotated<U>>
-    where
-        U: Data,
-        S: Stream<Item = Annotated<U>> + Send + 'static,
-    {
-        ResponseStream::new(Box::pin(stream), context)
-    }
-
     fn pass(stream: ManyOut<Annotated<T>>) -> ManyOut<Annotated<T>> {
-        stream
-    }
-
-    fn adopt<U: Data>(stream: ManyOut<Annotated<U>>) -> ManyOut<Annotated<U>> {
         stream
     }
 }
@@ -253,19 +227,7 @@ where
 
     type Response<U: Data> = gdl::Items<Annotated<U>>;
 
-    fn respond<U, S>(stream: S, _context: Arc<dyn AsyncEngineContext>) -> gdl::Items<Annotated<U>>
-    where
-        U: Data,
-        S: Stream<Item = Annotated<U>> + Send + 'static,
-    {
-        gdl::items(stream.map(Ok))
-    }
-
     fn pass(stream: AnnotatedItems<T>) -> gdl::Items<Annotated<T>> {
-        gdl::items(stream.map(Ok))
-    }
-
-    fn adopt<U: Data>(stream: ManyOut<Annotated<U>>) -> gdl::Items<Annotated<U>> {
         gdl::items(stream.map(Ok))
     }
 }
