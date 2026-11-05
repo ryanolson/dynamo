@@ -1585,9 +1585,7 @@ mod tests {
     use crate::session_affinity::SessionAffinityMode;
     use dynamo_runtime::discovery::DiscoveryEvent;
     use dynamo_runtime::engine::AsyncEngine;
-    use dynamo_runtime::pipeline::{
-        Error, ManyOut, Operator, SegmentSource, ServiceBackend, SingleIn, Source,
-    };
+    use dynamo_runtime::pipeline::{Error, ManyOut, SingleIn};
     use dynamo_runtime::{Runtime, distributed::DistributedConfig};
     use futures::StreamExt;
 
@@ -1716,22 +1714,12 @@ mod tests {
             let cancellation = runtime_cancellation.child_token();
             let preprocessor =
                 worker_set_chat_preprocessor(&card, card.tokenizer().unwrap(), &cancellation)
-                    .unwrap()
-                    .into_operator();
+                    .unwrap();
             let backend = Arc::new(CompletingBackend::default());
-            let source = SegmentSource::<
-                SingleIn<NvCreateChatCompletionRequest>,
-                ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>,
-            >::new();
-            let engine = source
-                .link(preprocessor.forward_edge())
-                .unwrap()
-                .link(ServiceBackend::from_engine(backend.clone()))
-                .unwrap()
-                .link(preprocessor.backward_edge())
-                .unwrap()
-                .link_terminal(source)
-                .unwrap();
+            let engine = crate::operator::testing::preprocessor::<
+                NvCreateChatCompletionRequest,
+                NvCreateChatCompletionStreamResponse,
+            >(preprocessor, backend.clone());
             let mut worker_set = WorkerSet::new("retired-prefill".into(), "test".into(), card);
             worker_set.set_lifecycle_cancellation(cancellation.clone());
             worker_set.chat_engine = Some(engine);
