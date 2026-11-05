@@ -8,8 +8,8 @@
 
 use std::sync::Arc;
 
-use dynamo_gdl_adapters::{Boxed, Carried, EngineSink, PipelineEngine};
-use dynamo_runtime::engine::{AsyncEngine, Data};
+use dynamo_gdl_adapters::{AnnotatedItems, Boxed, Carried, EngineSink, PipelineEngine};
+use dynamo_runtime::engine::{AsyncEngine, AsyncEngineContext, Data, ResponseStream};
 use dynamo_runtime::error::DynamoError;
 use dynamo_runtime::pipeline::{Error, ManyOut, SingleIn};
 use dynamo_runtime::protocols::annotated::Annotated;
@@ -186,6 +186,20 @@ pub(crate) fn downstream<Req: Data, T: Data>(
     engine: Arc<DynEngine<Req, T>>,
 ) -> EngineDownstream<Req, T> {
     GdlDownstream::new(cx, sink(engine))
+}
+
+/// A native operator body's response read as a Dynamo stream, by the rule the frontend's
+/// `PipelineEngine` reads it with. `root` is the `Cx` the body ran under and `context` the
+/// request's.
+pub(crate) fn read<T: Data>(
+    items: gdl::Items<Annotated<T>>,
+    root: gdl::Cx,
+    context: Arc<dyn AsyncEngineContext>,
+) -> ManyOut<Annotated<T>> {
+    ResponseStream::new(
+        Box::pin(AnnotatedItems::new(items, root, context.clone())),
+        context,
+    )
 }
 
 /// The `DynamoError` an operator body's eager error on gdl stands for. The body sees a stage's
