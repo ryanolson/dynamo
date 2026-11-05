@@ -15,7 +15,11 @@ use dynamo_runtime::protocols::annotated::Annotated;
 
 use super::GdlOperator;
 use crate::backend::Backend;
-use crate::protocols::common::llm_backend::{BackendOutput, LLMEngineOutput, PreprocessedRequest};
+use crate::preprocessor::{OpenAIPreprocessor, PreprocessedEmbeddingRequest, PreprocessorNode};
+use crate::protocols::common::llm_backend::{
+    BackendOutput, EmbeddingsEngineOutput, LLMEngineOutput, PreprocessedRequest,
+};
+use crate::types::openai::embeddings::{NvCreateEmbeddingRequest, NvCreateEmbeddingResponse};
 
 /// A Dynamo engine of `Req` and `Annotated<T>`.
 pub(crate) type DynEngine<Req, T> = dyn AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, Error>;
@@ -24,11 +28,33 @@ pub(crate) type DynEngine<Req, T> = dyn AsyncEngine<SingleIn<Req>, ManyOut<Annot
 pub(crate) type EngineStage<Req, T, R = Boxed<Req>> =
     gdl::SinkStage<EngineSink<DynEngine<Req, T>, Req, T, R>>;
 
+/// A hop to a test's engine.
+pub(crate) type SinkHop<Req, T, R = Boxed<Req>> = gdl::Hop<(), EngineStage<Req, T, R>, ()>;
+
 /// `engine` as the inner end of a gdl hop, taking requests in the carrier `R`.
 pub(crate) fn sink_stage<Req: Data, T: Data, R: Carried<Req>>(
     engine: Arc<DynEngine<Req, T>>,
 ) -> EngineStage<Req, T, R> {
     gdl::SinkStage::new(Arc::new(EngineSink::new(engine)))
+}
+
+/// A hop to `engine`, taking requests in the carrier `R`.
+pub(crate) fn sink<Req: Data, T: Data, R: Carried<Req>>(
+    engine: Arc<DynEngine<Req, T>>,
+) -> SinkHop<Req, T, R> {
+    gdl::Hop::new((), sink_stage(engine), ())
+}
+
+/// `op` as a native gdl operator keyed by `K` over the hop `next`.
+pub(crate) fn native<O, K, H>(
+    op: Arc<O>,
+    next: H,
+) -> gdl::Hop<(), gdl::OperatorStage<GdlOperator<O, K>, H>, ()> {
+    gdl::Hop::new(
+        (),
+        gdl::OperatorStage::new(Arc::new(GdlOperator::new(op)), next),
+        (),
+    )
 }
 
 /// A hop to `I` with `GdlOperator<O, K>` as its one around node.
@@ -70,4 +96,46 @@ pub(crate) fn backend(
         PreprocessedRequest,
         _,
     >(backend, sink_stage(next)))
+}
+
+/// The chat or completions preprocessor over `next`, as the frontend composes it: an around
+/// node of the hop to `next`, with `next` also as the engine a speculative prefill goes to.
+pub(crate) fn preprocessor<Req, Resp>(
+    preprocessor: Arc<OpenAIPreprocessor>,
+    next: Arc<DynEngine<PreprocessedRequest, BackendOutput>>,
+) -> Arc<DynEngine<Req, Resp>>
+where
+    Req: Data,
+    Resp: Data,
+    PreprocessorNode<Req>: gdl::Around<
+            UpReq = Boxed<Req>,
+            UpItem = Annotated<Resp>,
+            DownReq = Boxed<PreprocessedRequest>,
+            DownItem = Annotated<BackendOutput>,
+        >,
+{
+    let (forward, backward) = gdl::around(Arc::new(PreprocessorNode::<Req>::new(
+        preprocessor,
+        next.clone(),
+    )));
+    engine_for_dynamo_stages::<_, Req, Resp, Boxed<Req>>(gdl::Hop::new(
+        (forward, ()),
+        sink_stage::<_, _, Boxed<PreprocessedRequest>>(next),
+        (backward, ()),
+    ))
+}
+
+/// The embeddings preprocessor over `next`, as the frontend composes it: a native gdl operator
+/// over the hop to `next`, carrying `SingleIn` itself.
+pub(crate) fn embeddings_preprocessor(
+    preprocessor: Arc<OpenAIPreprocessor>,
+    next: Arc<DynEngine<PreprocessedEmbeddingRequest, EmbeddingsEngineOutput>>,
+) -> Arc<DynEngine<NvCreateEmbeddingRequest, NvCreateEmbeddingResponse>> {
+    type Req = NvCreateEmbeddingRequest;
+    engine_for_dynamo_stages::<_, Req, NvCreateEmbeddingResponse, SingleIn<Req>>(
+        native::<_, Req, _>(
+            preprocessor,
+            sink::<_, _, SingleIn<PreprocessedEmbeddingRequest>>(next),
+        ),
+    )
 }
