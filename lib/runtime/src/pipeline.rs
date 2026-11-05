@@ -5,12 +5,6 @@
 /// a [`super::engine::ResponseStream`] as output.
 use serde::{Deserialize, Serialize};
 
-mod nodes;
-pub use nodes::{
-    Operator, PipelineNode, PipelineOperator, SegmentSink, SegmentSource, Service, ServiceBackend,
-    ServiceFrontend, Sink, Source,
-};
-
 pub mod context;
 pub mod error;
 pub mod network;

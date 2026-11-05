@@ -1331,8 +1331,8 @@ where
 }
 
 pub struct Ingress<Req: PipelineIO, Resp: PipelineIO, Adapter = SerdeIngressPayloadAdapter> {
-    /// Called directly for each request: the engine's stream is the call's
-    /// return value, so no response map sits between them.
+    /// Called directly for each request; the engine's stream is the call's
+    /// return value.
     engine: OnceLock<ServiceEngine<Req, Resp>>,
     /// Ids whose engine call has not returned; refuses a second request with one.
     in_flight_ids: ingress::inflight::InFlightIds,
