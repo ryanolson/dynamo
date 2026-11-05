@@ -4225,6 +4225,42 @@ async fn a_kill_during_a_retry_at_dispatch_records_cancelled_and_its_cause() {
     );
 }
 
+/// As [`a_kill_during_a_retry_at_dispatch_records_cancelled_and_its_cause`], for a retry after
+/// a mid-stream failure: the call has returned, and the retry runs while the caller reads.
+///
+/// Nothing is dropped here: on gdl the attempt's hop answers the kill with an empty stream, so
+/// Migration sees the dispatch end cancelled, as it does on any hop that answers a kill so.
+/// It must then abort the parked lifecycle with the cancel itself, since no attempt claims it.
+///
+/// An accepted difference: dynamo's caller receives the failure that caused the retry, because
+/// the host fails the killed dispatch; gdl's receives nothing. The HTTP handler stops reading at
+/// the kill, so a client sees neither.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_kill_during_a_retry_mid_stream_records_cancelled_and_its_cause() {
+    use crate::entrypoint::input::LocalPipeline;
+
+    let mut outcomes = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        outcomes.push(
+            kill_during_a_parked_retry(
+                local_pipeline,
+                Arc::new(AlwaysOverloadedDispatch::default()),
+            )
+            .await,
+        );
+    }
+    assert_eq!(
+        outcomes,
+        [
+            "dynamo: 1 items, outcomes [\"ongoing_request/cancelled x1\"], \
+             classifier [Aborted { cause: Some(Cancelled) }]",
+            "gdl: 0 items, outcomes [\"ongoing_request/cancelled x1\"], \
+             classifier [Aborted { cause: Some(Cancelled) }]",
+        ]
+    );
+}
+
 /// A gracefully shutting-down worker: `Cancelled` data frame, then the reason.
 #[derive(Default)]
 struct ShutdownAfterCancelDispatch {
