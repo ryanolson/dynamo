@@ -562,6 +562,30 @@ where
     /// Delivered tokens replayed in the active attempt's prompt. The worker counts them in its
     /// `prompt_tokens` although the client received them as completion.
     replayed_tokens: u32,
+    /// The migration whose outcome is not recorded yet: set while [`new_stream`] dispatches
+    /// for one, and taken when it records the outcome. A manager dropped with one set was
+    /// dropped in that dispatch (see the `Drop` impl).
+    ///
+    /// [`new_stream`]: Self::new_stream
+    unrecorded_migration: Option<MigrationEvent>,
+}
+
+/// The drop guard of a migration in flight. On the gdl pipeline a kill drops the response in
+/// flight, and with it this manager inside [`RetryManager::new_stream`], before it records the
+/// migration's outcome or aborts the classifier lifecycle parked for the retry. Record both
+/// here, as `new_stream` does when it sees the cancel: otherwise no outcome is recorded and the
+/// lifecycle is dropped later with no cause.
+impl<Resp, D> Drop for RetryManager<Resp, D>
+where
+    Resp: Data + HasTokenIds,
+    D: Downstream<PreprocessedRequest, Resp>,
+{
+    fn drop(&mut self) {
+        if self.unrecorded_migration.is_some() {
+            self.record_migration_outcome(frontend_service::migration_outcome::CANCELLED);
+            self.abort_request_lifecycle_cancelled();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -656,6 +680,7 @@ where
             pending_migration: None,
             prompt_len,
             replayed_tokens: 0,
+            unrecorded_migration: None,
         };
         slf.new_stream(None).await?;
         slf.exceed_max_seq_len(0); // disable migration if prompt len > max_seq_len
@@ -766,15 +791,16 @@ where
         }
     }
 
-    async fn new_stream(&mut self, mut migration_event: Option<MigrationEvent>) -> Result<()> {
+    /// Dispatch the next attempt. A `migration_event` is the migration it dispatches for; one
+    /// starts here when a dispatch fails over. Every return records its outcome, if any, and
+    /// the manager's drop records it if the future is dropped first.
+    async fn new_stream(&mut self, migration_event: Option<MigrationEvent>) -> Result<()> {
+        self.unrecorded_migration = migration_event;
         if !self.attempts.has_remaining() {
             if let Some(cause) = self.pending_migration.take() {
                 self.record_migration_exhausted(cause);
             }
-            self.record_migration_outcome(
-                migration_event.as_ref(),
-                frontend_service::migration_outcome::FAILURE,
-            );
+            self.record_migration_outcome(frontend_service::migration_outcome::FAILURE);
             let error = Error::msg("Migration limit exhausted");
             self.abort_request_lifecycle(error.as_ref());
             return Err(error);
@@ -830,17 +856,8 @@ where
                         "request cancelled before worker dispatch"
                     );
                 }
-                self.record_migration_outcome(
-                    migration_event.as_ref(),
-                    frontend_service::migration_outcome::CANCELLED,
-                );
-                let error = DynamoError::builder()
-                    .error_type(ErrorType::Cancelled)
-                    .message(format!(
-                        "Context id {} is stopped or killed",
-                        self.context.id()
-                    ))
-                    .build();
+                self.record_migration_outcome(frontend_service::migration_outcome::CANCELLED);
+                let error = self.cancelled_error();
                 self.abort_request_lifecycle(&error);
                 return Err(error.into());
             }
@@ -884,7 +901,7 @@ where
                     } else {
                         frontend_service::migration_outcome::SUCCESS
                     };
-                    self.record_migration_outcome(migration_event.as_ref(), outcome);
+                    self.record_migration_outcome(outcome);
                     self.active_route_trace = Some(route_trace);
                     self.next_stream = Some(next_stream);
                     self.replayed_tokens = replayed_tokens;
@@ -893,11 +910,13 @@ where
                 Err(err) if is_migratable_for_request(&self.request, err.as_ref()) => {
                     let Some(migration_error) = migratable_error_in_chain(err.as_ref()) else {
                         tracing::warn!(error = %err, "Migration eligibility had no semantic error");
+                        // This return records no outcome; nor may the drop.
+                        self.unrecorded_migration = None;
                         return Err(err);
                     };
                     let reason = migration_error.error_type();
-                    if migration_event.is_none() {
-                        migration_event = Some(MigrationEvent::new(
+                    if self.unrecorded_migration.is_none() {
+                        self.unrecorded_migration = Some(MigrationEvent::new(
                             frontend_service::migration_type::NEW_REQUEST,
                         ));
                     }
@@ -910,10 +929,7 @@ where
                             attempt: route_trace.attempt(),
                         };
                         self.record_migration_exhausted(cause);
-                        self.record_migration_outcome(
-                            migration_event.as_ref(),
-                            frontend_service::migration_outcome::FAILURE,
-                        );
+                        self.record_migration_outcome(frontend_service::migration_outcome::FAILURE);
                         self.abort_request_lifecycle(err.as_ref());
                         return Err(err);
                     }
@@ -927,19 +943,35 @@ where
                         } else {
                             frontend_service::migration_outcome::FAILURE
                         };
-                    self.record_migration_outcome(migration_event.as_ref(), outcome);
+                    self.record_migration_outcome(outcome);
                     self.abort_request_lifecycle(err.as_ref());
                     return Err(err);
                 }
             }
         }
-        self.record_migration_outcome(
-            migration_event.as_ref(),
-            frontend_service::migration_outcome::FAILURE,
-        );
+        self.record_migration_outcome(frontend_service::migration_outcome::FAILURE);
         let error = Error::msg("Migration limit exhausted");
         self.abort_request_lifecycle(error.as_ref());
         Err(error)
+    }
+
+    /// Abort any classifier lifecycle parked for a retry with the request's cancel as the cause.
+    /// The cause is built only when a lifecycle can be parked.
+    fn abort_request_lifecycle_cancelled(&self) {
+        if self.request.migration_state.is_some() {
+            self.abort_request_lifecycle(&self.cancelled_error());
+        }
+    }
+
+    /// The error of a request whose context is stopped or killed.
+    fn cancelled_error(&self) -> DynamoError {
+        DynamoError::builder()
+            .error_type(ErrorType::Cancelled)
+            .message(format!(
+                "Context id {} is stopped or killed",
+                self.context.id()
+            ))
+            .build()
     }
 
     /// The attempt a failure belongs to. Prefers the attempt's own trace
@@ -984,8 +1016,9 @@ where
         );
     }
 
-    fn record_migration_outcome(&self, migration_event: Option<&MigrationEvent>, outcome: &str) {
-        if let Some(event) = migration_event {
+    /// Record the outcome of the migration in flight, if any, once.
+    fn record_migration_outcome(&mut self, outcome: &str) {
+        if let Some(event) = self.unrecorded_migration.take() {
             self.metrics.observe_migration_duration(
                 &self.model_name,
                 event.migration_type,

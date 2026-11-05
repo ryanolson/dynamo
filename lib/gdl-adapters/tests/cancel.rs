@@ -279,8 +279,23 @@ fn pipeline_c(
     engine: Engine,
     migration_limit: u32,
 ) -> Pipeline<PreprocessedRequest, LLMEngineOutput> {
+    pipeline_c_with_metrics(
+        local_pipeline,
+        engine,
+        migration_limit,
+        Arc::new(Metrics::new()),
+    )
+}
+
+/// [`pipeline_c`], recording into `metrics`.
+fn pipeline_c_with_metrics(
+    local_pipeline: LocalPipeline,
+    engine: Engine,
+    migration_limit: u32,
+    metrics: Arc<Metrics>,
+) -> Pipeline<PreprocessedRequest, LLMEngineOutput> {
     routing(engine, local_pipeline)
-        .build_preprocessed_pipeline(&card(), migration_limit, None, Arc::new(Metrics::new()))
+        .build_preprocessed_pipeline(&card(), migration_limit, None, metrics)
         .unwrap()
 }
 
@@ -695,6 +710,106 @@ async fn a_worker_that_ignores_the_kill_is_cut_off_only_on_gdl() {
     }
     // An accepted difference: gdl ends sooner; neither sends an error.
     assert_eq!(outcomes, [(false, true, false), (true, false, false)]);
+}
+
+/// Every migration outcome `metrics` recorded, as `type/outcome xN`.
+fn migration_outcomes(metrics: &Metrics) -> Vec<String> {
+    use dynamo_runtime::metrics::prometheus_names::frontend_service::{
+        migration_outcome, migration_type,
+    };
+    let model = card().display_name;
+    let mut recorded = Vec::new();
+    for kind in [migration_type::NEW_REQUEST, migration_type::ONGOING_REQUEST] {
+        for outcome in [
+            migration_outcome::SUCCESS,
+            migration_outcome::FAILURE,
+            migration_outcome::CANCELLED,
+        ] {
+            let count = metrics.get_migration_duration_sample_count(&model, kind, outcome);
+            if count > 0 {
+                recorded.push(format!("{kind}/{outcome} x{count}"));
+            }
+        }
+    }
+    recorded
+}
+
+/// The migration outcomes a request on `turns` records through pipeline C with
+/// `migration_limit`, read after the caller has read the whole stream and dropped it and the
+/// pipeline.
+async fn outcomes_on_c(
+    local_pipeline: LocalPipeline,
+    turns: Vec<Turn>,
+    migration_limit: u32,
+) -> Vec<String> {
+    let (worker, _) = Worker::new(turns);
+    let metrics = Arc::new(Metrics::new());
+    let pipeline =
+        pipeline_c_with_metrics(local_pipeline, worker, migration_limit, metrics.clone());
+    let stream = pipeline.generate(preprocessed()).await.unwrap();
+    rest(stream).await;
+    drop(pipeline);
+    migration_outcomes(&metrics)
+}
+
+/// A migration that finishes, at dispatch or mid-stream, records one `success` and nothing
+/// else, on both local pipelines: dropping the finished stream records no second outcome.
+#[tokio::test]
+async fn a_finished_migration_records_one_success_on_both_local_pipelines() {
+    let mut outcomes = Vec::new();
+    for local_pipeline in BOTH {
+        outcomes.push(
+            outcomes_on_c(
+                local_pipeline,
+                vec![
+                    Turn::Unavailable,
+                    Turn::Stream(vec![last_token(450)], Then::End),
+                ],
+                3,
+            )
+            .await,
+        );
+        outcomes.push(
+            outcomes_on_c(
+                local_pipeline,
+                vec![
+                    Turn::Stream(vec![token(450), went_away()], Then::End),
+                    Turn::Stream(vec![last_token(4996)], Then::End),
+                ],
+                3,
+            )
+            .await,
+        );
+    }
+    let new_request = vec!["new_request/success x1".to_string()];
+    let ongoing = vec!["ongoing_request/success x1".to_string()];
+    assert_eq!(
+        outcomes,
+        [new_request.clone(), ongoing.clone(), new_request, ongoing]
+    );
+}
+
+/// A migration that runs out of attempts records one `failure` and nothing else, on both
+/// local pipelines: the caller receives the error, and dropping the stream records no second
+/// outcome.
+#[tokio::test]
+async fn a_failed_migration_records_one_failure_on_both_local_pipelines() {
+    let mut outcomes = Vec::new();
+    for local_pipeline in BOTH {
+        outcomes.push(
+            outcomes_on_c(
+                local_pipeline,
+                vec![
+                    Turn::Stream(vec![token(450), went_away()], Then::End),
+                    Turn::Unavailable,
+                ],
+                1,
+            )
+            .await,
+        );
+    }
+    let failure = vec!["ongoing_request/failure x1".to_string()];
+    assert_eq!(outcomes, [failure.clone(), failure]);
 }
 
 /// A slow client: the caller reads a few items of an endless ready stream and then stops
