@@ -135,9 +135,6 @@ pub(crate) trait ItemForm: Send + Sync + 'static {
     /// One item.
     type Item<U: Data>: Send + 'static;
 
-    /// The `Annotated` value of `item`.
-    fn item<U: Data>(item: &Self::Item<U>) -> &Annotated<U>;
-
     /// The `Annotated` value of `item`, to edit in place.
     fn item_mut<U: Data>(item: &mut Self::Item<U>) -> &mut Annotated<U>;
 
@@ -146,12 +143,6 @@ pub(crate) trait ItemForm: Send + Sync + 'static {
 
     /// `item` in this form.
     fn from_annotated<U: Data>(item: Annotated<U>) -> Self::Item<U>;
-
-    /// `item` with its `Annotated` value converted by `convert`.
-    fn map_item<U: Data, V: Data>(
-        item: Self::Item<U>,
-        convert: impl FnOnce(Annotated<U>) -> Annotated<V>,
-    ) -> Self::Item<V>;
 }
 
 /// An item of form `F`.
@@ -164,11 +155,6 @@ pub(crate) struct DynamoForm;
 
 impl ItemForm for DynamoForm {
     type Item<U: Data> = Annotated<U>;
-
-    #[inline]
-    fn item<U: Data>(item: &Annotated<U>) -> &Annotated<U> {
-        item
-    }
 
     #[inline]
     fn item_mut<U: Data>(item: &mut Annotated<U>) -> &mut Annotated<U> {
@@ -184,14 +170,6 @@ impl ItemForm for DynamoForm {
     fn from_annotated<U: Data>(item: Annotated<U>) -> Annotated<U> {
         item
     }
-
-    #[inline]
-    fn map_item<U: Data, V: Data>(
-        item: Annotated<U>,
-        convert: impl FnOnce(Annotated<U>) -> Annotated<V>,
-    ) -> Annotated<V> {
-        convert(item)
-    }
 }
 
 /// gdl's items, `gdl::Result<Annotated<U>>`, read through [`CheckedItems`], so always `Ok`.
@@ -201,42 +179,51 @@ impl ItemForm for GdlForm {
     type Item<U: Data> = gdl::Result<Annotated<U>>;
 
     #[inline]
-    fn item<U: Data>(item: &gdl::Result<Annotated<U>>) -> &Annotated<U> {
-        match item {
-            Ok(item) => item,
-            Err(_) => unreachable!("checked items carry no `Err`"),
-        }
-    }
-
-    #[inline]
     fn item_mut<U: Data>(item: &mut gdl::Result<Annotated<U>>) -> &mut Annotated<U> {
-        match item {
-            Ok(item) => item,
-            Err(_) => unreachable!("checked items carry no `Err`"),
-        }
+        checked_mut(item)
     }
 
     #[inline]
     fn into_annotated<U: Data>(item: gdl::Result<Annotated<U>>) -> Annotated<U> {
-        match item {
-            Ok(item) => item,
-            Err(_) => unreachable!("checked items carry no `Err`"),
-        }
+        into_checked(item)
     }
 
     #[inline]
     fn from_annotated<U: Data>(item: Annotated<U>) -> gdl::Result<Annotated<U>> {
         Ok(item)
     }
+}
 
-    #[inline]
-    fn map_item<U: Data, V: Data>(
-        item: gdl::Result<Annotated<U>>,
-        convert: impl FnOnce(Annotated<U>) -> Annotated<V>,
-    ) -> gdl::Result<Annotated<V>> {
-        item.map(convert)
+/// The `Annotated` value of an item read through [`CheckedItems`], which is always `Ok`. An
+/// operator that edits its items in place reads them in their gdl `Result`, so an item is never
+/// taken out of its `Result` and wrapped again, which would move it (about 600 bytes) twice per
+/// stage.
+#[inline]
+pub(crate) fn checked<U>(item: &gdl::Result<Annotated<U>>) -> &Annotated<U> {
+    match item {
+        Ok(item) => item,
+        Err(_) => unreachable!("checked items carry no `Err`"),
     }
 }
+
+/// As [`checked`], to edit in place.
+#[inline]
+pub(crate) fn checked_mut<U>(item: &mut gdl::Result<Annotated<U>>) -> &mut Annotated<U> {
+    match item {
+        Ok(item) => item,
+        Err(_) => unreachable!("checked items carry no `Err`"),
+    }
+}
+
+/// As [`checked`], by value, for a path that takes the item out of its `Result`.
+#[inline]
+pub(crate) fn into_checked<U>(item: gdl::Result<Annotated<U>>) -> Annotated<U> {
+    match item {
+        Ok(item) => item,
+        Err(_) => unreachable!("checked items carry no `Err`"),
+    }
+}
+
 /// Dynamo's `next`, as a Dynamo operator's body calls it.
 ///
 /// A newtype rather than an impl on `Arc<dyn AsyncEngine>`: inside an `async_trait` method the
