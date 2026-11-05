@@ -49,8 +49,8 @@
 //! | Row | Allocations, 1 item | Bytes, 1 item | Allocations, 16 items | Bytes, 16 items |
 //! |---|---:|---:|---:|---:|
 //! | `engine` | 7 | 2,752 | 22 | 2,812 |
-//! | `a-gdl` | 328 | 65,615 | 841 | 87,103 |
-//! | `b-gdl` | 343 | 82,306 | 856 | 103,794 |
+//! | `a-gdl` | 328 | 63,647 | 841 | 85,135 |
+//! | `b-gdl` | 343 | 80,338 | 856 | 101,826 |
 //! | `c-gdl` | 38 | 28,148 | 53 | 28,208 |
 //! | `embed-engine` | 8 | 6,548 | 23 | 88,868 |
 //! | `embeddings-gdl` | 177 | 41,647 | 2,261 | 527,095 |
@@ -132,11 +132,11 @@ const BASELINE: &[Row] = &[
     row("engine", 1, 7, 2752),
     row("engine", 16, 22, 2812),
     // +2 for the boxed chat and preprocessed requests (see the module docs).
-    row("a-gdl", 1, 328, 65615),
-    row("a-gdl", 16, 841, 87103),
+    row("a-gdl", 1, 328, 63647),
+    row("a-gdl", 16, 841, 85135),
     // +2 for the boxed chat and preprocessed requests (see the module docs).
-    row("b-gdl", 1, 343, 82306),
-    row("b-gdl", 16, 856, 103794),
+    row("b-gdl", 1, 343, 80338),
+    row("b-gdl", 16, 856, 101826),
     // +1 for the boxed preprocessed request (see the module docs).
     row("c-gdl", 1, 38, 28148),
     row("c-gdl", 16, 53, 28208),

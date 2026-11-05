@@ -71,9 +71,7 @@ use crate::local_model::runtime_config::{
 #[cfg(feature = "mm-routing")]
 use crate::model_card::ModelInfoType;
 use crate::model_card::{ModelDeploymentCard, ModelInfo, PromptFormatterArtifact};
-use crate::operator::{
-    Downstream, DynamoDownstream, GdlDownstream, GdlOperator, gdl_error, native,
-};
+use crate::operator::{Downstream, GdlDownstream, GdlOperator, gdl_error, native};
 #[cfg(feature = "mm-routing")]
 use crate::preprocessor::media::MediaFetcher;
 use crate::preprocessor::media::{MediaDecoder, MediaLoader, max_data_url_bytes};
@@ -91,7 +89,7 @@ use dynamo_parsers::{
 };
 use dynamo_runtime::engine::{AsyncEngine, AsyncEngineContextProvider};
 use dynamo_runtime::pipeline::{
-    AsyncEngineContext, Context as PipelineContext, Error, ManyOut, Operator, SingleIn,
+    AsyncEngineContext, Context as PipelineContext, Error, ManyOut, SingleIn,
 };
 use dynamo_runtime::protocols::annotated::{Annotated, AnnotationsProvider};
 
@@ -8451,40 +8449,6 @@ fn preprocessing_lifecycle(context: &PipelineContext<()>) -> LifecycleTrace {
 // any prompt template that does not support this should return an error
 // oob - we should update any prompt template that does not support this to support it
 
-// Transition: remove when the gdl pipeline is the only local pipeline.
-impl
-    Operator<
-        SingleIn<NvCreateChatCompletionRequest>,
-        ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>,
-        SingleIn<PreprocessedRequest>,
-        ManyOut<Annotated<BackendOutput>>,
-    > for OpenAIPreprocessor
-{
-    fn generate<'life0, 'async_trait>(
-        &'life0 self,
-        request: SingleIn<NvCreateChatCompletionRequest>,
-        next: Arc<
-            dyn AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>,
-        >,
-    ) -> Pin<
-        Box<
-            dyn Future<
-                    Output = Result<
-                        ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>,
-                        Error,
-                    >,
-                > + Send
-                + 'async_trait,
-        >,
-    >
-    where
-        'life0: 'async_trait,
-        Self: 'async_trait,
-    {
-        Box::pin(self.generate_chat(request, DynamoDownstream(next)))
-    }
-}
-
 /// The engine the stages below a preprocessor form, as chat's speculative next-turn prefill
 /// calls it.
 pub type BelowEngine =
@@ -8545,19 +8509,10 @@ impl gdl::Around for PreprocessorNode<NvCreateChatCompletionRequest> {
     {
         async move {
             let (mut request, context) = (*request).into_parts();
+            // gdl sends the request on once this half returns it.
             let (common_request, state, tool_definitions) = self
                 .op
-                .chat_forward(
-                    &mut request,
-                    context,
-                    // gdl sends the request on once this half returns it.
-                    |common_request| std::future::ready(Ok(common_request)),
-                    |common_request, request, state| {
-                        // Checked before the request is sent on, unlike the Dynamo operator.
-                        let tool_definitions = OpenAIPreprocessor::chat_tool_definitions(request)?;
-                        Ok((common_request, state, tool_definitions))
-                    },
-                )
+                .chat_forward(&mut request, context)
                 .await
                 .map_err(gdl_error)?;
             let context = common_request.context();
@@ -8593,76 +8548,31 @@ impl gdl::Around for PreprocessorNode<NvCreateChatCompletionRequest> {
 }
 
 impl OpenAIPreprocessor {
-    /// Preprocess a chat request, send it on, and postprocess the response: the body of the
-    /// chat preprocessor's Dynamo operator. The gdl pipeline runs the halves as an around node
-    /// instead (see [`PreprocessorNode`]).
-    ///
-    /// Transition: remove when the gdl pipeline is the only local pipeline.
-    async fn generate_chat(
-        &self,
-        request: SingleIn<NvCreateChatCompletionRequest>,
-        next: DynamoDownstream<PreprocessedRequest, BackendOutput>,
-    ) -> Result<ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>, Error> {
-        let (mut request, context) = request.into_parts();
-        self.chat_forward(
-            &mut request,
-            context,
-            // forward the common completion request to the next operator
-            |common_request| next.send(common_request),
-            |response_stream, request, state| {
-                // Extract context once
-                let context = response_stream.context();
-
-                // Checked after the request is sent, as this path always has. Validation
-                // before dispatch already checked these tools, so this does not fail in
-                // practice.
-                let tool_definitions = Self::chat_tool_definitions(request)?;
-                let stream = self.chat_backward(
-                    request,
-                    state,
-                    tool_definitions,
-                    response_stream,
-                    context.clone(),
-                    || next.0.clone(),
-                );
-
-                // box the response stream once
-                Ok(
-                    DynamoDownstream::<PreprocessedRequest, BackendOutput>::respond(
-                        stream, context,
-                    ),
-                )
-            },
-        )
-        .await
-    }
-
     /// Everything the chat preprocessor does before it sends the request on, with `request` and
-    /// `context` unpacked from the request: `dispatch` sends the preprocessed request on, and
-    /// `then` gets its result, the request, and what [`chat_backward`](Self::chat_backward)
-    /// needs of it. A native operator that returns the preprocessed request instead of sending
-    /// it passes it through `dispatch`.
+    /// `context` unpacked from the request: the preprocessed request, what
+    /// [`chat_backward`](Self::chat_backward) needs of the request, and the request's tools,
+    /// validated (see [`chat_tool_definitions`](Self::chat_tool_definitions)). Every check runs
+    /// before the request is sent on.
     ///
-    /// Nothing large is returned and `then` is not async, so the request stays with the caller
-    /// and the state where this function built it: each copy of them would cost a memcpy per
-    /// request.
-    ///
-    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
+    /// The request stays with the caller, and the state is built in the returned value: each
+    /// copy of them would cost a memcpy per request.
     // A block, not an `async fn`: the block uses its arguments where it captured them, where
     // an `async fn` would move each into a local first and keep both in its future.
     #[allow(clippy::manual_async_fn)]
-    fn chat_forward<Sent, T, Dispatch, Fut, Then>(
+    fn chat_forward(
         &self,
         request: &mut NvCreateChatCompletionRequest,
         context: PipelineContext<()>,
-        dispatch: Dispatch,
-        then: Then,
-    ) -> impl Future<Output = Result<T, Error>>
-    where
-        Dispatch: Fn(SingleIn<PreprocessedRequest>) -> Fut,
-        Fut: Future<Output = Result<Sent, Error>>,
-        Then: FnOnce(Sent, &NvCreateChatCompletionRequest, ChatState) -> Result<T, Error>,
-    {
+    ) -> impl Future<
+        Output = Result<
+            (
+                SingleIn<PreprocessedRequest>,
+                ChatState,
+                Option<Vec<ToolDefinition>>,
+            ),
+            Error,
+        >,
+    > {
         async move {
             let lifecycle = preprocessing_lifecycle(&context);
             let preprocessing = lifecycle.start(LifecycleStage::RequestPreprocessing);
@@ -8842,10 +8752,9 @@ impl OpenAIPreprocessor {
                 .collect();
             drop(preprocessing);
 
-            let sent = dispatch(common_request).await?;
-            then(
-                sent,
-                request,
+            let tool_definitions = Self::chat_tool_definitions(request)?;
+            Ok((
+                common_request,
                 ChatState {
                     request_id,
                     response_generator,
@@ -8861,7 +8770,8 @@ impl OpenAIPreprocessor {
                     tool_processing_route,
                     annotations,
                 },
-            )
+                tool_definitions,
+            ))
         }
     }
 
@@ -8878,10 +8788,10 @@ impl OpenAIPreprocessor {
 
     /// Everything the chat preprocessor does with the response: `response_stream`, the response
     /// to the request [`chat_forward`](Self::chat_forward) made, as the client's chat chunks.
+    /// Generic over the stream it reads, so a test can drive it without a pipeline.
     /// `context` is the request's; `warmup` gives the engine a speculative next-turn prefill is
     /// sent to, and is called only when the request asks for one.
     ///
-    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
     #[inline(always)]
     fn chat_backward<S, W>(
         &self,
@@ -8979,8 +8889,6 @@ impl OpenAIPreprocessor {
 
 /// What the chat preprocessor keeps of a request between sending it on and reading the
 /// response (see [`OpenAIPreprocessor::chat_forward`]).
-///
-/// Transition: make concrete when the gdl pipeline is the only local pipeline.
 pub(crate) struct ChatState {
     request_id: String,
     response_generator: Box<crate::protocols::openai::chat_completions::DeltaGenerator>,
@@ -8995,36 +8903,6 @@ pub(crate) struct ChatState {
     guided_tool_constraint: crate::protocols::openai::GuidedToolConstraint,
     tool_processing_route: ToolProcessingRoute,
     annotations: Vec<Annotated<NvCreateChatCompletionStreamResponse>>,
-}
-
-// Transition: remove when the gdl pipeline is the only local pipeline.
-impl
-    Operator<
-        SingleIn<NvCreateCompletionRequest>,
-        ManyOut<Annotated<NvCreateCompletionResponse>>,
-        SingleIn<PreprocessedRequest>,
-        ManyOut<Annotated<BackendOutput>>,
-    > for OpenAIPreprocessor
-{
-    fn generate<'life0, 'async_trait>(
-        &'life0 self,
-        request: SingleIn<NvCreateCompletionRequest>,
-        next: Arc<
-            dyn AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>,
-        >,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<ManyOut<Annotated<NvCreateCompletionResponse>>, Error>>
-                + Send
-                + 'async_trait,
-        >,
-    >
-    where
-        'life0: 'async_trait,
-        Self: 'async_trait,
-    {
-        Box::pin(self.generate_completion(request, DynamoDownstream(next)))
-    }
 }
 
 /// What the completions preprocessor's forward half keeps of a request for its backward half.
@@ -9051,15 +8929,10 @@ impl gdl::Around for PreprocessorNode<NvCreateCompletionRequest> {
     {
         async move {
             let (request, context) = (*request).into_parts();
+            // gdl sends the request on once this half returns it.
             let (common_request, state) = self
                 .op
-                .completion_forward(
-                    request,
-                    context,
-                    // gdl sends the request on once this half returns it.
-                    |common_request| std::future::ready(Ok(common_request)),
-                    |common_request, state| Ok((common_request, state)),
-                )
+                .completion_forward(request, context)
                 .await
                 .map_err(gdl_error)?;
             let context = common_request.context();
@@ -9083,58 +8956,17 @@ impl gdl::Around for PreprocessorNode<NvCreateCompletionRequest> {
 }
 
 impl OpenAIPreprocessor {
-    /// Preprocess a completions request, send it on, and postprocess the response: the body
-    /// of the completions preprocessor's Dynamo operator. The gdl pipeline runs the halves as
-    /// an around node instead (see [`PreprocessorNode`]).
-    ///
-    /// Transition: remove when the gdl pipeline is the only local pipeline.
-    async fn generate_completion(
-        &self,
-        request: SingleIn<NvCreateCompletionRequest>,
-        next: DynamoDownstream<PreprocessedRequest, BackendOutput>,
-    ) -> Result<ManyOut<Annotated<NvCreateCompletionResponse>>, Error> {
-        let (request, context) = request.into_parts();
-        self.completion_forward(
-            request,
-            context,
-            // forward the common completion request to the next operator
-            |common_request| next.send(common_request),
-            |response_stream, state| {
-                // Extract context once
-                let context = response_stream.context();
-
-                let stream = Self::completion_backward(state, response_stream, context.clone());
-                Ok(
-                    DynamoDownstream::<PreprocessedRequest, BackendOutput>::respond(
-                        stream, context,
-                    ),
-                )
-            },
-        )
-        .await
-    }
-
-    /// Everything the completions preprocessor does before it sends the request on:
-    /// `dispatch` sends the preprocessed request on, and `then` gets its result and what
-    /// [`completion_backward`](Self::completion_backward) needs. As in
-    /// [`chat_forward`](Self::chat_forward), nothing large is returned and `then` is not async.
-    ///
-    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
+    /// Everything the completions preprocessor does before it sends the request on: the
+    /// preprocessed request, and what [`completion_backward`](Self::completion_backward) needs.
+    /// As in [`chat_forward`](Self::chat_forward), the state is built in the returned value.
     // A block, not an `async fn`: the block uses its arguments where it captured them, where
     // an `async fn` would move each into a local first and keep both in its future.
     #[allow(clippy::manual_async_fn)]
-    fn completion_forward<Sent, T, Dispatch, Fut, Then>(
+    fn completion_forward(
         &self,
         mut request: NvCreateCompletionRequest,
         context: PipelineContext<()>,
-        dispatch: Dispatch,
-        then: Then,
-    ) -> impl Future<Output = Result<T, Error>>
-    where
-        Dispatch: Fn(SingleIn<PreprocessedRequest>) -> Fut,
-        Fut: Future<Output = Result<Sent, Error>>,
-        Then: FnOnce(Sent, CompletionState) -> Result<T, Error>,
-    {
+    ) -> impl Future<Output = Result<(SingleIn<PreprocessedRequest>, CompletionState), Error>> {
         async move {
             let _stage_guard = StageGuard::new(STAGE_PREPROCESS, "");
 
@@ -9245,9 +9077,8 @@ impl OpenAIPreprocessor {
             // End preprocess stage before handing off to downstream (route/dispatch).
             drop(_stage_guard);
 
-            let sent = dispatch(common_request).await?;
-            then(
-                sent,
+            Ok((
+                common_request,
                 CompletionState {
                     response_generator,
                     trace_state,
@@ -9255,14 +9086,12 @@ impl OpenAIPreprocessor {
                     trace_finish_reason_metadata,
                     annotations,
                 },
-            )
+            ))
         }
     }
 
     /// Everything the completions preprocessor does with the response. `context` is the
     /// request's.
-    ///
-    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
     #[inline(always)]
     fn completion_backward<S>(
         state: CompletionState,
@@ -9303,8 +9132,6 @@ impl OpenAIPreprocessor {
 
 /// What the completions preprocessor keeps of a request between sending it on and reading
 /// the response.
-///
-/// Transition: make concrete when the gdl pipeline is the only local pipeline.
 pub(crate) struct CompletionState {
     response_generator: Box<crate::protocols::openai::completions::DeltaGenerator>,
     trace_state: Option<crate::request_trace::RequestEndTraceState>,
@@ -9313,39 +9140,10 @@ pub(crate) struct CompletionState {
     annotations: Vec<Annotated<NvCreateCompletionResponse>>,
 }
 
-// Transition: remove when the gdl pipeline is the only local pipeline.
-impl
-    Operator<
-        SingleIn<NvCreateEmbeddingRequest>,
-        ManyOut<Annotated<NvCreateEmbeddingResponse>>,
-        SingleIn<PreprocessedEmbeddingRequest>,
-        ManyOut<Annotated<EmbeddingsEngineOutput>>,
-    > for OpenAIPreprocessor
-{
-    fn generate<'life0, 'async_trait>(
-        &'life0 self,
-        request: SingleIn<NvCreateEmbeddingRequest>,
-        next: Arc<
-            dyn AsyncEngine<
-                    SingleIn<PreprocessedEmbeddingRequest>,
-                    ManyOut<Annotated<EmbeddingsEngineOutput>>,
-                    Error,
-                >,
-        >,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<ManyOut<Annotated<NvCreateEmbeddingResponse>>, Error>>
-                + Send
-                + 'async_trait,
-        >,
-    >
-    where
-        'life0: 'async_trait,
-        Self: 'async_trait,
-    {
-        Box::pin(self.generate_embedding(request, DynamoDownstream(next)))
-    }
-}
+/// The stage below the embeddings preprocessor, as its body calls it: `next` takes the
+/// preprocessed request as `SingleIn` itself, which is small.
+type EmbeddingDownstream<N> =
+    GdlDownstream<N, SingleIn<PreprocessedEmbeddingRequest>, PreprocessedEmbeddingRequest>;
 
 impl gdl::Operator for GdlOperator<OpenAIPreprocessor, NvCreateEmbeddingRequest> {
     type UpReq = SingleIn<NvCreateEmbeddingRequest>;
@@ -9369,55 +9167,47 @@ impl gdl::Operator for GdlOperator<OpenAIPreprocessor, NvCreateEmbeddingRequest>
 }
 
 impl OpenAIPreprocessor {
-    /// Preprocess an embeddings request, send it on, and postprocess the response: the body of
-    /// the embeddings preprocessor's Dynamo and gdl operators.
-    ///
-    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
-    async fn generate_embedding<D>(
+    /// Preprocess an embeddings request, send it on through `next`, and postprocess the
+    /// response: the body of the embeddings preprocessor's native operator.
+    async fn generate_embedding<N>(
         &self,
         request: SingleIn<NvCreateEmbeddingRequest>,
-        next: D,
-    ) -> Result<D::Response<NvCreateEmbeddingResponse>, Error>
+        next: EmbeddingDownstream<N>,
+    ) -> Result<gdl::Items<Annotated<NvCreateEmbeddingResponse>>, Error>
     where
-        D: Downstream<PreprocessedEmbeddingRequest, EmbeddingsEngineOutput>,
+        N: gdl::Next<SingleIn<PreprocessedEmbeddingRequest>, Annotated<EmbeddingsEngineOutput>>,
     {
         let (request, context) = request.into_parts();
-        let (response_stream, annotations) = self
-            .embedding_forward(
-                &request,
-                context,
-                // Forward to next stage
-                |preprocessed_request| next.send(preprocessed_request),
-            )
-            .await?;
-
-        // Extract context once
-        let context = response_stream.context();
-
-        Ok(D::respond(
-            Self::embedding_backward(request, annotations, response_stream),
-            context,
+        let (response_stream, annotations) =
+            self.embedding_forward(&request, context, &next).await?;
+        Ok(gdl::items(
+            Self::embedding_backward(request, annotations, response_stream).map(Ok),
         ))
     }
 
-    /// Everything the embeddings preprocessor does before it sends the request on: `dispatch`
-    /// sends the preprocessed request on. Returns its result and the annotations
+    /// Everything the embeddings preprocessor does before it sends the request on, and the
+    /// send through `next`. Returns the response and the annotations
     /// [`embedding_backward`](Self::embedding_backward) puts first. The request stays with the
     /// caller, which hands it to the backward half: each move of it is a memcpy.
-    ///
-    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
     // A block, not an `async fn`: the block uses its arguments where it captured them, where
     // an `async fn` would move each into a local first and keep both in its future.
     #[allow(clippy::manual_async_fn)]
-    fn embedding_forward<Sent, Dispatch, Fut>(
+    fn embedding_forward<N>(
         &self,
         request: &NvCreateEmbeddingRequest,
         context: PipelineContext<()>,
-        dispatch: Dispatch,
-    ) -> impl Future<Output = Result<(Sent, Vec<Annotated<NvCreateEmbeddingResponse>>), Error>>
+        next: &EmbeddingDownstream<N>,
+    ) -> impl Future<
+        Output = Result<
+            (
+                AnnotatedItems<EmbeddingsEngineOutput>,
+                Vec<Annotated<NvCreateEmbeddingResponse>>,
+            ),
+            Error,
+        >,
+    >
     where
-        Dispatch: Fn(SingleIn<PreprocessedEmbeddingRequest>) -> Fut,
-        Fut: Future<Output = Result<Sent, Error>>,
+        N: gdl::Next<SingleIn<PreprocessedEmbeddingRequest>, Annotated<EmbeddingsEngineOutput>>,
     {
         async move {
             // Preprocess the embedding request
@@ -9431,15 +9221,13 @@ impl OpenAIPreprocessor {
                 .into_iter()
                 .filter_map(|(k, v)| Annotated::from_annotation(k, &v).ok())
                 .collect::<Vec<_>>();
-            let sent = dispatch(context.map(|_| preprocessed_request)).await?;
+            let sent = next.send(context.map(|_| preprocessed_request)).await?;
             Ok((sent, annotations))
         }
     }
 
     /// Everything the embeddings preprocessor does with the response to `request`: the
     /// annotations first, then the response in OpenAI's form.
-    ///
-    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
     #[inline(always)]
     fn embedding_backward<S>(
         request: NvCreateEmbeddingRequest,
@@ -10148,13 +9936,8 @@ mod tests {
         let context =
             PipelineContext::with_id_and_metadata((), request_id.to_string(), Default::default());
         let controller = context.context();
-        let (_, mut state) = preprocessor
-            .chat_forward(
-                &mut request,
-                context,
-                |request| std::future::ready(Ok(request)),
-                |request, _, state| Ok((request, state)),
-            )
+        let (_, mut state, _) = preprocessor
+            .chat_forward(&mut request, context)
             .await
             .unwrap();
         state.payload_handle = Some(
