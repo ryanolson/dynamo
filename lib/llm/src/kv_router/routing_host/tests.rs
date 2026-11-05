@@ -4260,14 +4260,14 @@ async fn a_kill_during_a_retry_mid_stream_records_cancelled_once() {
 /// shapes. Dynamo's host fails the killed dispatch as `Cancelled`, and Migration aborts the
 /// parked lifecycle with that error.
 ///
-/// On gdl no one aborts it: the kill drops Migration's future (at dispatch) or the hop answers
-/// it with an empty stream (mid-stream), and the lifecycle's own drop aborts it with no cause.
-/// Migration cannot abort it at the kill, because a detached prefill route's decode leg may
-/// still take it (`killed_migration_preserves_one_classifier_lifecycle_through_detached_cleanup`).
+/// On gdl the kill drops Migration's future (at dispatch), or the hop answers it with an empty
+/// stream (mid-stream). Migration cannot abort the lifecycle then, because a detached prefill
+/// route's decode leg may still take it
+/// (`killed_migration_preserves_one_classifier_lifecycle_through_detached_cleanup`). So it
+/// gives the lifecycle the cancel as the cause of its drop, and the lifecycle aborts with it
+/// when it is dropped unclaimed.
 #[tokio::test]
 #[serial_test::serial]
-#[ignore = "gdl drops the cause: aborting the parked lifecycle at the kill breaks detached \
-            decode cleanup, so the cause must be deferred to the lifecycle's drop"]
 async fn a_kill_during_a_retry_aborts_the_parked_lifecycle_with_its_cause() {
     use crate::entrypoint::input::LocalPipeline;
 
