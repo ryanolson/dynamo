@@ -8563,16 +8563,7 @@ impl OpenAIPreprocessor {
         &self,
         request: &mut NvCreateChatCompletionRequest,
         context: PipelineContext<()>,
-    ) -> impl Future<
-        Output = Result<
-            (
-                SingleIn<PreprocessedRequest>,
-                ChatState,
-                Option<Vec<ToolDefinition>>,
-            ),
-            Error,
-        >,
-    > {
+    ) -> impl Future<Output = Result<ChatForward, Error>> {
         async move {
             let lifecycle = preprocessing_lifecycle(&context);
             let preprocessing = lifecycle.start(LifecycleStage::RequestPreprocessing);
@@ -8886,6 +8877,14 @@ impl OpenAIPreprocessor {
         stream::iter(state.annotations).chain(final_stream)
     }
 }
+
+/// What [`OpenAIPreprocessor::chat_forward`] gives: the preprocessed request, the chat state,
+/// and the request's tools, validated.
+type ChatForward = (
+    SingleIn<PreprocessedRequest>,
+    ChatState,
+    Option<Vec<ToolDefinition>>,
+);
 
 /// What the chat preprocessor keeps of a request between sending it on and reading the
 /// response (see [`OpenAIPreprocessor::chat_forward`]).
