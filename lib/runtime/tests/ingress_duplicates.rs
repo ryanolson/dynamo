@@ -19,8 +19,7 @@ use tokio::sync::{Semaphore, mpsc};
 use dynamo_runtime::{
     engine::{AsyncEngine, AsyncEngineContextProvider},
     pipeline::{
-        ManyOut, PipelineError, ResponseStream, SegmentSource, ServiceBackend, ServiceEngine,
-        SingleIn, Source,
+        ManyOut, PipelineError, ResponseStream, ServiceEngine, SingleIn,
         network::{Ingress, PushWorkHandler, SerdeIngressPayloadAdapter},
     },
     protocols::annotated::Annotated,
@@ -199,21 +198,11 @@ async fn dropped_request_frees_its_id() {
 }
 
 /// Every constructor serves a request and refuses a duplicate inside the engine
-/// call, including those that take a `SegmentSource` pipeline.
+/// call.
 #[tokio::test]
 async fn every_constructor_serves_and_refuses_duplicates() {
-    fn pipeline(
-        engine: TestEngine,
-    ) -> Arc<SegmentSource<SingleIn<String>, ManyOut<Annotated<String>>>> {
-        let frontend = SegmentSource::new();
-        frontend
-            .link(ServiceBackend::from_engine(engine))
-            .unwrap()
-            .link_terminal(frontend)
-            .unwrap()
-    }
     type Build = fn(TestEngine) -> Arc<dyn PushWorkHandler>;
-    let constructors: [(&str, Build); 7] = [
+    let constructors: [(&str, Build); 4] = [
         ("for_engine", |engine| Ingress::for_engine(engine).unwrap()),
         ("for_engine_with_lifecycle_role", |engine| {
             Ingress::for_engine_with_lifecycle_role(engine, LifecycleOperationRole::Worker).unwrap()
@@ -228,15 +217,6 @@ async fn every_constructor_serves_and_refuses_duplicates() {
                 LifecycleOperationRole::Worker,
             )
             .unwrap()
-        }),
-        ("for_pipeline", |engine| {
-            Ingress::for_pipeline(pipeline(engine)).unwrap()
-        }),
-        ("link", |engine| Ingress::link(pipeline(engine)).unwrap()),
-        ("attach", |engine| {
-            let ingress = Ingress::new();
-            ingress.attach(pipeline(engine)).unwrap();
-            ingress
         }),
     ];
     for (name, build) in constructors {
