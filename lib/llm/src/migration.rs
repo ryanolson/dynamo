@@ -10,13 +10,13 @@ use std::task::{Poll, ready};
 use std::time::Instant;
 
 use anyhow::{Error, Result};
-use dynamo_gdl_adapters::{Boxed, Carried};
+use dynamo_gdl_adapters::{Boxed, Carried, CheckedItems};
 use futures::{FutureExt, Stream, stream::StreamExt};
 
 use crate::{
     http::service::metrics::Metrics,
     model_card::ModelDeploymentCard,
-    operator::{Downstream, DynamoDownstream, GdlDownstream, GdlOperator, Item, ItemForm, native},
+    operator::{GdlDownstream, GdlOperator, checked_mut, into_checked, native},
     protocols::{
         TokenIdType,
         common::{
@@ -35,8 +35,7 @@ use dynamo_runtime::engine::Data;
 use dynamo_runtime::error::{self, DynamoError, ErrorReason, ErrorType};
 use dynamo_runtime::metrics::prometheus_names::frontend_service;
 use dynamo_runtime::pipeline::{
-    AsyncEngineContext, AsyncEngineContextProvider, Context, ManyOut, Operator,
-    ServerStreamingEngine, SingleIn, attach_first_response_guard,
+    AsyncEngineContext, AsyncEngineContextProvider, Context, SingleIn, attach_first_response_guard,
     network::egress::route_span::{RouteTraceContext, attach_route_trace_context, error_type_name},
 };
 use dynamo_runtime::protocols::annotated::Annotated;
@@ -286,29 +285,9 @@ impl Migration {
     }
 }
 
-// Transition: remove when the gdl pipeline is the only local pipeline.
-impl<Resp>
-    Operator<
-        SingleIn<PreprocessedRequest>,
-        ManyOut<Annotated<Resp>>,
-        SingleIn<PreprocessedRequest>,
-        ManyOut<Annotated<Resp>>,
-    > for Migration
-where
-    Resp: Data + HasTokenIds,
-{
-    fn generate<'life0, 'async_trait>(
-        &'life0 self,
-        request: SingleIn<PreprocessedRequest>,
-        next: ServerStreamingEngine<PreprocessedRequest, Annotated<Resp>>,
-    ) -> Pin<Box<dyn Future<Output = Result<ManyOut<Annotated<Resp>>>> + Send + 'async_trait>>
-    where
-        'life0: 'async_trait,
-        Self: 'async_trait,
-    {
-        Box::pin(self.migrate(request, DynamoDownstream(next)))
-    }
-}
+/// The stage below Migration, as its body calls it: gdl's `cx` and `next`, which takes the
+/// preprocessed request boxed.
+type MigrationDownstream<N> = GdlDownstream<N, Boxed<PreprocessedRequest>, PreprocessedRequest>;
 
 impl<Resp> gdl::Operator for GdlOperator<Migration, Resp>
 where
@@ -340,23 +319,20 @@ where
 
 impl Migration {
     /// Send `request` on, and send it again on a migratable failure: the body of Migration's
-    /// Dynamo and gdl operators.
-    ///
-    /// Transition: make concrete when the gdl pipeline is the only local pipeline.
-    async fn migrate<Resp, D>(
+    /// native gdl operator.
+    async fn migrate<Resp, N>(
         &self,
         request: SingleIn<PreprocessedRequest>,
-        next: D,
-    ) -> Result<D::Response<Resp>>
+        next: MigrationDownstream<N>,
+    ) -> Result<gdl::Items<Annotated<Resp>>>
     where
         Resp: Data + HasTokenIds,
-        D: Downstream<PreprocessedRequest, Resp> + 'static,
+        N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<Resp>> + 'static,
     {
         // NOTE: Keep the migration operator in the request path at limit zero. The limit controls
         // replacement attempts; RetryManager continues to own the initial attempt uniformly.
         let (preprocessed_request, context) = request.transfer(());
         let engine_ctx = context.context();
-        let engine_ctx_ = engine_ctx.clone();
         let session_affinity = context
             .get_optional::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
             .map_err(Error::msg)?
@@ -373,10 +349,7 @@ impl Migration {
             session_affinity,
         )
         .await?;
-        Ok(D::respond_items(
-            Migrated::Streaming(retry_manager),
-            engine_ctx_,
-        ))
+        Ok(gdl::items(Migrated::Streaming(retry_manager)))
     }
 }
 
@@ -386,53 +359,45 @@ impl Migration {
 /// place of `unfold` and `fuse` over [`RetryManager::next`], which moved the manager and the
 /// item (about 1 KB) through a new future on every item. Only a migration, which awaits the
 /// next attempt's dispatch, runs as a future, and that future owns the manager until it ends.
-///
-/// Transition: make concrete over `D` when the gdl pipeline is the only local pipeline.
 // The large variant is the one every item is read through. Boxing the manager to shrink the
 // enum would cost an allocation per request and an indirection per item, for the sake of the
 // rare variants.
 #[allow(clippy::large_enum_variant)]
-enum Migrated<Resp, D>
+enum Migrated<Resp, N>
 where
     Resp: Data + HasTokenIds,
-    D: Downstream<PreprocessedRequest, Resp>,
 {
     /// Reading the active attempt.
-    Streaming(RetryManager<Resp, D>),
+    Streaming(RetryManager<Resp, N>),
     /// Migrating on a failure of the active attempt, or reading after the manager lost its
     /// attempt: [`RetryManager::migrate_on`] and [`RetryManager::next`] in a future. Its output
     /// gives the manager back with the next item, or with `None` at the end.
-    Migrating(MigrationFuture<Resp, D>),
+    Migrating(MigrationFuture<Resp, N>),
     /// Ended. The manager, and with it the attempt's stream, is dropped when the stream ends,
     /// as `unfold` dropped it, rather than when its caller drops the stream.
     Ended,
 }
 
 /// The future of [`Migrated::Migrating`].
-type MigrationFuture<Resp, D> =
-    Pin<Box<dyn Future<Output = (RetryManager<Resp, D>, Option<Annotated<Resp>>)> + Send>>;
+type MigrationFuture<Resp, N> =
+    Pin<Box<dyn Future<Output = (RetryManager<Resp, N>, Option<Annotated<Resp>>)> + Send>>;
 
 // Nothing in the stream is pinned: the manager is moved freely, as `unfold` moved it, and the
 // future is boxed.
-impl<Resp, D> Unpin for Migrated<Resp, D>
-where
-    Resp: Data + HasTokenIds,
-    D: Downstream<PreprocessedRequest, Resp>,
-{
-}
+impl<Resp, N> Unpin for Migrated<Resp, N> where Resp: Data + HasTokenIds {}
 
-impl<Resp, D> Stream for Migrated<Resp, D>
+impl<Resp, N> Stream for Migrated<Resp, N>
 where
     Resp: Data + HasTokenIds,
-    D: Downstream<PreprocessedRequest, Resp> + 'static,
+    N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<Resp>> + 'static,
 {
-    type Item = Item<D::Form, Resp>;
+    type Item = gdl::Result<Annotated<Resp>>;
 
     // hot path: per-item-response
     fn poll_next(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> Poll<Option<Item<D::Form, Resp>>> {
+    ) -> Poll<Option<gdl::Result<Annotated<Resp>>>> {
         let this = &mut *self;
         loop {
             match this {
@@ -449,7 +414,7 @@ where
                                 return poll;
                             }
                             Poll::Ready(Some(response)) => {
-                                if manager.accept(<D::Form as ItemForm>::item_mut(response)) {
+                                if manager.accept(checked_mut(response)) {
                                     return poll;
                                 }
                             }
@@ -457,7 +422,7 @@ where
                         let Poll::Ready(Some(response)) = poll else {
                             unreachable!("only a failure to migrate on gets here");
                         };
-                        let response = <D::Form as ItemForm>::into_annotated(response);
+                        let response = into_checked(response);
                         let Migrated::Streaming(mut manager) =
                             std::mem::replace(this, Migrated::Ended)
                         else {
@@ -489,7 +454,7 @@ where
                         Some(_) => Migrated::Streaming(manager),
                         None => Migrated::Ended,
                     };
-                    return Poll::Ready(next.map(<D::Form as ItemForm>::from_annotated));
+                    return Poll::Ready(next.map(Ok));
                 }
                 Migrated::Ended => return Poll::Ready(None),
             }
@@ -511,18 +476,16 @@ impl MigrationEvent {
     }
 }
 
-/// Transition: make concrete over `D` when the gdl pipeline is the only local pipeline.
-struct RetryManager<Resp, D>
+struct RetryManager<Resp, N>
 where
     Resp: Data + HasTokenIds,
-    D: Downstream<PreprocessedRequest, Resp>,
 {
     context: Arc<dyn AsyncEngineContext>,
     metadata: BTreeMap<String, String>,
     request: PreprocessedRequest,
     session_affinity: Option<SessionAffinityId>,
-    next_generate: D,
-    next_stream: Option<D::Items>,
+    next_generate: MigrationDownstream<N>,
+    next_stream: Option<CheckedItems<Resp>>,
     attempts: AttemptBudget,
     max_seq_len: Option<u32>,
     model_name: Arc<String>,
@@ -550,20 +513,18 @@ where
     unrecorded_migration: Option<MigrationEvent>,
 }
 
-/// The drop guard of a migration in flight. On the gdl pipeline a kill drops the response in
-/// flight, and on either pipeline the HTTP handler drops it when the client disconnects. Either
-/// drops this manager inside [`RetryManager::new_stream`], before it records the migration's
+/// The drop guard of a migration in flight. A kill drops the response in flight, and the HTTP
+/// handler drops it when the client disconnects. Either drops this manager inside [`RetryManager::new_stream`], before it records the migration's
 /// outcome. Record it here as cancelled, as `new_stream` does when it sees the cancel.
 ///
 /// The guard gives the classifier lifecycle parked for the retry the cancel as its cause, but
-/// leaves it parked rather than abort it: on gdl a remote prefill's route outlives the kill as
-/// a detached task, and its decode leg, which releases the staged KV, takes the parked
+/// leaves it parked rather than abort it: a remote prefill's route outlives the kill as a
+/// detached task, and its decode leg, which releases the staged KV, takes the parked
 /// lifecycle and finishes it. Aborting it here would make that leg start and classify a second
 /// one. Unclaimed, the lifecycle aborts with the cause when it is dropped.
-impl<Resp, D> Drop for RetryManager<Resp, D>
+impl<Resp, N> Drop for RetryManager<Resp, N>
 where
     Resp: Data + HasTokenIds,
-    D: Downstream<PreprocessedRequest, Resp>,
 {
     fn drop(&mut self) {
         // A drop in flight is the request's cancel, whether its context is killed first (gdl's
@@ -587,17 +548,51 @@ struct MigrationCause {
     attempt: u32,
 }
 
-impl<Resp, D> RetryManager<Resp, D>
+/// What the manager's `Drop` calls, so it needs no bound on the stage below.
+impl<Resp, N> RetryManager<Resp, N>
 where
     Resp: Data + HasTokenIds,
-    D: Downstream<PreprocessedRequest, Resp>,
+{
+    /// Record the outcome of the migration in flight, if any, once.
+    fn record_migration_outcome(&mut self, outcome: &str) {
+        if let Some(event) = self.unrecorded_migration.take() {
+            self.metrics.observe_migration_duration(
+                &self.model_name,
+                event.migration_type,
+                outcome,
+                event.started_at.elapsed(),
+            );
+        }
+    }
+
+    /// Give any classifier lifecycle parked for a retry the request's cancel as the cause it
+    /// aborts with if no leg takes it (see [`MigrationState::abort_request_lifecycle_on_drop`]).
+    /// The cause is built only when a lifecycle can be parked.
+    fn abort_request_lifecycle_on_drop_cancelled(&self) {
+        if let Some(state) = self.request.migration_state.as_ref() {
+            let error = DynamoError::builder()
+                .error_type(ErrorType::Cancelled)
+                .message(format!(
+                    "Context id {} is stopped or killed",
+                    self.context.id()
+                ))
+                .build();
+            state.abort_request_lifecycle_on_drop(&error);
+        }
+    }
+}
+
+impl<Resp, N> RetryManager<Resp, N>
+where
+    Resp: Data + HasTokenIds,
+    N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<Resp>>,
 {
     #[allow(clippy::too_many_arguments)]
     pub async fn build(
         context: Arc<dyn AsyncEngineContext>,
         metadata: BTreeMap<String, String>,
         mut preprocessed_request: PreprocessedRequest,
-        next: D,
+        next: MigrationDownstream<N>,
         mut retries_left: u32,
         max_seq_len: Option<u32>,
         model_name: Arc<String>,
@@ -687,13 +682,10 @@ where
                 }
             };
             let mut response = response_stream.next().await?;
-            if self.accept(<D::Form as ItemForm>::item_mut(&mut response)) {
-                return Some(<D::Form as ItemForm>::into_annotated(response));
+            if self.accept(checked_mut(&mut response)) {
+                return Some(into_checked(response));
             }
-            if let Some(response) = self
-                .migrate_on(<D::Form as ItemForm>::into_annotated(response))
-                .await
-            {
+            if let Some(response) = self.migrate_on(into_checked(response)).await {
                 return Some(response);
             }
         }
@@ -777,22 +769,6 @@ where
     fn abort_request_lifecycle(&self, error: &AbortCause) {
         if let Some(state) = self.request.migration_state.as_ref() {
             state.abort_request_lifecycle(Some(error));
-        }
-    }
-
-    /// Give any classifier lifecycle parked for a retry the request's cancel as the cause it
-    /// aborts with if no leg takes it (see [`MigrationState::abort_request_lifecycle_on_drop`]).
-    /// The cause is built only when a lifecycle can be parked.
-    fn abort_request_lifecycle_on_drop_cancelled(&self) {
-        if let Some(state) = self.request.migration_state.as_ref() {
-            let error = DynamoError::builder()
-                .error_type(ErrorType::Cancelled)
-                .message(format!(
-                    "Context id {} is stopped or killed",
-                    self.context.id()
-                ))
-                .build();
-            state.abort_request_lifecycle_on_drop(&error);
         }
     }
 
@@ -1014,18 +990,6 @@ where
         );
     }
 
-    /// Record the outcome of the migration in flight, if any, once.
-    fn record_migration_outcome(&mut self, outcome: &str) {
-        if let Some(event) = self.unrecorded_migration.take() {
-            self.metrics.observe_migration_duration(
-                &self.model_name,
-                event.migration_type,
-                outcome,
-                event.started_at.elapsed(),
-            );
-        }
-    }
-
     fn track_response(&mut self, response: &Annotated<Resp>) {
         let llm_engine_output = match response.data.as_ref() {
             Some(output) => output,
@@ -1155,7 +1119,7 @@ mod tests {
     use dynamo_runtime::error::{BackendError, DynamoError, ErrorType};
     use dynamo_runtime::pipeline::AsyncEngine;
     use dynamo_runtime::pipeline::context::Controller;
-    use dynamo_runtime::pipeline::{ResponseStream, async_trait};
+    use dynamo_runtime::pipeline::{ManyOut, ResponseStream, ServerStreamingEngine, async_trait};
     use dynamo_runtime::protocols::maybe_error::MaybeError;
     use futures::stream;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -2104,7 +2068,7 @@ mod tests {
         behavior: MockBehavior,
         migration_limit: u32,
     ) -> (
-        RetryManager<BackendOutput, EngineDownstream<PreprocessedRequest, BackendOutput>>,
+        RetryManager<BackendOutput, testing::SinkHop<PreprocessedRequest, BackendOutput>>,
         std::sync::Weak<Vec<TokenIdType>>,
     ) {
         let context_id = uuid::Uuid::new_v4().to_string();

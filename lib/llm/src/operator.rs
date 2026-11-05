@@ -93,105 +93,6 @@ pub(crate) trait Downstream<Req: Data, T: Data>: Send + Sync {
     ///
     /// Transition: remove when the gdl pipeline is the only local pipeline.
     fn adopt<U: Data>(stream: ManyOut<Annotated<U>>) -> Self::Response<U>;
-
-    /// The form of the items an operator that edits them in place reads and answers.
-    ///
-    /// Transition: remove when the gdl pipeline is the only local pipeline.
-    type Form: ItemForm;
-
-    /// The response stream of [`send_items`](Self::send_items). On gdl, gdl's `Err` rule is
-    /// already applied to it, as [`send`](Self::send) applies it, so every item is `Ok`.
-    type Items: Stream<Item = Item<Self::Form, T>>
-        + AsyncEngineContextProvider
-        + Send
-        + Unpin
-        + 'static;
-
-    /// Send `request` on, as [`send`](Self::send) does, and read the response as items of
-    /// [`Form`](Self::Form).
-    fn send_items(
-        &self,
-        request: SingleIn<Req>,
-    ) -> impl Future<Output = anyhow::Result<Self::Items>> + Send;
-
-    /// Box a stream of items of [`Form`](Self::Form) once, as the operator's response, as
-    /// [`respond`](Self::respond) does for `Annotated` items.
-    ///
-    /// Transition: remove when the gdl pipeline is the only local pipeline.
-    fn respond_items<U, S>(stream: S, context: Arc<dyn AsyncEngineContext>) -> Self::Response<U>
-    where
-        U: Data,
-        S: Stream<Item = Item<Self::Form, U>> + Send + 'static;
-}
-
-/// A stream item as the stage below sends it, for an operator that edits its items in place:
-/// `Annotated<U>` on Dynamo ([`DynamoForm`]), and on gdl the gdl item,
-/// `gdl::Result<Annotated<U>>` ([`GdlForm`]). Read and answered in this form, an item is never
-/// taken out of its `Result` and wrapped again, which would move it (about 600 bytes) twice per
-/// stage.
-///
-/// Transition: remove when the gdl pipeline is the only local pipeline.
-pub(crate) trait ItemForm: Send + Sync + 'static {
-    /// One item.
-    type Item<U: Data>: Send + 'static;
-
-    /// The `Annotated` value of `item`, to edit in place.
-    fn item_mut<U: Data>(item: &mut Self::Item<U>) -> &mut Annotated<U>;
-
-    /// `item` as an `Annotated` value, for a path that takes it by value.
-    fn into_annotated<U: Data>(item: Self::Item<U>) -> Annotated<U>;
-
-    /// `item` in this form.
-    fn from_annotated<U: Data>(item: Annotated<U>) -> Self::Item<U>;
-}
-
-/// An item of form `F`.
-pub(crate) type Item<F, U> = <F as ItemForm>::Item<U>;
-
-/// Dynamo's items: `Annotated<U>` as it is.
-///
-/// Transition: remove when the gdl pipeline is the only local pipeline.
-pub(crate) struct DynamoForm;
-
-impl ItemForm for DynamoForm {
-    type Item<U: Data> = Annotated<U>;
-
-    #[inline]
-    fn item_mut<U: Data>(item: &mut Annotated<U>) -> &mut Annotated<U> {
-        item
-    }
-
-    #[inline]
-    fn into_annotated<U: Data>(item: Annotated<U>) -> Annotated<U> {
-        item
-    }
-
-    #[inline]
-    fn from_annotated<U: Data>(item: Annotated<U>) -> Annotated<U> {
-        item
-    }
-}
-
-/// gdl's items, `gdl::Result<Annotated<U>>`, read through [`CheckedItems`], so always `Ok`.
-pub(crate) struct GdlForm;
-
-impl ItemForm for GdlForm {
-    type Item<U: Data> = gdl::Result<Annotated<U>>;
-
-    #[inline]
-    fn item_mut<U: Data>(item: &mut gdl::Result<Annotated<U>>) -> &mut Annotated<U> {
-        checked_mut(item)
-    }
-
-    #[inline]
-    fn into_annotated<U: Data>(item: gdl::Result<Annotated<U>>) -> Annotated<U> {
-        into_checked(item)
-    }
-
-    #[inline]
-    fn from_annotated<U: Data>(item: Annotated<U>) -> gdl::Result<Annotated<U>> {
-        Ok(item)
-    }
 }
 
 /// The `Annotated` value of an item read through [`CheckedItems`], which is always `Ok`. An
@@ -277,25 +178,6 @@ impl<Req: Data, T: Data> Downstream<Req, T> for DynamoDownstream<Req, T> {
 
     fn adopt<U: Data>(stream: ManyOut<Annotated<U>>) -> ManyOut<Annotated<U>> {
         stream
-    }
-
-    type Form = DynamoForm;
-
-    type Items = ManyOut<Annotated<T>>;
-
-    fn send_items(
-        &self,
-        request: SingleIn<Req>,
-    ) -> impl Future<Output = anyhow::Result<Self::Items>> + Send {
-        self.0.generate(request)
-    }
-
-    fn respond_items<U, S>(stream: S, context: Arc<dyn AsyncEngineContext>) -> ManyOut<Annotated<U>>
-    where
-        U: Data,
-        S: Stream<Item = Annotated<U>> + Send + 'static,
-    {
-        ResponseStream::new(Box::pin(stream), context)
     }
 }
 
@@ -386,15 +268,20 @@ where
     fn adopt<U: Data>(stream: ManyOut<Annotated<U>>) -> gdl::Items<Annotated<U>> {
         gdl::items(stream.map(Ok))
     }
+}
 
-    type Form = GdlForm;
-
-    type Items = CheckedItems<T>;
-
-    fn send_items(
+impl<N, R: Carried<Req>, Req: Data> GdlDownstream<N, R, Req> {
+    /// Send `request` on, as [`Downstream::send`] does, and read the response's items in their
+    /// gdl `Result`, for an operator that edits them in place (see [`checked_mut`]). gdl's
+    /// `Err` rule is already applied to the stream, so every item is `Ok`.
+    pub(crate) fn send_items<T>(
         &self,
         request: SingleIn<Req>,
-    ) -> impl Future<Output = anyhow::Result<Self::Items>> + Send {
+    ) -> impl Future<Output = anyhow::Result<CheckedItems<T>>> + Send
+    where
+        N: gdl::Next<R, Annotated<T>>,
+        T: Data,
+    {
         let context = request.context();
         let root = self.cx.clone();
         self.next
@@ -406,19 +293,6 @@ where
             })
     }
 
-    fn respond_items<U, S>(
-        stream: S,
-        _context: Arc<dyn AsyncEngineContext>,
-    ) -> gdl::Items<Annotated<U>>
-    where
-        U: Data,
-        S: Stream<Item = gdl::Result<Annotated<U>>> + Send + 'static,
-    {
-        gdl::items(stream)
-    }
-}
-
-impl<N, R: Carried<Req>, Req: Data> GdlDownstream<N, R, Req> {
     /// Send `request` on under `cx` and read the response as a Dynamo stream.
     fn send_under<T>(
         &self,
