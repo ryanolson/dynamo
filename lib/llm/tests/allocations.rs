@@ -143,17 +143,17 @@ const BASELINE: &[Row] = &[
     row("a-gdl", 1, 328, 65719),
     row("a-gdl", 16, 841, 87207),
     // Transition: remove when the gdl pipeline is the only local pipeline.
-    row("b", 1, 399, 224617),
-    row("b", 16, 912, 246105),
+    row("b", 1, 399, 224649),
+    row("b", 16, 912, 246137),
     // +2 for the boxed chat and preprocessed requests (see the module docs).
-    row("b-gdl", 1, 343, 82522),
-    row("b-gdl", 16, 856, 104010),
+    row("b-gdl", 1, 343, 82554),
+    row("b-gdl", 16, 856, 104042),
     // Transition: remove when the gdl pipeline is the only local pipeline.
-    row("c", 1, 71, 142051),
-    row("c", 16, 86, 142111),
+    row("c", 1, 71, 142083),
+    row("c", 16, 86, 142143),
     // +1 for the boxed preprocessed request (see the module docs).
-    row("c-gdl", 1, 38, 28356),
-    row("c-gdl", 16, 53, 28416),
+    row("c-gdl", 1, 38, 28388),
+    row("c-gdl", 16, 53, 28448),
     row("embed-engine", 1, 8, 6548),
     row("embed-engine", 16, 23, 88868),
     // Transition: remove when the gdl pipeline is the only local pipeline.
