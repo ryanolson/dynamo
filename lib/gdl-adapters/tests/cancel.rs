@@ -957,7 +957,6 @@ async fn a_kill_before_http_stream_drop_records_one_cancelled_migration() {
 
 /// An HTTP body dropped during a retry records one cancellation after its monitor kills the request.
 #[tokio::test]
-#[ignore = "R3: HTTP body drop destroys Migration before the disconnect monitor kills the request"]
 async fn an_http_stream_drop_during_a_retry_records_one_cancelled_migration() {
     let mut outcomes = Vec::new();
     for local_pipeline in BOTH {
