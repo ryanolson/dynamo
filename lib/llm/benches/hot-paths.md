@@ -127,39 +127,45 @@ the stages.
 
 - **Per request, a future copied with its gap:** when a coroutine's `Unresumed` layout puts a
   large gap before a field that is filled by `memcpy`, LLVM copies the gap with the field. The
-  gap is the space the coroutine keeps for a later state, so the copy carries no data.
+  gap is the space the coroutine keeps for a later state, so the copy carries no data. rustc
+  picks which field comes after a gap, and a small change to a type can change its choice.
 
-  On `b-gdl`, `gdl::compose::build` copies 9,808 bytes per request into the box of Migration's
-  future. A change of 24 bytes in `PreprocessedRequest` (from the merge of dynamo main) made
-  rustc put `Migration::migrate`'s arguments after the 9,696 bytes of its `RetryManager::build`
-  future. The copy is that gap and the 80-byte `gdl::Cx` after it. On `c-gdl` the first
-  argument stays at offset 0, and there is no such copy.
+  `Migration::migrate`'s future is the one to watch: its `RetryManager::build` state is about
+  9.6 KB, and rustc puts `migrate`'s arguments before or after that space. On this tree they
+  sit before it: on `b-gdl` and `c-gdl` the `Unresumed` variant puts `request` at offset 0, so
+  the layout has no gap before the first argument and no sign of the copy (debug build,
+  aarch64).
+
+  A later dynamo (ai-dynamo main at 53015f9b05) showed the copy. There, a change of 24 bytes
+  in `PreprocessedRequest` made rustc put `migrate`'s arguments after 9,727 bytes of padding
+  on `b-gdl` (debug build), and `gdl::compose::build` copied 9,808 bytes per request into the
+  box of Migration's future: the gap and the 80-byte `gdl::Cx` after it. The numbers below
+  were measured on that tree (aarch64), not on this one.
 
   To find a copy like this:
 
   1. Find the function that calls `memcpy` with the large size: the `memcpy` size attribution
      of the bench host, or callgrind's callers of `memcpy` in the window.
-  2. Read its disassembly. Here the stack frame of the `build` instance is 9,808 bytes, and
-     `mov w2, #0x2650` (9,808) comes before `bl memcpy`.
+  2. Read its disassembly. On the later dynamo the stack frame of the `build` instance was
+     9,808 bytes, and `mov w2, #0x2650` (9,808) came before `bl memcpy`.
   3. Print the layout:
      `RUSTC_BOOTSTRAP=1 cargo rustc -p dynamo-llm --lib -- -Zprint-type-sizes`. The sign is a
      `padding` line before the first `upvar` of the `Unresumed` variant.
 
-  Changes to `migrate` in dynamo did not remove the cost (aarch64, 2026-11-05, on 5eb99f3583):
+  Changes to `migrate` that were tried on the later dynamo did not remove the cost:
 
   - `migrate` as a plain function that returns `RetryManager::build`'s future: the future
-    falls from 12,272 to 9,872 bytes on B, and the 9,808-byte copy goes. But the code that ran
-    in the first poll now runs inside `build`, and it copies the 2 KB request three more times.
-    `b-gdl` loses 1 `memcpy` and 1.3k instructions per request; `c-gdl` gains 1 `memcpy` and
+    fell from 12,272 to 9,872 bytes on B, and the 9,808-byte copy went. But the code that ran
+    in the first poll then ran inside `build`, and it copied the 2 KB request three more times.
+    `b-gdl` lost 1 `memcpy` and 1.3k instructions per request; `c-gdl` gained 1 `memcpy` and
     1.5k instructions.
   - The same, with the context read before the request leaves its box: a new copy of 7,400
     bytes, from a gap of 7,376 bytes before `session_affinity` in `RetryManager::build`'s
     future.
   - The same, with the context read before `transfer`: the same 4 request copies.
 
-  rustc picks which field comes after a gap, and a small change to a type can change its
-  choice. So a new shape of `migrate` moves the copy and does not remove it. Two changes can
-  remove it: keep the request in its box until `RetryManager` takes it, so that no 2 KB request
+  So a new shape of `migrate` moves the copy and does not remove it. Two changes can remove
+  it: keep the request in its box until `RetryManager` takes it, so that no 2 KB request
   moves when the future is built, or change how gdl's `compose::build` makes the future.
 
 - **Not covered:** the window starts where the HTTP handler calls the engine. HTTP parsing, the
