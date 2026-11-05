@@ -1050,6 +1050,15 @@ mod tests {
 
     const MAX_ROOM: u64 = i64::MAX as u64;
 
+    /// `router` over `next` as the frontend's gdl pipeline runs it: a native operator over the
+    /// hop to `next`.
+    pub(super) fn on_gdl(
+        router: &Arc<PrefillRouter>,
+        next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
+    ) -> ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> {
+        crate::operator::testing::operator::<_, PreprocessedRequest, _, _, _>(router.clone(), next)
+    }
+
     #[derive(Default)]
     struct QueryOnlyDecodeHost {
         requests: AtomicUsize,
@@ -1203,8 +1212,8 @@ mod tests {
         ));
 
         let host = Arc::new(CountingDecodeHost::default());
-        let error = router
-            .generate(SingleIn::new(inference_request()), host.clone())
+        let error = on_gdl(&router, host.clone())
+            .generate(SingleIn::new(inference_request()))
             .await
             .expect_err("a pending prefill target must not pass through to decode");
 
@@ -1232,8 +1241,8 @@ mod tests {
         ));
 
         let host = Arc::new(CountingDecodeHost::default());
-        router
-            .generate(SingleIn::new(inference_request()), host.clone())
+        on_gdl(&router, host.clone())
+            .generate(SingleIn::new(inference_request()))
             .await
             .expect("no target means plain passthrough");
         assert_eq!(host.requests.load(Ordering::Relaxed), 1);
@@ -1251,8 +1260,8 @@ mod tests {
         ));
 
         let host = Arc::new(CountingDecodeHost::default());
-        router
-            .generate(SingleIn::new(inference_request()), host.clone())
+        on_gdl(&router, host.clone())
+            .generate(SingleIn::new(inference_request()))
             .await
             .expect("a deactivated router passes through");
         assert_eq!(host.requests.load(Ordering::Relaxed), 1);
@@ -1266,8 +1275,8 @@ mod tests {
         mark_target_pending(&router);
 
         let host = Arc::new(QueryOnlyDecodeHost::default());
-        router
-            .generate(SingleIn::new(query_only_request()), host.clone())
+        on_gdl(&router, host.clone())
+            .generate(SingleIn::new(query_only_request()))
             .await
             .expect("query-only requests bypass the activation gate");
         assert_eq!(host.requests.load(Ordering::Relaxed), 1);
@@ -1295,7 +1304,7 @@ mod tests {
         let in_flight = tokio::spawn({
             let router = router.clone();
             let host = host.clone();
-            async move { router.generate(SingleIn::new(request), host).await }
+            async move { on_gdl(&router, host).generate(SingleIn::new(request)).await }
         });
         // With paused time this sleep completes only once every other task is
         // idle, i.e. once the request has passed the gate and parked on the barrier.
@@ -1395,7 +1404,7 @@ mod tests {
             // Decode can enter its phase even though prefill is still observed.
             let _decode_permit = tracker.set_phase(RequestPhase::Decode).await;
             let error = task
-                .forward_decode::<crate::operator::DynamoDownstream<PreprocessedRequest, LLMEngineOutput>>(
+                .forward_decode_on_gdl(
                     std::future::pending(),
                     Context::new(()).context(),
                     PrefillNeed::None,
@@ -1512,8 +1521,8 @@ mod tests {
 
         // No prefill binding: the old fallback would continue to downstream instead
         // of returning the preview's client error.
-        let error = router
-            .generate(SingleIn::new(request), downstream.clone())
+        let error = on_gdl(&router, downstream.clone())
+            .generate(SingleIn::new(request))
             .await
             .unwrap_err();
         assert!(match_error_chain(
@@ -1533,8 +1542,8 @@ mod tests {
         let next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
             decode_host.clone();
 
-        let mut response = router
-            .generate(SingleIn::new(query_only_request()), next)
+        let mut response = on_gdl(&router, next)
+            .generate(SingleIn::new(query_only_request()))
             .await
             .expect("query-only request should bypass conditional planning");
         let output = response
@@ -1687,8 +1696,8 @@ mod tests {
             } else {
                 Vec::new()
             };
-            let mut stream = router
-                .generate(SingleIn::new(request), downstream.clone())
+            let mut stream = on_gdl(&router, downstream.clone())
+                .generate(SingleIn::new(request))
                 .await
                 .expect("conditional disagg should bypass to the decode host");
             let first = stream.next().await.expect("first frame");
@@ -2117,7 +2126,6 @@ mod tests {
     /// route that runs inline.
     #[tokio::test]
     async fn the_route_acts_on_the_gate_its_caller_read() {
-        use crate::operator::DynamoDownstream;
         use dynamo_runtime::{DistributedRuntime, Runtime, distributed::DistributedConfig};
 
         let runtime = Runtime::from_current().unwrap();
@@ -2140,12 +2148,14 @@ mod tests {
                     Error,
                 >,
         > = decode.clone();
+        // The downstream the native operator gives its route: under a `Cx` that follows the
+        // caller, as the frontend's routed pipelines root it.
+        let next = crate::operator::testing::downstream(
+            dynamo_gdl_adapters::CxBridge::cx(caller.as_ref()),
+            next,
+        );
         let response = router
-            .route(
-                request,
-                DynamoDownstream(next),
-                Some(PrefillGate::PassThrough),
-            )
+            .route(request, next, Some(PrefillGate::PassThrough))
             .await
             .unwrap();
         drop(response);

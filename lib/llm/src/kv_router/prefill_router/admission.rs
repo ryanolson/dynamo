@@ -379,10 +379,7 @@ mod tests {
             let decode: ManyOut<Annotated<LLMEngineOutput>> =
                 ResponseStream::new(Box::pin(stream::pending()), context.clone());
             match completion
-                .forward_decode::<crate::operator::DynamoDownstream<
-                    crate::protocols::common::preprocessor::PreprocessedRequest,
-                    LLMEngineOutput,
-                >>(
+                .forward_decode_on_gdl(
                     async { Ok(decode) },
                     context,
                     PrefillNeed::None,

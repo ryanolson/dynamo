@@ -312,10 +312,43 @@ fn cancel_prefill_on_decode_rejection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operator::DynamoDownstream;
+    use crate::operator::testing::{self, EngineDownstream};
+    use dynamo_gdl_adapters::{AnnotatedItems, CxBridge};
     use dynamo_runtime::pipeline::{ManyOut, ResponseStream};
 
-    type Dynamo = DynamoDownstream<PreprocessedRequest, LLMEngineOutput>;
+    impl PrefillTask {
+        /// [`forward_decode`](Self::forward_decode) as the prefill router's native gdl operator
+        /// calls it: `decode` arrives as the gdl downstream reads the stage below, under a `Cx`
+        /// that follows `request_context`, and the response is read as the frontend reads it.
+        pub(crate) async fn forward_decode_on_gdl(
+            self,
+            decode: impl Future<Output = anyhow::Result<ManyOut<Annotated<LLMEngineOutput>>>>,
+            request_context: Arc<dyn AsyncEngineContext>,
+            output: PrefillNeed,
+            prefill_context: Arc<dyn AsyncEngineContext>,
+        ) -> anyhow::Result<ManyOut<Annotated<LLMEngineOutput>>> {
+            let cx = CxBridge::cx(request_context.as_ref());
+            let root = cx.clone();
+            let decode = async move {
+                let decode = decode.await?;
+                let context = decode.context();
+                Ok(AnnotatedItems::new(
+                    gdl::items(decode.map(Ok)),
+                    root,
+                    context,
+                ))
+            };
+            let response = self
+                .forward_decode::<EngineDownstream<PreprocessedRequest, LLMEngineOutput>>(
+                    decode,
+                    request_context.clone(),
+                    output,
+                    prefill_context,
+                )
+                .await?;
+            Ok(testing::read(response, cx, request_context))
+        }
+    }
     use dynamo_runtime::{
         error::{BackendError, ErrorType},
         pipeline::context::Controller,
@@ -346,7 +379,7 @@ mod tests {
     async fn failure_interrupts_pending_decode_dispatch() {
         let (tx, task) = pending_prefill();
         let context = Arc::new(Controller::default());
-        let mut response = Box::pin(task.forward_decode::<Dynamo>(
+        let mut response = Box::pin(task.forward_decode_on_gdl(
             std::future::pending(),
             context.clone(),
             PrefillNeed::None,
@@ -369,7 +402,7 @@ mod tests {
         let decode: ManyOut<Annotated<LLMEngineOutput>> =
             ResponseStream::new(Box::pin(stream::pending()), context.clone());
         let mut response = task
-            .forward_decode::<Dynamo>(
+            .forward_decode_on_gdl(
                 async { Ok(decode) },
                 context.clone(),
                 PrefillNeed::None,
@@ -413,7 +446,7 @@ mod tests {
             context.clone(),
         );
         let mut response = task
-            .forward_decode::<Dynamo>(
+            .forward_decode_on_gdl(
                 async { Ok(decode) },
                 context.clone(),
                 PrefillNeed::None,
@@ -450,7 +483,7 @@ mod tests {
             context.clone(),
         );
         let mut response = task
-            .forward_decode::<Dynamo>(
+            .forward_decode_on_gdl(
                 async { Ok(decode) },
                 context,
                 PrefillNeed::None,
@@ -477,7 +510,7 @@ mod tests {
             context.clone(),
         );
         let mut response = task
-            .forward_decode::<Dynamo>(
+            .forward_decode_on_gdl(
                 async { Ok(decode) },
                 context,
                 PrefillNeed::None,
@@ -511,7 +544,7 @@ mod tests {
             context.clone(),
         );
         let mut response = task
-            .forward_decode::<Dynamo>(
+            .forward_decode_on_gdl(
                 async { Ok(decode) },
                 context.clone(),
                 PrefillNeed::None,
@@ -543,7 +576,7 @@ mod tests {
         let decode: ManyOut<Annotated<LLMEngineOutput>> =
             ResponseStream::new(Box::pin(stream::pending()), context.clone());
         let response = task
-            .forward_decode::<Dynamo>(
+            .forward_decode_on_gdl(
                 async { Ok(decode) },
                 context.clone(),
                 PrefillNeed::None,
@@ -579,7 +612,7 @@ mod tests {
             );
             let context = Arc::new(Controller::default());
             let mut response = task
-                .forward_decode::<Dynamo>(
+                .forward_decode_on_gdl(
                     async { Ok(decode) },
                     context.clone(),
                     PrefillNeed::BeforeFirst,
@@ -610,7 +643,7 @@ mod tests {
         let context = Arc::new(Controller::default());
         let decode: ManyOut<Annotated<LLMEngineOutput>> =
             ResponseStream::new(Box::pin(stream::pending()), context.clone());
-        let response = task.forward_decode::<Dynamo>(
+        let response = task.forward_decode_on_gdl(
             async { Ok(decode) },
             context.clone(),
             PrefillNeed::BeforeFirst,
@@ -638,7 +671,7 @@ mod tests {
         );
         let context = Arc::new(Controller::default());
         let mut response = task
-            .forward_decode::<Dynamo>(
+            .forward_decode_on_gdl(
                 async { Ok(decode) },
                 context,
                 PrefillNeed::BeforeLast,
@@ -690,7 +723,7 @@ mod tests {
                 context.clone(),
             );
             let mut response = task
-                .forward_decode::<Dynamo>(
+                .forward_decode_on_gdl(
                     async { Ok(decode) },
                     context.clone(),
                     PrefillNeed::BeforeFirst,
@@ -741,7 +774,7 @@ mod tests {
         let error = anyhow::Error::new(error).context("decode admission rejected");
         let request_context = Arc::new(Controller::default());
         let result = task
-            .forward_decode::<Dynamo>(
+            .forward_decode_on_gdl(
                 async { Err(error) },
                 request_context,
                 output,
@@ -787,7 +820,7 @@ mod tests {
             request_context.clone(),
         );
         let mut response = task
-            .forward_decode::<Dynamo>(
+            .forward_decode_on_gdl(
                 async { Ok(decode) },
                 request_context,
                 output,
@@ -823,7 +856,7 @@ mod tests {
         let request_context = Arc::new(Controller::default());
         let case = format!("{output:?}: {error}");
         let result = task
-            .forward_decode::<Dynamo>(
+            .forward_decode_on_gdl(
                 async { Err(error) },
                 request_context,
                 output,
