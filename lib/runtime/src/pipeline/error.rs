@@ -47,9 +47,6 @@ pub enum PipelineError {
     #[error("Deserialization Error: {0}")]
     DeserializationError(String),
 
-    #[error("Failed to issue request to the control plane: {0}")]
-    ControlPlaneRequestError(String),
-
     #[error("Failed to establish a streaming connection: {0}")]
     ConnectionFailed(String),
 
