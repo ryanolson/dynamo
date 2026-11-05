@@ -26,10 +26,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use dynamo_gdl_adapters::{AnnotatedItems, Carried, CheckedItems, CxBridge, enter};
-use dynamo_runtime::engine::{AsyncEngine, Data};
-use dynamo_runtime::pipeline::{AsyncEngineContextProvider, Error, ManyOut, SingleIn};
+use dynamo_runtime::engine::Data;
+use dynamo_runtime::pipeline::{AsyncEngineContextProvider, SingleIn};
 use dynamo_runtime::protocols::annotated::Annotated;
-use futures::{FutureExt, Stream, StreamExt};
+use futures::{FutureExt, Stream};
 use tracing::Instrument;
 
 #[cfg(test)]
@@ -74,11 +74,6 @@ pub(crate) trait Downstream<Req: Data, T: Data>: Send + Sync {
     ///
     /// Transition: remove when the gdl pipeline is the only local pipeline.
     type Response<U: Data>;
-
-    /// A stream from [`send`](Self::send) as the operator's response, unchanged.
-    ///
-    /// Transition: remove when the gdl pipeline is the only local pipeline.
-    fn pass(stream: Self::Stream) -> Self::Response<T>;
 }
 
 /// The `Annotated` value of an item read through [`CheckedItems`], which is always `Ok`. An
@@ -108,50 +103,6 @@ pub(crate) fn into_checked<U>(item: gdl::Result<Annotated<U>>) -> Annotated<U> {
     match item {
         Ok(item) => item,
         Err(_) => unreachable!("checked items carry no `Err`"),
-    }
-}
-
-/// Dynamo's `next`, as a Dynamo operator's body calls it.
-///
-/// A newtype rather than an impl on `Arc<dyn AsyncEngine>`: inside an `async_trait` method the
-/// compiler checks the body's future for `Send` with the trait object's lifetime erased, and an
-/// impl for the `'static` trait object is then not general enough. The newtype fixes the
-/// lifetime where it is defined.
-///
-/// Transition: remove when the gdl pipeline is the only local pipeline.
-pub(crate) struct DynamoDownstream<Req: Data, T: Data>(
-    pub(crate) Arc<dyn AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, Error>>,
-);
-
-impl<Req: Data, T: Data> Downstream<Req, T> for DynamoDownstream<Req, T> {
-    type Stream = ManyOut<Annotated<T>>;
-
-    // The engine's own future, as the body awaited before it was shared.
-    fn send(
-        &self,
-        request: SingleIn<Req>,
-    ) -> impl Future<Output = anyhow::Result<Self::Stream>> + Send {
-        self.0.generate(request)
-    }
-
-    fn forward(
-        &self,
-        request: SingleIn<Req>,
-    ) -> impl Future<Output = anyhow::Result<Self::Response<T>>> + Send {
-        self.0.generate(request)
-    }
-
-    fn send_cleanup(
-        &self,
-        request: SingleIn<Req>,
-    ) -> impl Future<Output = anyhow::Result<Self::Stream>> + Send {
-        self.0.generate(request)
-    }
-
-    type Response<U: Data> = ManyOut<Annotated<U>>;
-
-    fn pass(stream: ManyOut<Annotated<T>>) -> ManyOut<Annotated<T>> {
-        stream
     }
 }
 
@@ -226,10 +177,6 @@ where
     }
 
     type Response<U: Data> = gdl::Items<Annotated<U>>;
-
-    fn pass(stream: AnnotatedItems<T>) -> gdl::Items<Annotated<T>> {
-        gdl::items(stream.map(Ok))
-    }
 }
 
 impl<N, R: Carried<Req>, Req: Data> GdlDownstream<N, R, Req> {
