@@ -892,8 +892,8 @@ where
                     // A dispatch cancelled before its response prologue returns `Ok` empty,
                     // so a stopped context here means the client left during the handshake.
                     // The attempt can be stopped or killed on its own, so check it too.
-                    let outcome = if self.context.is_stopped()
-                        || self.context.is_killed()
+                    let request_cancelled = self.context.is_stopped() || self.context.is_killed();
+                    let outcome = if request_cancelled
                         || attempt_context.is_stopped()
                         || attempt_context.is_killed()
                     {
@@ -902,6 +902,14 @@ where
                         frontend_service::migration_outcome::SUCCESS
                     };
                     self.record_migration_outcome(outcome);
+                    // A hop that answered the cancel with an empty stream never claimed a
+                    // lifecycle parked for this retry, and no later attempt will, so abort it
+                    // with the cause now rather than let its drop abort it with none. Not on an
+                    // attempt cancelled alone: the request goes on, and a later retry may claim
+                    // the lifecycle.
+                    if request_cancelled {
+                        self.abort_request_lifecycle_cancelled();
+                    }
                     self.active_route_trace = Some(route_trace);
                     self.next_stream = Some(next_stream);
                     self.replayed_tokens = replayed_tokens;
