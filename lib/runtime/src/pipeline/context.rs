@@ -13,7 +13,7 @@ use super::registry::Registry;
 
 pub struct Context<T: Data> {
     current: T,
-    controller: Arc<Controller>, //todo: hold this as an arc
+    controller: Arc<Controller>,
     registry: Registry,
     stages: Vec<String>,
     metadata: BTreeMap<String, String>,
@@ -550,6 +550,24 @@ mod tests {
                 message: format!("Processed length: {}", processed.length),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn parent_stop_does_not_downgrade_killed_child() {
+        let parent = Controller::default();
+        let child = Arc::new(Controller::default());
+        parent.link_child(child.clone());
+
+        child.kill();
+        parent.stop();
+
+        assert!(child.is_killed());
+        tokio::time::timeout(std::time::Duration::from_secs(1), child.killed())
+            .await
+            .expect("killed child no longer reported its terminal state");
+
+        child.stop_generating();
+        assert!(child.is_killed());
     }
 
     #[test]
