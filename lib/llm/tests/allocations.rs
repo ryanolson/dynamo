@@ -49,13 +49,13 @@
 //!
 //! | Row | Allocations, 1 item | Bytes, 1 item | Allocations, 16 items | Bytes, 16 items |
 //! |---|---:|---:|---:|---:|
-//! | `engine` | 7 | 2,752 | 22 | 2,812 |
-//! | `a` | 346 | 100,886 | 859 | 122,374 |
-//! | `a-gdl` | 328 | 65,567 | 841 | 87,055 |
-//! | `b` | 399 | 222,921 | 912 | 244,409 |
-//! | `b-gdl` | 343 | 82,418 | 856 | 103,906 |
-//! | `c` | 71 | 140,547 | 86 | 140,607 |
-//! | `c-gdl` | 38 | 28,196 | 53 | 28,256 |
+//! | `engine` | 7 | 2,776 | 22 | 2,836 |
+//! | `a` | 346 | 101,270 | 859 | 122,758 |
+//! | `a-gdl` | 328 | 65,879 | 841 | 87,367 |
+//! | `b` | 399 | 224,617 | 912 | 246,105 |
+//! | `b-gdl` | 343 | 82,682 | 856 | 104,170 |
+//! | `c` | 71 | 142,051 | 86 | 142,111 |
+//! | `c-gdl` | 38 | 28,436 | 53 | 28,496 |
 //! | `embed-engine` | 8 | 6,548 | 23 | 88,868 |
 //! | `embed` | 199 | 44,438 | 2,283 | 529,886 |
 //! | `embeddings-gdl` | 177 | 41,727 | 2,261 | 527,175 |
@@ -134,26 +134,26 @@ const REQUESTS: usize = 200;
 /// Recorded allocations and bytes of the typical request (see [`Measured::typical`]). Debug
 /// and release builds give the same numbers.
 const BASELINE: &[Row] = &[
-    row("engine", 1, 7, 2752),
-    row("engine", 16, 22, 2812),
+    row("engine", 1, 7, 2776),
+    row("engine", 16, 22, 2836),
     // Transition: remove when the gdl pipeline is the only local pipeline.
-    row("a", 1, 346, 100886),
-    row("a", 16, 859, 122374),
+    row("a", 1, 346, 101270),
+    row("a", 16, 859, 122758),
     // +2 for the boxed chat and preprocessed requests (see the module docs).
-    row("a-gdl", 1, 328, 65567),
-    row("a-gdl", 16, 841, 87055),
+    row("a-gdl", 1, 328, 65879),
+    row("a-gdl", 16, 841, 87367),
     // Transition: remove when the gdl pipeline is the only local pipeline.
-    row("b", 1, 399, 222921),
-    row("b", 16, 912, 244409),
+    row("b", 1, 399, 224617),
+    row("b", 16, 912, 246105),
     // +2 for the boxed chat and preprocessed requests (see the module docs).
-    row("b-gdl", 1, 343, 82418),
-    row("b-gdl", 16, 856, 103906),
+    row("b-gdl", 1, 343, 82682),
+    row("b-gdl", 16, 856, 104170),
     // Transition: remove when the gdl pipeline is the only local pipeline.
-    row("c", 1, 71, 140547),
-    row("c", 16, 86, 140607),
+    row("c", 1, 71, 142051),
+    row("c", 16, 86, 142111),
     // +1 for the boxed preprocessed request (see the module docs).
-    row("c-gdl", 1, 38, 28196),
-    row("c-gdl", 16, 53, 28256),
+    row("c-gdl", 1, 38, 28436),
+    row("c-gdl", 16, 53, 28496),
     row("embed-engine", 1, 8, 6548),
     row("embed-engine", 16, 23, 88868),
     // Transition: remove when the gdl pipeline is the only local pipeline.
