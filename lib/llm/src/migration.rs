@@ -800,18 +800,11 @@ where
         }
     }
 
-    /// Give any classifier lifecycle parked for a retry `error` as the cause it aborts with if
-    /// no leg takes it (see [`MigrationState::abort_request_lifecycle_on_drop`]).
-    fn abort_request_lifecycle_on_drop(&self, error: &AbortCause) {
-        if let Some(state) = self.request.migration_state.as_ref() {
-            state.abort_request_lifecycle_on_drop(error);
-        }
-    }
-
-    /// [`abort_request_lifecycle_on_drop`](Self::abort_request_lifecycle_on_drop) with the
-    /// request's cancel. The cause is built only when a lifecycle can be parked.
+    /// Give any classifier lifecycle parked for a retry the request's cancel as the cause it
+    /// aborts with if no leg takes it (see [`MigrationState::abort_request_lifecycle_on_drop`]).
+    /// The cause is built only when a lifecycle can be parked.
     fn abort_request_lifecycle_on_drop_cancelled(&self) {
-        if self.request.migration_state.is_some() {
+        if let Some(state) = self.request.migration_state.as_ref() {
             let error = DynamoError::builder()
                 .error_type(ErrorType::Cancelled)
                 .message(format!(
@@ -819,7 +812,7 @@ where
                     self.context.id()
                 ))
                 .build();
-            self.abort_request_lifecycle_on_drop(&error);
+            state.abort_request_lifecycle_on_drop(&error);
         }
     }
 
@@ -981,21 +974,14 @@ where
                     tracing::warn!(error = %err, "Creating new stream, retrying");
                 }
                 Err(err) => {
-                    let cancelled =
-                        error::match_error_chain(err.as_ref(), &[ErrorType::Cancelled], &[]);
-                    let outcome = if cancelled {
-                        frontend_service::migration_outcome::CANCELLED
-                    } else {
-                        frontend_service::migration_outcome::FAILURE
-                    };
+                    let outcome =
+                        if error::match_error_chain(err.as_ref(), &[ErrorType::Cancelled], &[]) {
+                            frontend_service::migration_outcome::CANCELLED
+                        } else {
+                            frontend_service::migration_outcome::FAILURE
+                        };
                     self.record_migration_outcome(outcome);
-                    // A cancelled dispatch can leave a leg in flight that takes the parked
-                    // lifecycle, such as a detached decode cleanup: defer the abort to its drop.
-                    if cancelled {
-                        self.abort_request_lifecycle_on_drop(err.as_ref());
-                    } else {
-                        self.abort_request_lifecycle(err.as_ref());
-                    }
+                    self.abort_request_lifecycle(err.as_ref());
                     return Err(err);
                 }
             }
