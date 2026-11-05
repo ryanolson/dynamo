@@ -1090,7 +1090,7 @@ mod tests {
                 dispatch: Some(Arc::new(KillOnEncode {
                     caller: caller.clone(),
                 }) as Arc<_>),
-                ..Default::default()
+                ..crate::kv_router::plugins::push_router_options()
             };
             let push =
                 EncodePushRouter::from_client_with_options(client, RouterMode::RoundRobin, options)
@@ -1242,7 +1242,7 @@ mod tests {
                 caller_task: tokio::task::try_id(),
                 inline: inline.clone(),
             }) as Arc<_>),
-            ..Default::default()
+            ..crate::kv_router::plugins::push_router_options()
         };
         let push =
             EncodePushRouter::from_client_with_options(client, RouterMode::RoundRobin, options)
