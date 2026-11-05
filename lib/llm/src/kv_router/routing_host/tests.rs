@@ -27,8 +27,8 @@ use dynamo_runtime::{
     distributed::{DiscoveryBackend, DistributedConfig, RequestPlaneMode},
     error::{BackendError, ErrorType, match_error_chain},
     pipeline::{
-        AddressedRequest, AsyncEngineContext, Context, ManyIn, Operator, RouterMode,
-        ServerStreamingEngine, StreamingDispatch, context::Controller,
+        AddressedRequest, AsyncEngineContext, Context, ManyIn, RouterMode, ServerStreamingEngine,
+        StreamingDispatch, context::Controller,
     },
     storage::kv::Selector,
     traits::DistributedRuntimeProvider,
@@ -48,6 +48,15 @@ use crate::{
         timing::RequestTracker,
     },
 };
+
+/// `migration` over `next` as the frontend's gdl pipeline runs it: a native operator over the
+/// hop to `next`.
+fn on_gdl(
+    migration: &Arc<Migration>,
+    next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
+) -> ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> {
+    crate::operator::testing::operator::<_, LLMEngineOutput, _, _, _>(migration.clone(), next)
+}
 
 fn request() -> PreprocessedRequest {
     PreprocessedRequest::builder()
@@ -2265,8 +2274,8 @@ async fn typed_classifier_rejection_reaches_client_without_migration() {
         let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
             Arc::new(router);
         let migration = Migration::new(2, None, "test".to_string(), Arc::new(Metrics::new()));
-        let client_error = match migration
-            .generate(Context::new(request()), engine.clone())
+        let client_error = match on_gdl(&migration, engine.clone())
+            .generate(Context::new(request()))
             .await
         {
             Ok(_) => panic!("typed rejection unexpectedly selected a worker"),
@@ -3677,8 +3686,8 @@ async fn worker_overload_stream_migration_releases_and_reselects() {
         two_worker_migration_harness("worker-overload-migration", dispatch.clone(), None).await;
     let migration = Migration::new(1, None, "test".to_string(), Arc::new(Metrics::new()));
 
-    let responses: Vec<_> = migration
-        .generate(Context::new(request()), harness.engine.clone())
+    let responses: Vec<_> = on_gdl(&migration, harness.engine.clone())
+        .generate(Context::new(request()))
         .await
         .unwrap()
         .collect()
@@ -3728,8 +3737,8 @@ async fn stream_migration_retry_continues_one_classifier_lifecycle() {
     .await;
     let migration = Migration::new(1, None, "test".to_string(), Arc::new(Metrics::new()));
 
-    let responses: Vec<_> = migration
-        .generate(Context::new(request()), harness.engine.clone())
+    let responses: Vec<_> = on_gdl(&migration, harness.engine.clone())
+        .generate(Context::new(request()))
         .await
         .unwrap()
         .collect()
@@ -3906,8 +3915,8 @@ async fn pinned_request_stream_failure_aborts_parked_lifecycle_with_cause() {
         ..Default::default()
     });
 
-    let responses: Vec<_> = migration
-        .generate(Context::new(content), harness.engine.clone())
+    let responses: Vec<_> = on_gdl(&migration, harness.engine.clone())
+        .generate(Context::new(content))
         .await
         .unwrap()
         .collect()
@@ -4000,8 +4009,8 @@ async fn exhausted_migration_aborts_parked_lifecycle_with_worker_failure() {
     .await;
     let migration = Migration::new(1, None, "test".to_string(), Arc::new(Metrics::new()));
 
-    let responses: Vec<_> = migration
-        .generate(Context::new(request()), harness.engine.clone())
+    let responses: Vec<_> = on_gdl(&migration, harness.engine.clone())
+        .generate(Context::new(request()))
         .await
         .unwrap()
         .collect()
@@ -4085,7 +4094,7 @@ async fn retry_dispatch_failure_releases_classifier_id(error_type: ErrorType) {
     let first = Context::with_id_and_metadata(request(), context_id.to_owned(), Default::default());
     let context = first.context();
     let migration = Migration::new(1, None, "test".to_owned(), Arc::new(Metrics::new()));
-    let mut failed_stream = migration.generate(first, engine).await.unwrap();
+    let mut failed_stream = on_gdl(&migration, engine).generate(first).await.unwrap();
     let terminal = tokio::time::timeout(Duration::from_secs(5), failed_stream.next())
         .await
         .expect("the failed retry returns its terminal error")
@@ -4647,8 +4656,8 @@ async fn engine_shutdown_after_cancel_frame_migrates_and_reselects() {
         two_worker_migration_harness("engine-shutdown-migration", dispatch.clone(), None).await;
     let migration = Migration::new(1, None, "test".to_string(), Arc::new(Metrics::new()));
 
-    let responses: Vec<_> = migration
-        .generate(Context::new(request()), harness.engine.clone())
+    let responses: Vec<_> = on_gdl(&migration, harness.engine.clone())
+        .generate(Context::new(request()))
         .await
         .unwrap()
         .collect()
