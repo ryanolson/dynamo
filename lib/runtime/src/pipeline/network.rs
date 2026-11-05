@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use super::{
     AsyncTransportEngine, Context, Data, Error, ManyIn, ManyOut, PipelineError, PipelineIO,
-    SegmentSource, ServiceBackend, ServiceEngine, SingleIn, Source, context,
+    ServiceEngine, SingleIn, context,
 };
 use crate::metrics::MetricsHierarchy;
 use crate::metrics::prometheus_names::work_handler;
@@ -1353,18 +1353,6 @@ impl<Req: PipelineIO + Sync, Resp: PipelineIO> Ingress<Req, Resp> {
         Ingress::new_with_adapter(SerdeIngressPayloadAdapter)
     }
 
-    pub fn link(segment: Arc<SegmentSource<Req, Resp>>) -> Result<Arc<Self>> {
-        let ingress = Ingress::new();
-        ingress.attach(segment)?;
-        Ok(ingress)
-    }
-
-    pub fn for_pipeline(segment: Arc<SegmentSource<Req, Resp>>) -> Result<Arc<Self>> {
-        let ingress = Ingress::new();
-        ingress.attach(segment)?;
-        Ok(ingress)
-    }
-
     pub fn for_engine(engine: ServiceEngine<Req, Resp>) -> Result<Arc<Self>> {
         Self::for_engine_with_adapter(engine, SerdeIngressPayloadAdapter)
     }
@@ -1412,10 +1400,6 @@ where
             .set(role)
             .expect("new ingress lifecycle role source must be empty");
         ingress
-    }
-
-    pub fn attach(&self, segment: Arc<SegmentSource<Req, Resp>>) -> Result<()> {
-        self.set_engine(segment)
     }
 
     fn set_engine(&self, engine: ServiceEngine<Req, Resp>) -> Result<()> {
