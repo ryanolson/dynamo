@@ -31,8 +31,8 @@ pub const REQUEST_ID: &str = "dynamo.request_id";
 /// call fails it as `Cancelled`. So a pipeline with a Dynamo engine in it
 /// derives its `Cx` with
 /// [`cx_for_dynamo_stages`](Self::cx_for_dynamo_stages), which a kill does
-/// not cancel; the engine sees the kill through its own context, as on
-/// Dynamo's `link` chain. [`cx`](Self::cx) is for gdl-native nodes.
+/// not cancel; the engine sees the kill through its own context, as it did
+/// on Dynamo's `link` chain. [`cx`](Self::cx) is for gdl-native nodes.
 pub struct CxBridge;
 
 impl CxBridge {

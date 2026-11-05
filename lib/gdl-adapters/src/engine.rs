@@ -102,8 +102,8 @@ where
 /// item, or with no item when it is a cancel of a request that was killed.
 ///
 /// A native gdl operator over Dynamo items reads its downstream through it,
-/// so it sees what a Dynamo operator on Dynamo's `link` chain sees from the
-/// same stages. One that can work on the gdl item as it is reads through
+/// so it sees the stages below as a Dynamo stream, as Dynamo's operators did
+/// on the `link` chain. One that can work on the gdl item as it is reads through
 /// [`CheckedItems`] instead, and saves taking each item out of its `Result`.
 /// The two apply the same rule.
 pub struct AnnotatedItems<T> {

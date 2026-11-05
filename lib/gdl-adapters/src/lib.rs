@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The bridge between Dynamo's local pipelines and gdl's.
+//! The bridge between Dynamo's engines and gdl's local pipeline, the only
+//! local pipeline the frontend composes.
 //!
 //! These adapters let a Dynamo `AsyncEngine` run as the sink of a gdl local
 //! pipeline, and a gdl pipeline run as a Dynamo `AsyncEngine`:
