@@ -611,7 +611,7 @@ mod tests {
         ) -> Result<WatchStream<PoolListing, PoolKey>, DiscoveryError> {
             let failing = self
                 .failing_watches
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |calls| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |calls| {
                     calls.checked_sub(1)
                 })
                 .is_ok();

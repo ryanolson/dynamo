@@ -3205,8 +3205,8 @@ policy_classes:
             .collect::<Vec<_>>();
         // While both classes are backlogged, each round charges 800 to Priority for two
         // requests and 200 to Standard for one: an 80/20 cost split at a 2:1 request count.
-        for round in dispatches[..9].chunks_exact(3) {
-            assert_eq!(round, [(0, 300), (0, 500), (1, 200)]);
+        for round in dispatches[..9].as_chunks::<3>().0 {
+            assert_eq!(*round, [(0, 300), (0, 500), (1, 200)]);
         }
         // Standard's last request leaves 50 of its 200 credit unspent. Emptying the class
         // resets that credit to zero, and Priority then uses the idle capacity.

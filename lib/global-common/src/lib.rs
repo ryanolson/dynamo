@@ -25,6 +25,7 @@ mod discovery;
 /// deployment policy decides whether the network needs authentication.
 #[cfg(feature = "grpc")]
 pub mod grpc {
+    #![allow(clippy::result_large_err)]
     tonic::include_proto!("dynamo.globalview.v1");
 
     /// Four subscription payloads of up to 4 MiB each, plus protobuf framing.

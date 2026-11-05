@@ -300,7 +300,7 @@ async fn valid_choices_and_shapes_preserve_backend_requests_and_assigned_ids() {
         }
         let requests = svc.engine.take_requests().await;
         assert_eq!(requests.len(), 5);
-        for group in requests.chunks_exact(4) {
+        for group in requests.as_chunks::<4>().0 {
             assert_eq!(group[0].inner.tool_choice, Some(ChatCompletionToolChoiceOption::None));
             assert_eq!(group[1].inner.tool_choice, Some(ChatCompletionToolChoiceOption::Auto));
             assert_eq!(group[2].inner.tool_choice, Some(ChatCompletionToolChoiceOption::Required));
