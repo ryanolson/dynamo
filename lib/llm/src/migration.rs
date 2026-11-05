@@ -581,7 +581,12 @@ where
     D: Downstream<PreprocessedRequest, Resp>,
 {
     fn drop(&mut self) {
-        if self.unrecorded_migration.is_some() {
+        // Only a cancel of the request is a cancelled outcome: a panic unwinding through the
+        // dispatch, or a caller that drops the response of a live request, records none, as
+        // before.
+        if self.unrecorded_migration.is_some()
+            && (self.context.is_stopped() || self.context.is_killed())
+        {
             self.record_migration_outcome(frontend_service::migration_outcome::CANCELLED);
             self.abort_request_lifecycle_cancelled();
         }
