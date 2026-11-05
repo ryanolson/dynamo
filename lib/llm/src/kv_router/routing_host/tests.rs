@@ -4037,6 +4037,113 @@ async fn exhausted_migration_aborts_parked_lifecycle_with_worker_failure() {
     harness.runtime.shutdown();
 }
 
+async fn retry_dispatch_failure_releases_classifier_id(error_type: ErrorType) {
+    struct FailRetry {
+        host: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
+        calls: AtomicUsize,
+        error_type: ErrorType,
+    }
+
+    #[async_trait]
+    impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>, Error>
+        for FailRetry
+    {
+        async fn generate(
+            &self,
+            request: SingleIn<PreprocessedRequest>,
+        ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+            if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                return self.host.generate(request).await;
+            }
+            if self.error_type == ErrorType::Cancelled {
+                request.context().kill();
+            }
+            Err(DynamoError::builder()
+                .error_type(self.error_type)
+                .message("retry rejected before reaching the host")
+                .build()
+                .into())
+        }
+    }
+
+    let (observations, mut events) = mpsc::unbounded_channel();
+    let harness = two_worker_migration_harness(
+        "retry-dispatch-failure-releases-classifier-id",
+        Arc::new(RejectFirstDispatch::default()),
+        Some(RecordingClassifier {
+            calls: Arc::new(AtomicUsize::new(0)),
+            observations,
+        }),
+    )
+    .await;
+    let engine = Arc::new(FailRetry {
+        host: harness.engine.clone(),
+        calls: AtomicUsize::new(0),
+        error_type,
+    });
+    let context_id = "reuse-after-retry-dispatch-failure";
+    let first = Context::with_id_and_metadata(request(), context_id.to_owned(), Default::default());
+    let context = first.context();
+    let migration = Migration::new(1, None, "test".to_owned(), Arc::new(Metrics::new()));
+    let mut failed_stream = migration.generate(first, engine).await.unwrap();
+    let terminal = tokio::time::timeout(Duration::from_secs(5), failed_stream.next())
+        .await
+        .expect("the failed retry returns its terminal error")
+        .unwrap();
+    assert!(match_error_chain(
+        terminal.error.as_ref().unwrap(),
+        &[ErrorType::WorkerOverloaded],
+        &[],
+    ));
+    assert!(!context.is_stopped());
+    assert!(!context.is_killed());
+
+    // A caller may keep the stream after its terminal error, without another poll.
+    let second =
+        Context::with_id_and_metadata(request(), context_id.to_owned(), Default::default());
+    let reused = tokio::time::timeout(Duration::from_secs(5), harness.engine.generate(second))
+        .await
+        .expect("request-id reuse must not hang");
+    let reuse_error = match reused {
+        Ok(stream) => {
+            let responses =
+                tokio::time::timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
+                    .await
+                    .unwrap();
+            assert!(responses.iter().all(|item| item.error.is_none()));
+            None
+        }
+        Err(error) => Some(format!("{error:#}")),
+    };
+    drop(failed_stream);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap(),
+        Some(ClassifierObservation::Aborted {
+            cause: Some(error_type),
+        }),
+    );
+    harness.runtime.shutdown();
+    assert!(
+        reuse_error.is_none(),
+        "a terminal retry error must release its classifier id before another poll or drop: {reuse_error:?}",
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn rejected_retry_dispatch_releases_classifier_id_before_stream_drop() {
+    retry_dispatch_failure_releases_classifier_id(ErrorType::InvalidArgument).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+#[ignore = "R3: a cancelled retry dispatch leaves the classifier id live until stream EOF or drop"]
+async fn cancelled_retry_dispatch_releases_classifier_id_before_stream_drop() {
+    retry_dispatch_failure_releases_classifier_id(ErrorType::Cancelled).await;
+}
+
 /// The engine behind Migration in [`a_kill_during_a_retry_records_cancelled_and_its_cause`]:
 /// its first call goes to the routing host, whose worker fails in-stream with a migratable
 /// error, so the host parks the classifier lifecycle for the retry. Its later calls stand for
