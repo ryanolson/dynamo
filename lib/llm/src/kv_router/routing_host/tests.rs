@@ -4298,8 +4298,8 @@ async fn a_kill_during_a_retry_aborts_the_parked_lifecycle_with_its_cause() {
 /// A remote prefill's route can send its decode leg, which releases the staged KV, after
 /// Migration has seen the kill: on gdl the route outlives the kill as a detached task. That leg
 /// takes the classifier lifecycle parked for the retry, so the request is classified once, on
-/// both local pipelines and for both retry shapes. Migration must leave the parked lifecycle to
-/// it.
+/// both local pipelines, for both retry shapes, and whether the hop answers the kill with an
+/// empty stream or fails as `Cancelled`. Migration must leave the parked lifecycle to it.
 #[tokio::test]
 #[serial_test::serial]
 async fn killed_migration_preserves_one_classifier_lifecycle_through_detached_cleanup() {
@@ -4314,6 +4314,8 @@ async fn killed_migration_preserves_one_classifier_lifecycle_through_detached_cl
         retry_entered: mpsc::UnboundedSender<()>,
         release_cleanup: Arc<Notify>,
         cleanup_finished: mpsc::UnboundedSender<()>,
+        /// Answer the kill with a `Cancelled` error rather than an empty stream.
+        fail_on_kill: bool,
     }
 
     #[async_trait]
@@ -4345,6 +4347,13 @@ async fn killed_migration_preserves_one_classifier_lifecycle_through_detached_cl
             });
             self.retry_entered.send(()).unwrap();
             context.killed().await;
+            if self.fail_on_kill {
+                return Err(DynamoError::builder()
+                    .error_type(ErrorType::Cancelled)
+                    .message("request killed during dispatch")
+                    .build()
+                    .into());
+            }
             Ok(ResponseStream::new(Box::pin(stream::empty()), context))
         }
     }
@@ -4353,7 +4362,9 @@ async fn killed_migration_preserves_one_classifier_lifecycle_through_detached_cl
         .unwrap();
     let mut classifications = Vec::new();
     for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
-        for eager_failure in [true, false] {
+        for (eager_failure, fail_on_kill) in
+            [(true, false), (false, false), (true, true), (false, true)]
+        {
             let calls = Arc::new(AtomicUsize::new(0));
             let (observations, mut events) = mpsc::unbounded_channel();
             let dispatch: Arc<
@@ -4364,7 +4375,10 @@ async fn killed_migration_preserves_one_classifier_lifecycle_through_detached_cl
                 Arc::new(RejectFirstDispatch::default())
             };
             let harness = two_worker_migration_harness(
-                &format!("late-cleanup-{}-{eager_failure}", local_pipeline.as_str()),
+                &format!(
+                    "late-cleanup-{}-{eager_failure}-{fail_on_kill}",
+                    local_pipeline.as_str()
+                ),
                 dispatch,
                 Some(RecordingClassifier {
                     calls: calls.clone(),
@@ -4381,6 +4395,7 @@ async fn killed_migration_preserves_one_classifier_lifecycle_through_detached_cl
                 retry_entered,
                 release_cleanup: release_cleanup.clone(),
                 cleanup_finished,
+                fail_on_kill,
             });
             let pipeline = PreprocessedRouting::new(
                 engine,
@@ -4424,7 +4439,7 @@ async fn killed_migration_preserves_one_classifier_lifecycle_through_detached_cl
         }
     }
     assert_eq!(
-        classifications, [1; 4],
+        classifications, [1; 8],
         "cleanup must reuse the request's classification"
     );
 }
