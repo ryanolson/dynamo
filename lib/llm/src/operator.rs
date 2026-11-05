@@ -1,24 +1,24 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Dynamo's operators as Dynamo operators and as native gdl operators: the embeddings
-//! preprocessor, Migration, and the encoder and prefill routers. Backend and the chat and
-//! completions preprocessors are gdl around nodes instead (`BackendState`, `PreprocessorNode`):
-//! their forward and backward halves run on either side of the hop below them.
+//! Dynamo's operators as native gdl operators: the embeddings preprocessor, Migration, and the
+//! encoder and prefill routers. Backend and the chat and completions preprocessors are gdl
+//! around nodes instead (`BackendState`, `PreprocessorNode`): their forward and backward halves
+//! run on either side of the hop below them.
 //!
-//! Each operator has one body, generic over [`Downstream`]: how it calls the stage below it.
-//! Its Dynamo `Operator` impl passes the `Arc<dyn AsyncEngine>` it is given, and its gdl
-//! `Operator` impl passes a [`GdlDownstream`] over gdl's `cx` and static `next`. So a native
-//! stage builds no `Cx` of its own and no `Arc<dyn AsyncEngine>`.
+//! Each native operator's body calls the stage below it through a [`GdlDownstream`] over gdl's
+//! `cx` and static `next`, so a native stage builds no `Cx` of its own and no
+//! `Arc<dyn AsyncEngine>`.
 //!
-//! The request stays Dynamo's `SingleIn<T>` on both paths: its context carries the id, the
-//! metadata and registry (session affinity, LoRA name, request metrics) and the stop and kill
-//! that the stages below read. On gdl the chat, completion and preprocessed requests travel
-//! boxed between the nodes ([`Boxed`](dynamo_gdl_adapters::Boxed)), so gdl's chain moves a pointer, not the request. A
+//! The request stays Dynamo's `SingleIn<T>`: its context carries the id, the metadata and
+//! registry (session affinity, LoRA name, request metrics) and the stop and kill that the stages
+//! below read. The chat, completion and preprocessed requests travel boxed between the nodes
+//! ([`Boxed`](dynamo_gdl_adapters::Boxed)), so gdl's chain moves a pointer, not the request. A
 //! native operator takes the request out of its box to run its body, and the body's first send
-//! puts the request it sends in that box again ([`GdlDownstream::with_spare`]). Items stay `Annotated<T>`; an operator that edits its items in
-//! place reads and answers them as [`Downstream::Item`], which on gdl leaves each item in its
-//! gdl `Result`, so it is not taken out and wrapped again at every stage.
+//! puts the request it sends in that box again ([`GdlDownstream::with_spare`]). Items stay
+//! `Annotated<T>`; an operator that edits its items in place reads them in their gdl `Result`
+//! ([`GdlDownstream::send_items`], [`checked_mut`]), so an item is not taken out and wrapped
+//! again at every stage.
 
 use std::future::Future;
 use std::marker::PhantomData;
@@ -29,52 +29,11 @@ use dynamo_gdl_adapters::{AnnotatedItems, Carried, CheckedItems, CxBridge, enter
 use dynamo_runtime::engine::Data;
 use dynamo_runtime::pipeline::{AsyncEngineContextProvider, SingleIn};
 use dynamo_runtime::protocols::annotated::Annotated;
-use futures::{FutureExt, Stream};
+use futures::FutureExt;
 use tracing::Instrument;
 
 #[cfg(test)]
 pub(crate) mod testing;
-
-/// The stage below an operator, as the operator's body calls it.
-///
-/// Transition: remove when the gdl pipeline is the only local pipeline.
-pub(crate) trait Downstream<Req: Data, T: Data>: Send + Sync {
-    /// The response stream of one call. It gives the request's Dynamo context, which the body
-    /// stops to stop the stages below.
-    type Stream: Stream<Item = Annotated<T>> + AsyncEngineContextProvider + Send + Unpin + 'static;
-
-    /// Send `request` on.
-    ///
-    /// Not named `generate`: on an `Arc<dyn AsyncEngine>` that name would shadow the engine's
-    /// own wherever this trait is in scope.
-    fn send(
-        &self,
-        request: SingleIn<Req>,
-    ) -> impl Future<Output = anyhow::Result<Self::Stream>> + Send;
-
-    /// Send `request` on and answer with the response of the stage below as it is, for an
-    /// operator that adds nothing to it. On gdl this reads no item, where [`send`](Self::send)
-    /// and [`respond`](Self::respond) would add a layer.
-    fn forward(
-        &self,
-        request: SingleIn<Req>,
-    ) -> impl Future<Output = anyhow::Result<Self::Response<T>>> + Send;
-
-    /// Send `request` on in a call that a kill of the request does not end: the leg that
-    /// releases what a worker below holds for the request, such as the prefill router's decode
-    /// leg after a KV handoff. The stage below still sees the kill through the request's
-    /// context. On gdl the call runs under a root `Cx` of its own, since a cancel of the
-    /// request's `cx` would refuse it.
-    fn send_cleanup(
-        &self,
-        request: SingleIn<Req>,
-    ) -> impl Future<Output = anyhow::Result<Self::Stream>> + Send;
-
-    /// The operator's response, as its caller takes it.
-    ///
-    /// Transition: remove when the gdl pipeline is the only local pipeline.
-    type Response<U: Data>;
-}
 
 /// The `Annotated` value of an item read through [`CheckedItems`], which is always `Ok`. An
 /// operator that edits its items in place reads them in their gdl `Result`, so an item is never
@@ -106,9 +65,9 @@ pub(crate) fn into_checked<U>(item: gdl::Result<Annotated<U>>) -> Annotated<U> {
     }
 }
 
-/// gdl's `cx` and `next`, as a native operator's body calls them. `next` takes requests in
-/// the carrier `R` (see [`Carried`]): boxed for Migration and the routers, `SingleIn` itself for
-/// the embeddings preprocessor.
+/// The stage below a native operator, as the operator's body calls it: gdl's `cx` and `next`.
+/// `next` takes requests in the carrier `R` (see [`Carried`]): boxed for Migration and the
+/// routers, `SingleIn` itself for the embeddings preprocessor.
 pub(crate) struct GdlDownstream<N, R: Carried<Req>, Req: Data> {
     cx: gdl::Cx,
     next: N,
@@ -128,8 +87,36 @@ impl<N, R: Carried<Req>, Req: Data> GdlDownstream<N, R, Req> {
         Self { cx, next, spare }
     }
 
+    /// Send `request` on, and read the response as a Dynamo stream. The stream gives the
+    /// request's Dynamo context, which the body stops to stop the stages below.
+    pub(crate) fn send<T>(
+        &self,
+        request: SingleIn<Req>,
+    ) -> impl Future<Output = anyhow::Result<AnnotatedItems<T>>> + Send
+    where
+        N: gdl::Next<R, Annotated<T>>,
+        T: Data,
+    {
+        self.send_under(self.cx.clone(), request)
+    }
+
+    /// Send `request` on and answer with the response of the stage below as it is, for an
+    /// operator that adds nothing to it. This reads no item, where [`send`](Self::send) would
+    /// add a layer.
+    pub(crate) fn forward<T>(
+        &self,
+        request: SingleIn<Req>,
+    ) -> impl Future<Output = anyhow::Result<gdl::Items<Annotated<T>>>> + Send
+    where
+        N: gdl::Next<R, Annotated<T>>,
+        T: Data,
+    {
+        self.forward_carried(R::carry_in(request, &self.spare))
+    }
+
     /// Send `request` on in its carrier, as it came, and answer with the response of the stage
-    /// below as it is: [`Downstream::forward`] for a request that does not go through the body.
+    /// below as it is: [`forward`](Self::forward) for a request that does not go through the
+    /// body.
     pub(crate) fn forward_carried<T>(
         &self,
         request: R,
@@ -143,44 +130,25 @@ impl<N, R: Carried<Req>, Req: Data> GdlDownstream<N, R, Req> {
             .generate(self.cx.clone(), request)
             .map(|result| result.map_err(anyhow::Error::new))
     }
-}
 
-impl<N, R, Req, T> Downstream<Req, T> for GdlDownstream<N, R, Req>
-where
-    N: gdl::Next<R, Annotated<T>>,
-    R: Carried<Req>,
-    Req: Data,
-    T: Data,
-{
-    type Stream = AnnotatedItems<T>;
-
-    fn send(
+    /// Send `request` on in a call that a kill of the request does not end: the leg that
+    /// releases what a worker below holds for the request, such as the prefill router's decode
+    /// leg after a KV handoff. The stage below still sees the kill through the request's
+    /// context. The call runs under a root `Cx` of its own, since a cancel of the request's
+    /// `cx` would refuse it.
+    pub(crate) fn send_cleanup<T>(
         &self,
         request: SingleIn<Req>,
-    ) -> impl Future<Output = anyhow::Result<Self::Stream>> + Send {
-        self.send_under(self.cx.clone(), request)
-    }
-
-    fn forward(
-        &self,
-        request: SingleIn<Req>,
-    ) -> impl Future<Output = anyhow::Result<Self::Response<T>>> + Send {
-        self.forward_carried(R::carry_in(request, &self.spare))
-    }
-
-    fn send_cleanup(
-        &self,
-        request: SingleIn<Req>,
-    ) -> impl Future<Output = anyhow::Result<Self::Stream>> + Send {
+    ) -> impl Future<Output = anyhow::Result<AnnotatedItems<T>>> + Send
+    where
+        N: gdl::Next<R, Annotated<T>>,
+        T: Data,
+    {
         let cx = CxBridge::cx_for_cleanup(request.context().as_ref());
         self.send_under(cx, request)
     }
 
-    type Response<U: Data> = gdl::Items<Annotated<U>>;
-}
-
-impl<N, R: Carried<Req>, Req: Data> GdlDownstream<N, R, Req> {
-    /// Send `request` on, as [`Downstream::send`] does, and read the response's items in their
+    /// Send `request` on, as [`send`](Self::send) does, and read the response's items in their
     /// gdl `Result`, for an operator that edits them in place (see [`checked_mut`]). gdl's
     /// `Err` rule is already applied to the stream, so every item is `Ok`.
     pub(crate) fn send_items<T>(
@@ -226,7 +194,8 @@ impl<N, R: Carried<Req>, Req: Data> GdlDownstream<N, R, Req> {
     }
 }
 
-/// A Dynamo operator `O` as a native gdl `Operator`, keyed by `K`.
+/// One of Dynamo's operators `O` (Backend, the preprocessor, Migration or a router) as a gdl
+/// operator, keyed by `K`.
 ///
 /// gdl's `Operator` names its request and item types, so an operator that serves several of
 /// them is one gdl operator per type, and `K` names the type that tells them apart: the

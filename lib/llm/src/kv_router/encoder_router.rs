@@ -21,7 +21,7 @@ use dynamo_runtime::{
 };
 
 use crate::discovery::{WorkerSetTarget, WorkerSetTargetId};
-use crate::operator::{Downstream, GdlDownstream, GdlOperator, detached, native};
+use crate::operator::{GdlDownstream, GdlOperator, detached, native};
 use crate::protocols::common::{
     llm_backend::{LLMEngineOutput, PreprocessedRequest},
     preprocessor::TraceLink,

@@ -71,7 +71,7 @@ use crate::local_model::runtime_config::{
 #[cfg(feature = "mm-routing")]
 use crate::model_card::ModelInfoType;
 use crate::model_card::{ModelDeploymentCard, ModelInfo, PromptFormatterArtifact};
-use crate::operator::{Downstream, GdlDownstream, GdlOperator, gdl_error, native};
+use crate::operator::{GdlDownstream, GdlOperator, gdl_error, native};
 #[cfg(feature = "mm-routing")]
 use crate::preprocessor::media::MediaFetcher;
 use crate::preprocessor::media::{MediaDecoder, MediaLoader, max_data_url_bytes};
