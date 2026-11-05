@@ -4261,6 +4261,137 @@ async fn a_kill_during_a_retry_mid_stream_records_cancelled_and_its_cause() {
     );
 }
 
+/// A detached prefill can dispatch decode cleanup after Migration sees the kill.
+#[tokio::test]
+#[serial_test::serial]
+#[ignore = "R2: migration aborts the lifecycle before detached decode cleanup can claim it"]
+async fn killed_migration_preserves_one_classifier_lifecycle_through_detached_cleanup() {
+    use crate::entrypoint::input::{LocalPipeline, PreprocessedRouting};
+    use crate::kv_router::{EncoderRouter, PrefillRouter};
+    use crate::model_card::ModelDeploymentCard;
+    use crate::protocols::common::timing::RequestTracker;
+
+    struct LateCleanup {
+        host: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
+        calls: AtomicUsize,
+        retry_entered: mpsc::UnboundedSender<()>,
+        release_cleanup: Arc<Notify>,
+        cleanup_finished: mpsc::UnboundedSender<()>,
+    }
+
+    #[async_trait]
+    impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>, Error>
+        for LateCleanup
+    {
+        async fn generate(
+            &self,
+            mut request: SingleIn<PreprocessedRequest>,
+        ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+            if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                return self.host.generate(request).await;
+            }
+            let context = request.context();
+            request.staged_kv_cleanup = true;
+            let tracker = Arc::new(RequestTracker::new());
+            drop(tracker.set_phase(RequestPhase::Decode).await);
+            request.tracker = Some(tracker);
+            let host = self.host.clone();
+            let release = self.release_cleanup.clone();
+            let finished = self.cleanup_finished.clone();
+            // The prefill router detaches its route on gdl; its decode cleanup survives the kill.
+            tokio::spawn(async move {
+                release.notified().await;
+                if let Ok(stream) = host.generate(request).await {
+                    stream.collect::<Vec<_>>().await;
+                }
+                finished.send(()).unwrap();
+            });
+            self.retry_entered.send(()).unwrap();
+            context.killed().await;
+            Ok(ResponseStream::new(Box::pin(stream::empty()), context))
+        }
+    }
+
+    let card = ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
+        .unwrap();
+    let mut classifications = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        for eager_failure in [true, false] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (observations, mut events) = mpsc::unbounded_channel();
+            let dispatch: Arc<
+                dyn StreamingDispatch<PreprocessedRequest, Annotated<LLMEngineOutput>>,
+            > = if eager_failure {
+                Arc::new(UnavailableDispatch)
+            } else {
+                Arc::new(RejectFirstDispatch::default())
+            };
+            let harness = two_worker_migration_harness(
+                &format!("late-cleanup-{}-{eager_failure}", local_pipeline.as_str()),
+                dispatch,
+                Some(RecordingClassifier {
+                    calls: calls.clone(),
+                    observations,
+                }),
+            )
+            .await;
+            let release_cleanup = Arc::new(Notify::new());
+            let (retry_entered, mut retries) = mpsc::unbounded_channel();
+            let (cleanup_finished, mut finished) = mpsc::unbounded_channel();
+            let engine = Arc::new(LateCleanup {
+                host: harness.engine.clone(),
+                calls: AtomicUsize::new(0),
+                retry_entered,
+                release_cleanup: release_cleanup.clone(),
+                cleanup_finished,
+            });
+            let pipeline = PreprocessedRouting::new(
+                engine,
+                PrefillRouter::disabled(
+                    Arc::new(crate::discovery::ModelManager::new()),
+                    RouterMode::KV,
+                    None,
+                ),
+                EncoderRouter::disabled(),
+            )
+            .with_local_pipeline(local_pipeline)
+            .build_preprocessed_pipeline(&card, 3, None, Arc::new(Metrics::new()))
+            .unwrap();
+            let request = Context::new(request());
+            let context = request.context();
+            let call = tokio::spawn(async move {
+                if let Ok(stream) = pipeline.generate(request).await {
+                    stream.collect::<Vec<_>>().await;
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(5), retries.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            context.kill();
+            tokio::time::timeout(Duration::from_secs(5), call)
+                .await
+                .unwrap()
+                .unwrap();
+            release_cleanup.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), finished.recv())
+                .await
+                .expect("decode cleanup must finish after the kill")
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("the classifier must receive a terminal event")
+                .unwrap();
+            classifications.push(calls.load(Ordering::Acquire));
+            harness.runtime.shutdown();
+        }
+    }
+    assert_eq!(
+        classifications, [1; 4],
+        "cleanup must reuse the request's classification"
+    );
+}
+
 /// A gracefully shutting-down worker: `Cancelled` data frame, then the reason.
 #[derive(Default)]
 struct ShutdownAfterCancelDispatch {
