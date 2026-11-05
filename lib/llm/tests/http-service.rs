@@ -1681,8 +1681,6 @@ impl
 /// the engine must see distinct server-minted context ids rather than the client's id.
 #[tokio::test]
 async fn test_concurrent_requests_with_shared_client_request_id() {
-    use dynamo_runtime::pipeline::{ServiceBackend, ServiceFrontend, Source};
-
     const MODEL: &str = "concurrent-echo-model";
     let (listener, port) = bind_random_port().await;
     let service = HttpService::builder()
@@ -1702,21 +1700,10 @@ async fn test_concurrent_requests_with_shared_client_request_id() {
         barrier: tokio::sync::Barrier::new(2),
         context_ids: std::sync::Mutex::new(Vec::new()),
     });
-    // Discovery-built pipelines start with a frontend source that matches responses to callers
-    // by request id; serve the engine through one so the test exercises that map.
-    let frontend = ServiceFrontend::<
-        SingleIn<NvCreateChatCompletionRequest>,
-        ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>,
-    >::new();
-    let pipeline = frontend
-        .link(ServiceBackend::from_engine(engine.clone()))
-        .unwrap()
-        .link_terminal(frontend)
-        .unwrap();
     let card = ModelDeploymentCard::with_name_only(MODEL);
     state
         .manager()
-        .add_chat_completions_model(MODEL, card.mdcsum(), pipeline)
+        .add_chat_completions_model(MODEL, card.mdcsum(), engine.clone())
         .unwrap();
 
     let client_id = uuid::Uuid::new_v4().to_string();
