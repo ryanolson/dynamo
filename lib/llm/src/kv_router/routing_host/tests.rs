@@ -4098,12 +4098,12 @@ impl StreamingDispatch<PreprocessedRequest, Annotated<LLMEngineOutput>> for Unav
 
 /// What a client disconnect during Migration's retry records through pipeline C on
 /// `local_pipeline`, when the first attempt's worker fails through `dispatch` and the host
-/// parks the classifier lifecycle for the retry: the items the caller received, every
+/// parks the classifier lifecycle for the retry: what the caller received with every
 /// migration outcome recorded, and the classifier's terminal events.
 async fn kill_during_a_parked_retry(
     local_pipeline: crate::entrypoint::input::LocalPipeline,
     dispatch: Arc<dyn StreamingDispatch<PreprocessedRequest, Annotated<LLMEngineOutput>>>,
-) -> String {
+) -> (String, String) {
     use crate::entrypoint::input::PreprocessedRouting;
     use crate::kv_router::{EncoderRouter, PrefillRouter};
     use crate::model_card::ModelDeploymentCard;
@@ -4190,81 +4190,116 @@ async fn kill_during_a_parked_retry(
         }
     }
     harness.runtime.shutdown();
-    format!(
-        "{}: {answer}, outcomes {recorded:?}, classifier {events:?}",
-        local_pipeline.as_str()
+    let pipeline = local_pipeline.as_str();
+    (
+        format!("{pipeline}: {answer}, outcomes {recorded:?}"),
+        format!("{pipeline}: {events:?}"),
     )
 }
 
 /// A client disconnect while Migration's retry after an eager `WorkerUnavailable` is still
-/// dispatching, with the classifier lifecycle parked for that retry. Migration records the
-/// retry's outcome as `cancelled` once, and the classifier's one terminal event carries the
-/// cancel as its cause, on both local pipelines.
+/// dispatching, with the classifier lifecycle parked for that retry: Migration records the
+/// retry's outcome as `cancelled` once, on both local pipelines.
 ///
 /// The retry is part of the call, so on gdl the kill drops Migration's future in flight and
 /// the call fails as `Cancelled` (the accepted difference `kill_during_dispatch` pins). Only
-/// Migration's drop can then record the outcome and the cause.
+/// Migration's drop can then record the outcome.
 #[tokio::test]
 #[serial_test::serial]
-async fn a_kill_during_a_retry_at_dispatch_records_cancelled_and_its_cause() {
+async fn a_kill_during_a_retry_at_dispatch_records_cancelled_once() {
     use crate::entrypoint::input::LocalPipeline;
 
     let mut outcomes = Vec::new();
     for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
-        outcomes
-            .push(kill_during_a_parked_retry(local_pipeline, Arc::new(UnavailableDispatch)).await);
+        let (outcome, _) =
+            kill_during_a_parked_retry(local_pipeline, Arc::new(UnavailableDispatch)).await;
+        outcomes.push(outcome);
     }
     assert_eq!(
         outcomes,
         [
-            "dynamo: error Cancelled, outcomes [\"new_request/cancelled x1\"], \
-             classifier [Aborted { cause: Some(Cancelled) }]",
-            "gdl: error Cancelled, outcomes [\"new_request/cancelled x1\"], \
-             classifier [Aborted { cause: Some(Cancelled) }]",
+            "dynamo: error Cancelled, outcomes [\"new_request/cancelled x1\"]",
+            "gdl: error Cancelled, outcomes [\"new_request/cancelled x1\"]",
         ]
     );
 }
 
-/// As [`a_kill_during_a_retry_at_dispatch_records_cancelled_and_its_cause`], for a retry after
-/// a mid-stream failure: the call has returned, and the retry runs while the caller reads.
-///
-/// Nothing is dropped here: on gdl the attempt's hop answers the kill with an empty stream, so
-/// Migration sees the dispatch end cancelled, as it does on any hop that answers a kill so.
-/// It must then abort the parked lifecycle with the cancel itself, since no attempt claims it.
+/// As [`a_kill_during_a_retry_at_dispatch_records_cancelled_once`], for a retry after a
+/// mid-stream failure: the call has returned, and the retry runs while the caller reads.
+/// Nothing is dropped here: on gdl the attempt's hop answers the kill with an empty stream,
+/// and Migration records the outcome as it does on any hop that answers a kill so.
 ///
 /// An accepted difference: dynamo's caller receives the failure that caused the retry, because
 /// the host fails the killed dispatch; gdl's receives nothing. The HTTP handler stops reading at
 /// the kill, so a client sees neither.
 #[tokio::test]
 #[serial_test::serial]
-async fn a_kill_during_a_retry_mid_stream_records_cancelled_and_its_cause() {
+async fn a_kill_during_a_retry_mid_stream_records_cancelled_once() {
     use crate::entrypoint::input::LocalPipeline;
 
     let mut outcomes = Vec::new();
     for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
-        outcomes.push(
-            kill_during_a_parked_retry(
-                local_pipeline,
-                Arc::new(AlwaysOverloadedDispatch::default()),
-            )
-            .await,
-        );
+        let (outcome, _) = kill_during_a_parked_retry(
+            local_pipeline,
+            Arc::new(AlwaysOverloadedDispatch::default()),
+        )
+        .await;
+        outcomes.push(outcome);
     }
     assert_eq!(
         outcomes,
         [
-            "dynamo: 1 items, outcomes [\"ongoing_request/cancelled x1\"], \
-             classifier [Aborted { cause: Some(Cancelled) }]",
-            "gdl: 0 items, outcomes [\"ongoing_request/cancelled x1\"], \
-             classifier [Aborted { cause: Some(Cancelled) }]",
+            "dynamo: 1 items, outcomes [\"ongoing_request/cancelled x1\"]",
+            "gdl: 0 items, outcomes [\"ongoing_request/cancelled x1\"]",
         ]
     );
 }
 
-/// A detached prefill can dispatch decode cleanup after Migration sees the kill.
+/// The classifier's one terminal event for a kill during a retry, with the lifecycle parked
+/// for that retry, carries the cancel as its cause, on both local pipelines and for both retry
+/// shapes. Dynamo's host fails the killed dispatch as `Cancelled`, and Migration aborts the
+/// parked lifecycle with that error.
+///
+/// On gdl no one aborts it: the kill drops Migration's future (at dispatch) or the hop answers
+/// it with an empty stream (mid-stream), and the lifecycle's own drop aborts it with no cause.
+/// Migration cannot abort it at the kill, because a detached prefill route's decode leg may
+/// still take it (`killed_migration_preserves_one_classifier_lifecycle_through_detached_cleanup`).
 #[tokio::test]
 #[serial_test::serial]
-#[ignore = "R2: migration aborts the lifecycle before detached decode cleanup can claim it"]
+#[ignore = "gdl drops the cause: aborting the parked lifecycle at the kill breaks detached \
+            decode cleanup, so the cause must be deferred to the lifecycle's drop"]
+async fn a_kill_during_a_retry_aborts_the_parked_lifecycle_with_its_cause() {
+    use crate::entrypoint::input::LocalPipeline;
+
+    let mut causes = Vec::new();
+    for local_pipeline in [LocalPipeline::Dynamo, LocalPipeline::Gdl] {
+        for dispatch in [
+            Arc::new(UnavailableDispatch)
+                as Arc<dyn StreamingDispatch<PreprocessedRequest, Annotated<LLMEngineOutput>>>,
+            Arc::new(AlwaysOverloadedDispatch::default()),
+        ] {
+            let (_, cause) = kill_during_a_parked_retry(local_pipeline, dispatch).await;
+            causes.push(cause);
+        }
+    }
+    assert_eq!(
+        causes,
+        [
+            "dynamo: [Aborted { cause: Some(Cancelled) }]",
+            "dynamo: [Aborted { cause: Some(Cancelled) }]",
+            "gdl: [Aborted { cause: Some(Cancelled) }]",
+            "gdl: [Aborted { cause: Some(Cancelled) }]",
+        ]
+    );
+}
+
+/// A remote prefill's route can send its decode leg, which releases the staged KV, after
+/// Migration has seen the kill: on gdl the route outlives the kill as a detached task. That leg
+/// takes the classifier lifecycle parked for the retry, so the request is classified once, on
+/// both local pipelines and for both retry shapes. Migration must leave the parked lifecycle to
+/// it.
+#[tokio::test]
+#[serial_test::serial]
 async fn killed_migration_preserves_one_classifier_lifecycle_through_detached_cleanup() {
     use crate::entrypoint::input::{LocalPipeline, PreprocessedRouting};
     use crate::kv_router::{EncoderRouter, PrefillRouter};
