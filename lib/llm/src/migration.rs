@@ -362,12 +362,20 @@ impl Migration {
     /// Send `request` on, and send it again on a migratable failure: the body of Migration's
     /// Dynamo and gdl operators.
     ///
+    /// A plain function, not an `async fn`: it returns [`RetryManager::build`]'s future with its
+    /// output mapped. As an `async fn`, its coroutine held that 9.7 KB future, and rustc laid
+    /// the coroutine's arguments out after the space the inner future takes. gdl then built the
+    /// operator's future on the stack and copied it into its box, 9.8 KB per request on
+    /// pipeline B. `RetryManager::build`'s future starts with the request, so gdl writes it in
+    /// place. The lookups below run when the operator is called, not when its future is first
+    /// polled; they have no effects.
+    ///
     /// Transition: make concrete when the gdl pipeline is the only local pipeline.
-    async fn migrate<Resp, D>(
+    fn migrate<Resp, D>(
         &self,
         request: SingleIn<PreprocessedRequest>,
         next: D,
-    ) -> Result<D::Response<Resp>>
+    ) -> impl Future<Output = Result<D::Response<Resp>>> + use<Resp, D>
     where
         Resp: Data + HasTokenIds,
         D: Downstream<PreprocessedRequest, Resp> + 'static,
@@ -377,10 +385,13 @@ impl Migration {
         let (preprocessed_request, context) = request.transfer(());
         let engine_ctx = context.context();
         let engine_ctx_ = engine_ctx.clone();
-        let session_affinity = context
+        let session_affinity = match context
             .get_optional::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
-            .map_err(Error::msg)?
-            .map(|session_id| session_id.as_ref().clone());
+            .map_err(Error::msg)
+        {
+            Ok(session_id) => session_id.map(|session_id| session_id.as_ref().clone()),
+            Err(error) => return futures::future::Either::Left(futures::future::ready(Err(error))),
+        };
         let retry_manager = RetryManager::build(
             engine_ctx,
             context.metadata().clone(),
@@ -391,12 +402,15 @@ impl Migration {
             self.model_name.clone(),
             self.metrics.clone(),
             session_affinity,
-        )
-        .await?;
-        Ok(D::respond_items(
-            Migrated::Streaming(retry_manager),
-            engine_ctx_,
-        ))
+        );
+        futures::future::Either::Right(retry_manager.map(move |retry_manager| {
+            // Held until the manager is built, as the `async fn` held it.
+            drop(context);
+            Ok(D::respond_items(
+                Migrated::Streaming(retry_manager?),
+                engine_ctx_,
+            ))
+        }))
     }
 }
 

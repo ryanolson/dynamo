@@ -1091,19 +1091,8 @@ mod tests {
         );
     }
 
-    /// Pipelines B and C on gdl are native gdl stages from the source to the terminal: no
-    /// Dynamo engine at a boundary inside them. The test's engine sits behind the terminal.
-    #[test]
-    fn routed_gdl_pipelines_are_native_from_source_to_terminal() {
-        use crate::protocols::openai::chat_completions::NvCreateChatCompletionStreamResponse;
-
-        let card =
-            ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
-                .unwrap();
-        let tokenizer = card.tokenizer().unwrap();
-        let PromptFormatter::OAI(formatter) = prompt_formatter_from_mdc(&card).unwrap();
-        let preprocessor =
-            OpenAIPreprocessor::new_with_parts(card.clone(), formatter, tokenizer.clone()).unwrap();
+    /// The routers and terminal of pipelines B and C over an engine that is never called.
+    fn silent_routing() -> PreprocessedRouting {
         struct Silent;
         #[dynamo_runtime::pipeline::async_trait]
         impl
@@ -1120,7 +1109,7 @@ mod tests {
                 anyhow::bail!("not called")
             }
         }
-        let routing = PreprocessedRouting::new(
+        PreprocessedRouting::new(
             Arc::new(Silent),
             PrefillRouter::disabled(
                 Arc::new(crate::discovery::ModelManager::new()),
@@ -1128,7 +1117,23 @@ mod tests {
                 None,
             ),
             EncoderRouter::disabled(),
-        );
+        )
+    }
+
+    /// Pipelines B and C on gdl are native gdl stages from the source to the terminal: no
+    /// Dynamo engine at a boundary inside them. The test's engine sits behind the terminal.
+    #[test]
+    fn routed_gdl_pipelines_are_native_from_source_to_terminal() {
+        use crate::protocols::openai::chat_completions::NvCreateChatCompletionStreamResponse;
+
+        let card =
+            ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
+                .unwrap();
+        let tokenizer = card.tokenizer().unwrap();
+        let PromptFormatter::OAI(formatter) = prompt_formatter_from_mdc(&card).unwrap();
+        let preprocessor =
+            OpenAIPreprocessor::new_with_parts(card.clone(), formatter, tokenizer.clone()).unwrap();
+        let routing = silent_routing();
         let migration = || Migration::new(0, None, String::new(), Arc::new(Metrics::new()));
         let b = routing
             .gdl_pipeline::<NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse>(
@@ -1149,6 +1154,64 @@ mod tests {
             }
             assert!(pipeline.contains("RoutingTerminal"), "{name}: {pipeline}");
         }
+    }
+
+    /// The future of Migration's gdl operator, in bytes, on pipelines B and C: 9,872 and 9,632
+    /// at the time of writing. gdl writes it into its box; a larger future is more to build
+    /// there, and an `async fn` around `RetryManager::build`'s future made it 12,272 and 12,016
+    /// bytes, with a 9.8 KB copy on B (see `Migration::migrate`). The ceiling leaves room for a
+    /// field or two; a rise past it should be measured with the b-gdl `memcpy` column of
+    /// `benches/hotpath.sh` before the ceiling moves.
+    const MIGRATION_FUTURE_CEILING: usize = 10 * 1024;
+
+    #[test]
+    fn migration_future_stays_small() {
+        use crate::protocols::common::{OutputOptions, SamplingOptions, StopConditions};
+        use gdl::Operator as _;
+
+        type Pre = PreprocessedRequest;
+        let request = || {
+            let request = Pre::builder()
+                .model(String::new())
+                .token_ids(vec![1, 2, 3])
+                .stop_conditions(StopConditions::default())
+                .sampling_options(SamplingOptions::default())
+                .output_options(OutputOptions::default())
+                .eos_token_ids(vec![])
+                .annotations(vec![])
+                .build()
+                .unwrap();
+            Box::new(SingleIn::new(request))
+        };
+        let migration = || Migration::new(0, None, String::new(), Arc::new(Metrics::new()));
+        let card =
+            ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
+                .unwrap();
+        let routing = silent_routing();
+        let cx = gdl::Cx::new();
+
+        // Pipeline B: Migration over Backend's around node, as `gdl_pipeline` builds it.
+        let b = GdlOperator::<_, BackendOutput>::new(migration());
+        let b_next = around::<_, Pre, _>(
+            Backend::from_tokenizer(card.tokenizer().unwrap()),
+            routing.gdl_routers(),
+        );
+        let b_next =
+            gdl::__runtime::Called::of::<GdlOperator<Migration, BackendOutput>>(b_next, &cx);
+        let b_size = std::mem::size_of_val(&b.generate(cx.clone(), request(), b_next));
+
+        // Pipeline C: Migration over the routers, as `gdl_preprocessed_pipeline` builds it.
+        let c = GdlOperator::<_, LLMEngineOutput>::new(migration());
+        let c_next = gdl::Hop::new((), routing.gdl_routers(), ());
+        let c_next =
+            gdl::__runtime::Called::of::<GdlOperator<Migration, LLMEngineOutput>>(c_next, &cx);
+        let c_size = std::mem::size_of_val(&c.generate(cx.clone(), request(), c_next));
+
+        assert!(
+            b_size <= MIGRATION_FUTURE_CEILING && c_size <= MIGRATION_FUTURE_CEILING,
+            "Migration's future is {b_size} bytes on B and {c_size} on C, over its ceiling of \
+             {MIGRATION_FUTURE_CEILING}"
+        );
     }
 
     /// Transition: remove when the gdl pipeline is the only local pipeline.
