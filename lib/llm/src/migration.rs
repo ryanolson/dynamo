@@ -575,10 +575,11 @@ where
 /// drops this manager inside [`RetryManager::new_stream`], before it records the migration's
 /// outcome. Record it here as cancelled, as `new_stream` does when it sees the cancel.
 ///
-/// The guard does not abort the classifier lifecycle parked for the retry. On gdl a remote
-/// prefill's route outlives the kill as a detached task, and its decode leg, which releases
-/// the staged KV, takes the parked lifecycle and finishes it. Aborting it here would make that
-/// leg start and classify a second one.
+/// The guard gives the classifier lifecycle parked for the retry the cancel as its cause, but
+/// leaves it parked rather than abort it: on gdl a remote prefill's route outlives the kill as
+/// a detached task, and its decode leg, which releases the staged KV, takes the parked
+/// lifecycle and finishes it. Aborting it here would make that leg start and classify a second
+/// one. Unclaimed, the lifecycle aborts with the cause when it is dropped.
 impl<Resp, D> Drop for RetryManager<Resp, D>
 where
     Resp: Data + HasTokenIds,
@@ -591,6 +592,7 @@ where
         // dispatch is not a cancel and records none.
         if self.unrecorded_migration.is_some() && !std::thread::panicking() {
             self.record_migration_outcome(frontend_service::migration_outcome::CANCELLED);
+            self.abort_request_lifecycle_on_drop_cancelled();
         }
     }
 }
@@ -798,6 +800,22 @@ where
         }
     }
 
+    /// Give any classifier lifecycle parked for a retry the request's cancel as the cause it
+    /// aborts with if no leg takes it (see [`MigrationState::abort_request_lifecycle_on_drop`]).
+    /// The cause is built only when a lifecycle can be parked.
+    fn abort_request_lifecycle_on_drop_cancelled(&self) {
+        if let Some(state) = self.request.migration_state.as_ref() {
+            let error = DynamoError::builder()
+                .error_type(ErrorType::Cancelled)
+                .message(format!(
+                    "Context id {} is stopped or killed",
+                    self.context.id()
+                ))
+                .build();
+            state.abort_request_lifecycle_on_drop(&error);
+        }
+    }
+
     /// Dispatch the next attempt. A `migration_event` is the migration it dispatches for; one
     /// starts here when a dispatch fails over. Every return records its outcome, if any, and
     /// the manager's drop records it if the future is dropped first.
@@ -905,8 +923,8 @@ where
                     // A dispatch cancelled before its response prologue returns `Ok` empty,
                     // so a stopped context here means the client left during the handshake.
                     // The attempt can be stopped or killed on its own, so check it too.
-                    let outcome = if self.context.is_stopped()
-                        || self.context.is_killed()
+                    let request_cancelled = self.context.is_stopped() || self.context.is_killed();
+                    let outcome = if request_cancelled
                         || attempt_context.is_stopped()
                         || attempt_context.is_killed()
                     {
@@ -915,6 +933,12 @@ where
                         frontend_service::migration_outcome::SUCCESS
                     };
                     self.record_migration_outcome(outcome);
+                    // A hop that answered the request's cancel with an empty stream did not
+                    // claim a lifecycle parked for this retry. Not on an attempt cancelled alone:
+                    // the request goes on, and a later retry may claim the lifecycle.
+                    if request_cancelled {
+                        self.abort_request_lifecycle_on_drop_cancelled();
+                    }
                     self.active_route_trace = Some(route_trace);
                     self.next_stream = Some(next_stream);
                     self.replayed_tokens = replayed_tokens;
