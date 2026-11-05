@@ -571,9 +571,9 @@ where
 }
 
 /// The drop guard of a migration in flight. On the gdl pipeline a kill drops the response in
-/// flight, and with it this manager inside [`RetryManager::new_stream`], before it records the
-/// migration's outcome. Record it here as cancelled, as `new_stream` does when it sees the
-/// cancel.
+/// flight, and on either pipeline the HTTP handler drops it when the client disconnects. Either
+/// drops this manager inside [`RetryManager::new_stream`], before it records the migration's
+/// outcome. Record it here as cancelled, as `new_stream` does when it sees the cancel.
 ///
 /// The guard does not abort the classifier lifecycle parked for the retry. On gdl a remote
 /// prefill's route outlives the kill as a detached task, and its decode leg, which releases
@@ -585,12 +585,11 @@ where
     D: Downstream<PreprocessedRequest, Resp>,
 {
     fn drop(&mut self) {
-        // Only a cancel of the request is a cancelled outcome: a panic unwinding through the
-        // dispatch, or a caller that drops the response of a live request, records none, as
-        // before.
-        if self.unrecorded_migration.is_some()
-            && (self.context.is_stopped() || self.context.is_killed())
-        {
+        // A drop in flight is the request's cancel, whether its context is killed first (gdl's
+        // kill) or after (the HTTP handler drops the response, then its disconnect monitor
+        // kills the context), so the context cannot tell. A panic unwinding through the
+        // dispatch is not a cancel and records none.
+        if self.unrecorded_migration.is_some() && !std::thread::panicking() {
             self.record_migration_outcome(frontend_service::migration_outcome::CANCELLED);
         }
     }
