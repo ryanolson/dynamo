@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::pin::Pin;
+use std::future::Future;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use dynamo_renderer::PromptFormatter;
+use futures::future::Either;
 
 use crate::{
     backend::{Backend, ExecutionContext},
@@ -18,37 +19,85 @@ use crate::{
     migration::Migration,
     model_card::ModelDeploymentCard,
     namespace::NamespaceFilter,
-    preprocessor::{OpenAIPreprocessor, prompt::prompt_formatter_from_mdc},
-    protocols::common::llm_backend::{BackendOutput, LLMEngineOutput, PreprocessedRequest},
+    operator::GdlOperator,
+    preprocessor::{
+        OpenAIPreprocessor, PreprocessedEmbeddingRequest, PreprocessorNode,
+        prompt::prompt_formatter_from_mdc,
+    },
+    protocols::common::llm_backend::{
+        BackendOutput, EmbeddingsEngineOutput, LLMEngineOutput, PreprocessedRequest,
+    },
     request_template::RequestTemplate,
     session_affinity::{SessionAffinityMode, create_affinity_coordinator},
     types::{
         Annotated,
-        openai::chat_completions::{
-            NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse,
-            OpenAIChatCompletionsStreamingEngine,
+        openai::{
+            chat_completions::{
+                NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse,
+                OpenAIChatCompletionsStreamingEngine,
+            },
+            embeddings::{
+                NvCreateEmbeddingRequest, NvCreateEmbeddingResponse,
+                OpenAIEmbeddingsStreamingEngine,
+            },
         },
     },
 };
 
+use dynamo_gdl_adapters::{Boxed, EngineSink, PipelineEngine};
 use dynamo_kv_router::config::min_initial_workers_from_env;
 use dynamo_runtime::{
     DistributedRuntime,
     component::Client,
-    engine::{AsyncEngineStream, Data},
-    pipeline::{
-        Context, ManyOut, MultimodalCacheKeyExtractor, Operator, RouterMode, SegmentSource,
-        ServiceBackend, ServiceEngine, ServiceFrontend, SingleIn, Source,
-    },
+    engine::{AsyncEngine, Data},
+    pipeline::{ManyOut, MultimodalCacheKeyExtractor, RouterMode, ServiceEngine, SingleIn},
 };
 use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct PreprocessedRouting {
-    backend_engine:
-        ServiceEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>>,
+    backend: RoutingTerminal,
     prefill_router: Arc<PrefillRouter>,
     encoder_router: Arc<EncoderRouter>,
+}
+
+/// What a routed pipeline sends its requests to: the worker set's `RoutingHost`, or an engine
+/// that a test puts in its place.
+#[derive(Clone)]
+enum RoutingTerminal {
+    Host(Arc<RoutingHost>),
+    /// A test's engine, as a gdl sink.
+    Engine(TerminalSink),
+}
+
+/// A test's engine as the gdl sink of [`RoutingTerminal::Engine`].
+type TerminalSink = EngineSink<
+    dyn AsyncEngine<
+            SingleIn<PreprocessedRequest>,
+            ManyOut<Annotated<LLMEngineOutput>>,
+            anyhow::Error,
+        >,
+    PreprocessedRequest,
+    LLMEngineOutput,
+    Boxed<PreprocessedRequest>,
+>;
+
+/// The terminal as the sink of a gdl local pipeline: `RoutingHost`'s own sink, or the test's
+/// engine through `EngineSink`.
+impl gdl::Sink for RoutingTerminal {
+    type Req = Boxed<PreprocessedRequest>;
+    type Item = Annotated<LLMEngineOutput>;
+
+    fn generate(
+        &self,
+        cx: gdl::Cx,
+        request: Boxed<PreprocessedRequest>,
+    ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<LLMEngineOutput>>>> + Send {
+        match self {
+            Self::Host(host) => Either::Left(gdl::Sink::generate(host.as_ref(), cx, request)),
+            Self::Engine(sink) => Either::Right(gdl::Sink::generate(sink, cx, request)),
+        }
+    }
 }
 
 pub struct PreparedEngine {
@@ -255,12 +304,11 @@ pub(crate) async fn build_preprocessed_routing_with_session_affinity_mode(
             .set_decode_routing_host(routing_host.clone())
             .context("install conditional-disagg decode RoutingHost")?;
     }
-    let backend_engine: ServiceEngine<_, _> = routing_host;
-    Ok(PreprocessedRouting {
-        backend_engine,
+    Ok(PreprocessedRouting::with_routing_host(
+        routing_host,
         prefill_router,
         encoder_router,
-    })
+    ))
 }
 
 /// Turns an EngineConfig into an OpenAI chat-completions and completions supported StreamingEngine.
@@ -381,40 +429,131 @@ pub async fn prepare_engine(
     }
 }
 
+/// Build the in-process pipeline: preprocessor, then backend, then `engine`. The HTTP and gRPC
+/// inputs build it over an in-process token engine.
+///
+/// One hop to the engine, with the preprocessor and Backend as its around nodes.
 pub async fn build_pipeline<Req, Resp>(
     card: &ModelDeploymentCard,
     engine: ExecutionContext,
     tokenizer: crate::tokenizers::Tokenizer,
-) -> anyhow::Result<Arc<ServiceFrontend<SingleIn<Req>, ManyOut<Annotated<Resp>>>>>
+) -> anyhow::Result<ServiceEngine<SingleIn<Req>, ManyOut<Annotated<Resp>>>>
 where
     Req: Data,
     Resp: Data,
-    OpenAIPreprocessor: Operator<
-            Context<Req>,
-            Pin<Box<dyn AsyncEngineStream<Annotated<Resp>>>>,
-            Context<PreprocessedRequest>,
-            Pin<Box<dyn AsyncEngineStream<Annotated<BackendOutput>>>>,
+    PreprocessorNode<Req>: gdl::Around<
+            UpReq = Boxed<Req>,
+            UpItem = Annotated<Resp>,
+            DownReq = Boxed<PreprocessedRequest>,
+            DownItem = Annotated<BackendOutput>,
         >,
 {
-    let frontend = ServiceFrontend::<SingleIn<Req>, ManyOut<Annotated<Resp>>>::new();
+    use gdl::{Hop, SinkStage};
+    type Pre = PreprocessedRequest;
+
     let PromptFormatter::OAI(formatter) = prompt_formatter_from_mdc(card)?;
     let preprocessor =
-        OpenAIPreprocessor::new_with_parts(card.clone(), formatter, tokenizer.clone())?
-            .into_operator();
-    let backend = Backend::from_tokenizer(tokenizer).into_operator();
-    let engine = ServiceBackend::from_engine(engine);
+        OpenAIPreprocessor::new_with_parts(card.clone(), formatter, tokenizer.clone())?;
+    let backend = Backend::from_tokenizer(tokenizer);
 
-    Ok(frontend
-        .link(preprocessor.forward_edge())?
-        .link(backend.forward_edge())?
-        .link(engine)?
-        .link(backend.backward_edge())?
-        .link(preprocessor.backward_edge())?
-        .link_terminal(frontend)?)
+    let engine = SinkStage::new(Arc::new(EngineSink::<_, Pre, _, Boxed<Pre>>::new(engine)));
+    let below = Arc::new(
+        PipelineEngine::<_, Pre, BackendOutput, Boxed<Pre>>::for_dynamo_stages(
+            around::<_, Pre, _>(backend.clone(), engine.clone()),
+        ),
+    );
+    let (preprocessor_forward, preprocessor_backward) =
+        gdl::around(Arc::new(PreprocessorNode::<Req>::new(preprocessor, below)));
+    let (backend_forward, backend_backward) =
+        gdl::around(Arc::new(GdlOperator::<_, Pre>::new(backend)));
+    let hop = Hop::new(
+        (preprocessor_forward, (backend_forward, ())),
+        engine,
+        (backend_backward, (preprocessor_backward, ())),
+    );
+    Ok(Arc::new(
+        PipelineEngine::<_, Req, Resp, Boxed<Req>>::for_dynamo_stages(gdl::Source::new(hop)),
+    ))
+}
+
+/// Build the embeddings pipeline: the preprocessor, a native gdl operator, over `engine`.
+/// Backend passes an embeddings response through unchanged, so the pipeline has none.
+///
+/// The caller builds `preprocessor` (`OpenAIPreprocessor::new_for_embeddings`), so a card it
+/// cannot serve fails before the caller creates `engine`.
+pub fn build_embeddings_pipeline(
+    preprocessor: Arc<OpenAIPreprocessor>,
+    engine: ServiceEngine<
+        SingleIn<PreprocessedEmbeddingRequest>,
+        ManyOut<Annotated<EmbeddingsEngineOutput>>,
+    >,
+) -> OpenAIEmbeddingsStreamingEngine {
+    use gdl::{Hop, OperatorStage, SinkStage};
+    type Req = NvCreateEmbeddingRequest;
+    type Resp = NvCreateEmbeddingResponse;
+
+    let router = SinkStage::new(Arc::new(EngineSink::new(engine)));
+    let preprocessor = OperatorStage::new(
+        Arc::new(GdlOperator::<_, Req>::new(preprocessor)),
+        Hop::new((), router, ()),
+    );
+    Arc::new(PipelineEngine::<_, Req, Resp>::for_dynamo_stages(
+        gdl::Source::new(Hop::new((), preprocessor, ())),
+    ))
 }
 
 impl PreprocessedRouting {
+    /// Route through `routing_host` behind the given prefill and encoder routers.
+    /// [`build_preprocessed_routing`] builds the host from a discovery client.
+    pub(crate) fn with_routing_host(
+        routing_host: Arc<RoutingHost>,
+        prefill_router: Arc<PrefillRouter>,
+        encoder_router: Arc<EncoderRouter>,
+    ) -> Self {
+        Self::with_terminal(
+            RoutingTerminal::Host(routing_host),
+            prefill_router,
+            encoder_router,
+        )
+    }
+
+    /// Route through `backend_engine`, in place of a `RoutingHost`, behind the given prefill
+    /// and encoder routers: a test stands in for the workers.
+    pub fn new(
+        backend_engine: ServiceEngine<
+            SingleIn<PreprocessedRequest>,
+            ManyOut<Annotated<LLMEngineOutput>>,
+        >,
+        prefill_router: Arc<PrefillRouter>,
+        encoder_router: Arc<EncoderRouter>,
+    ) -> Self {
+        Self::with_terminal(
+            RoutingTerminal::Engine(TerminalSink::new(backend_engine)),
+            prefill_router,
+            encoder_router,
+        )
+    }
+
+    fn with_terminal(
+        backend: RoutingTerminal,
+        prefill_router: Arc<PrefillRouter>,
+        encoder_router: Arc<EncoderRouter>,
+    ) -> Self {
+        Self {
+            backend,
+            prefill_router,
+            encoder_router,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prefill_router(&self) -> &Arc<PrefillRouter> {
+        &self.prefill_router
+    }
+
     /// The normal way to build an inference pipeline. Connect this directly to HTTP layer.
+    ///
+    /// Each operator calls the hop below it directly, with no response map per stage.
     pub fn build_pipeline<Req, Resp>(
         &self,
         card: &ModelDeploymentCard,
@@ -427,41 +566,77 @@ impl PreprocessedRouting {
     where
         Req: Data,
         Resp: Data,
-        OpenAIPreprocessor: Operator<
-                Context<Req>,
-                Pin<Box<dyn AsyncEngineStream<Annotated<Resp>>>>,
-                Context<PreprocessedRequest>,
-                Pin<Box<dyn AsyncEngineStream<Annotated<BackendOutput>>>>,
+        PreprocessorNode<Req>: gdl::Around<
+                UpReq = Boxed<Req>,
+                UpItem = Annotated<Resp>,
+                DownReq = Boxed<PreprocessedRequest>,
+                DownItem = Annotated<BackendOutput>,
             >,
     {
-        let frontend = SegmentSource::<SingleIn<Req>, ManyOut<Annotated<Resp>>>::new();
-        let preprocessor_op = preprocessor.into_operator();
-        let token_backend = Backend::from_tokenizer(tokenizer).into_operator();
-        let migration = Migration::from_mdc(card, migration_limit, migration_max_seq_len, metrics)
-            .into_operator_for::<BackendOutput>();
-        let prefill_op = self.prefill_router.into_operator();
-        let encoder_op = self.encoder_router.into_operator();
-        let backend = ServiceBackend::from_engine(self.backend_engine.clone());
+        let token_backend = Backend::from_tokenizer(tokenizer);
+        let migration = Migration::from_mdc(card, migration_limit, migration_max_seq_len, metrics);
+        Ok(Arc::new(PipelineEngine::<_, Req, Resp, Boxed<Req>>::new(
+            self.gdl_pipeline(preprocessor, migration, token_backend),
+        )))
+    }
 
-        let engine = frontend
-            .link(preprocessor_op.forward_edge())?
-            .link(migration.forward_edge())?
-            .link(token_backend.forward_edge())?
-            .link(encoder_op.forward_edge())?
-            .link(prefill_op.forward_edge())?
-            .link(backend)?
-            .link(prefill_op.backward_edge())?
-            .link(encoder_op.backward_edge())?
-            .link(token_backend.backward_edge())?
-            .link(migration.backward_edge())?
-            .link(preprocessor_op.backward_edge())?
-            .link_terminal(frontend)?;
+    /// The stages of [`build_pipeline`](Self::build_pipeline), each a native gdl operator,
+    /// built from the terminal up, since each stage owns the hop it calls.
+    fn gdl_pipeline<Req, Resp>(
+        &self,
+        preprocessor: Arc<OpenAIPreprocessor>,
+        migration: Arc<Migration>,
+        token_backend: Arc<Backend>,
+    ) -> gdl::Source<impl gdl::Next<Boxed<Req>, Annotated<Resp>>>
+    where
+        Req: Data,
+        Resp: Data,
+        PreprocessorNode<Req>: gdl::Around<
+                UpReq = Boxed<Req>,
+                UpItem = Annotated<Resp>,
+                DownReq = Boxed<PreprocessedRequest>,
+                DownItem = Annotated<BackendOutput>,
+            >,
+    {
+        type Pre = PreprocessedRequest;
+        // Migration over Backend's hop to the routers: the inner end of the preprocessor's hop,
+        // and, as an engine of its own, where a speculative prefill is sent.
+        let migration = gdl::OperatorStage::new(
+            Arc::new(GdlOperator::<_, BackendOutput>::new(migration)),
+            around::<_, Pre, _>(token_backend, self.gdl_routers()),
+        );
+        let below =
+            Arc::new(
+                PipelineEngine::<_, Pre, BackendOutput, Boxed<Pre>>::for_dynamo_stages(
+                    gdl::Hop::new((), migration.clone(), ()),
+                ),
+            );
+        let (forward, backward) =
+            gdl::around(Arc::new(PreprocessorNode::<Req>::new(preprocessor, below)));
+        gdl::Source::new(gdl::Hop::new((forward, ()), migration, (backward, ())))
+    }
 
-        Ok(engine)
+    /// The encoder router, the prefill router and the terminal as native gdl stages: the tail
+    /// of [`gdl_pipeline`](Self::gdl_pipeline) and
+    /// [`gdl_preprocessed_pipeline`](Self::gdl_preprocessed_pipeline), as the inner end of the
+    /// hop that calls the encoder router.
+    fn gdl_routers(
+        &self,
+    ) -> impl gdl::Inner<Boxed<PreprocessedRequest>, Item = Annotated<LLMEngineOutput>> {
+        use gdl::{Hop, OperatorStage, SinkStage};
+        type Pre = PreprocessedRequest;
+
+        let terminal = Hop::new((), SinkStage::new(Arc::new(self.backend.clone())), ());
+        let prefill = native::<_, Pre, _>(self.prefill_router.clone(), terminal);
+        OperatorStage::new(
+            Arc::new(GdlOperator::<_, Pre>::new(self.encoder_router.clone())),
+            prefill,
+        )
     }
 
     /// Bring your own pre/post processor. Used when frontend has `--dyn-chat-processor
-    /// vllm|sglang`.
+    /// vllm|sglang`, and by the Generate engine. Built as [`build_pipeline`](Self::build_pipeline)
+    /// builds its own.
     pub fn build_preprocessed_pipeline(
         &self,
         card: &ModelDeploymentCard,
@@ -471,33 +646,197 @@ impl PreprocessedRouting {
     ) -> anyhow::Result<
         ServiceEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>>,
     > {
-        let frontend = SegmentSource::<
-            SingleIn<PreprocessedRequest>,
-            ManyOut<Annotated<LLMEngineOutput>>,
-        >::new();
-        let migration = Migration::from_mdc(card, migration_limit, migration_max_seq_len, metrics)
-            .into_operator_for::<LLMEngineOutput>();
-        let prefill_op = self.prefill_router.into_operator();
-        let encoder_op = self.encoder_router.into_operator();
-        let backend = ServiceBackend::from_engine(self.backend_engine.clone());
-
-        let engine = frontend
-            .link(migration.forward_edge())?
-            .link(encoder_op.forward_edge())?
-            .link(prefill_op.forward_edge())?
-            .link(backend)?
-            .link(prefill_op.backward_edge())?
-            .link(encoder_op.backward_edge())?
-            .link(migration.backward_edge())?
-            .link_terminal(frontend)?;
-
-        Ok(engine)
+        let migration = Migration::from_mdc(card, migration_limit, migration_max_seq_len, metrics);
+        Ok(Arc::new(PipelineEngine::<
+            _,
+            PreprocessedRequest,
+            LLMEngineOutput,
+            Boxed<PreprocessedRequest>,
+        >::new(
+            self.gdl_preprocessed_pipeline(migration)
+        )))
     }
+
+    /// The stages of [`build_preprocessed_pipeline`](Self::build_preprocessed_pipeline).
+    fn gdl_preprocessed_pipeline(
+        &self,
+        migration: Arc<Migration>,
+    ) -> gdl::Source<impl gdl::Next<Boxed<PreprocessedRequest>, Annotated<LLMEngineOutput>>> {
+        gdl::Source::new(native::<_, LLMEngineOutput, _>(
+            migration,
+            gdl::Hop::new((), self.gdl_routers(), ()),
+        ))
+    }
+}
+
+/// A hop to `I` with `GdlOperator<O, K>` as its one around node.
+type AroundHop<O, K, I> = gdl::Hop<
+    (gdl::ForwardHalf<GdlOperator<O, K>>, ()),
+    I,
+    (gdl::BackwardHalf<GdlOperator<O, K>>, ()),
+>;
+
+/// `op` as an around node of the hop to `inner`, keyed by `K` (see [`GdlOperator`]).
+fn around<O, K, I>(op: Arc<O>, inner: I) -> AroundHop<O, K, I>
+where
+    GdlOperator<O, K>: gdl::Around,
+{
+    let (forward, backward) = gdl::around(Arc::new(GdlOperator::new(op)));
+    gdl::Hop::new((forward, ()), inner, (backward, ()))
+}
+
+/// `op` as a native gdl operator, keyed by `K` (see [`GdlOperator`]), over the hop `next`.
+fn native<O, K, H>(
+    op: Arc<O>,
+    next: H,
+) -> gdl::Hop<(), gdl::OperatorStage<GdlOperator<O, K>, H>, ()> {
+    gdl::Hop::new(
+        (),
+        gdl::OperatorStage::new(Arc::new(GdlOperator::new(op)), next),
+        (),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The gdl nodes of pipelines A, B and C carry their requests boxed, so gdl's chain moves a
+    /// pointer through each node and future, not the request: about 2 KB for a chat request and
+    /// 1 KB for a preprocessed one, a `memcpy` per move.
+    #[test]
+    fn gdl_nodes_carry_their_requests_boxed() {
+        use crate::protocols::openai::completions::NvCreateCompletionRequest;
+        use std::mem::size_of;
+
+        type Chat = PreprocessorNode<NvCreateChatCompletionRequest>;
+        type Completion = PreprocessorNode<NvCreateCompletionRequest>;
+        type Pre = PreprocessedRequest;
+        type Op<O, K> = GdlOperator<O, K>;
+        let sizes = [
+            (
+                "chat preprocessor in",
+                size_of::<<Chat as gdl::Around>::UpReq>(),
+            ),
+            (
+                "chat preprocessor out",
+                size_of::<<Chat as gdl::Around>::DownReq>(),
+            ),
+            (
+                "completion preprocessor in",
+                size_of::<<Completion as gdl::Around>::UpReq>(),
+            ),
+            (
+                "completion preprocessor out",
+                size_of::<<Completion as gdl::Around>::DownReq>(),
+            ),
+            (
+                "backend in",
+                size_of::<<Op<Backend, Pre> as gdl::Around>::UpReq>(),
+            ),
+            (
+                "backend out",
+                size_of::<<Op<Backend, Pre> as gdl::Around>::DownReq>(),
+            ),
+            (
+                "migration in",
+                size_of::<<Op<Migration, BackendOutput> as gdl::Operator>::UpReq>(),
+            ),
+            (
+                "migration out",
+                size_of::<<Op<Migration, LLMEngineOutput> as gdl::Operator>::DownReq>(),
+            ),
+            (
+                "encoder router in",
+                size_of::<<Op<EncoderRouter, Pre> as gdl::Operator>::UpReq>(),
+            ),
+            (
+                "encoder router out",
+                size_of::<<Op<EncoderRouter, Pre> as gdl::Operator>::DownReq>(),
+            ),
+            (
+                "prefill router in",
+                size_of::<<Op<PrefillRouter, Pre> as gdl::Operator>::UpReq>(),
+            ),
+            (
+                "prefill router out",
+                size_of::<<Op<PrefillRouter, Pre> as gdl::Operator>::DownReq>(),
+            ),
+            (
+                "routing terminal",
+                size_of::<<RoutingTerminal as gdl::Sink>::Req>(),
+            ),
+            ("routing host", size_of::<<RoutingHost as gdl::Sink>::Req>()),
+        ];
+        let large: Vec<_> = sizes
+            .iter()
+            .filter(|(_, size)| *size != size_of::<usize>())
+            .collect();
+        assert!(
+            large.is_empty(),
+            "requests carried inline, in bytes: {large:?}"
+        );
+    }
+
+    /// Pipelines B and C on gdl are native gdl stages from the source to the terminal: no
+    /// Dynamo engine at a boundary inside them. The test's engine sits behind the terminal.
+    #[test]
+    fn routed_gdl_pipelines_are_native_from_source_to_terminal() {
+        use crate::protocols::openai::chat_completions::NvCreateChatCompletionStreamResponse;
+
+        let card =
+            ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
+                .unwrap();
+        let tokenizer = card.tokenizer().unwrap();
+        let PromptFormatter::OAI(formatter) = prompt_formatter_from_mdc(&card).unwrap();
+        let preprocessor =
+            OpenAIPreprocessor::new_with_parts(card.clone(), formatter, tokenizer.clone()).unwrap();
+        struct Silent;
+        #[dynamo_runtime::pipeline::async_trait]
+        impl
+            AsyncEngine<
+                SingleIn<PreprocessedRequest>,
+                ManyOut<Annotated<LLMEngineOutput>>,
+                anyhow::Error,
+            > for Silent
+        {
+            async fn generate(
+                &self,
+                _request: SingleIn<PreprocessedRequest>,
+            ) -> anyhow::Result<ManyOut<Annotated<LLMEngineOutput>>> {
+                anyhow::bail!("not called")
+            }
+        }
+        let routing = PreprocessedRouting::new(
+            Arc::new(Silent),
+            PrefillRouter::disabled(
+                Arc::new(crate::discovery::ModelManager::new()),
+                RouterMode::KV,
+                None,
+            ),
+            EncoderRouter::disabled(),
+        );
+        let migration = || Migration::new(0, None, String::new(), Arc::new(Metrics::new()));
+        let b = routing
+            .gdl_pipeline::<NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse>(
+                preprocessor,
+                migration(),
+                Backend::from_tokenizer(tokenizer),
+            );
+        let c = routing.gdl_preprocessed_pipeline(migration());
+        for (name, pipeline) in [
+            ("b", std::any::type_name_of_val(&b)),
+            ("c", std::any::type_name_of_val(&c)),
+        ] {
+            for adapter in ["EngineSink", "PipelineEngine"] {
+                assert!(
+                    !pipeline.contains(adapter),
+                    "{name} holds {adapter}: {pipeline}"
+                );
+            }
+            assert!(pipeline.contains("RoutingTerminal"), "{name}: {pipeline}");
+        }
+    }
 
     #[test]
     fn test_validate_router_mode_for_lora() {

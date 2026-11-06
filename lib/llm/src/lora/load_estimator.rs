@@ -113,15 +113,15 @@ impl BucketedRateCounter {
         // bucket) so a rare stale/out-of-order recorder with an older `now` can never REGRESS the
         // marker below a newer concurrent record — which would otherwise make has_recent_arrival
         // read stale and drop a genuinely recent signal.
-        let _ =
-            self.last_arrival_bucket
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                    Some(if cur == u64::MAX {
-                        global_bucket
-                    } else {
-                        cur.max(global_bucket)
-                    })
-                });
+        let _ = self
+            .last_arrival_bucket
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(if cur == u64::MAX {
+                    global_bucket
+                } else {
+                    cur.max(global_bucket)
+                })
+            });
 
         loop {
             let current_epoch = self.epochs[index].load(Ordering::Acquire);
@@ -577,7 +577,7 @@ impl LoadEstimator {
             entry
                 .value()
                 .active_count
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                     Some(v.saturating_sub(1))
                 })
                 .ok();

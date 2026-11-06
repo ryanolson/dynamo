@@ -662,6 +662,8 @@ mod tests {
     use crate::discovery::CommittedWorkerSetTarget;
     use crate::entrypoint::RouterConfig;
     use crate::kv_router::prefill_router::PrefillRouterLifecycle;
+    use crate::kv_router::prefill_router::tests::on_gdl;
+    use crate::operator::testing;
     use crate::protocols::common::llm_backend::{LLMEngineOutput, PreprocessedRequest};
     use dynamo_kv_router::config::KvRouterConfig;
     use dynamo_kv_router::protocols::RoutingConstraints;
@@ -672,7 +674,7 @@ mod tests {
         distributed::{DiscoveryBackend, DistributedConfig, RequestPlaneMode},
         error::{ErrorType, match_error_chain},
         pipeline::{
-            AsyncEngine, AsyncEngineContextProvider, ManyOut, Operator, ResponseStream, SingleIn,
+            AsyncEngine, AsyncEngineContextProvider, ManyOut, ResponseStream, SingleIn,
             network::Ingress,
         },
         storage::kv,
@@ -769,9 +771,9 @@ mod tests {
             .unwrap()
     }
 
-    async fn prefilled_worker(router: &PrefillRouter) -> u32 {
-        let mut response = router
-            .generate(SingleIn::new(request()), Arc::new(PrefillWorker(99)))
+    async fn prefilled_worker(router: &Arc<PrefillRouter>) -> u32 {
+        let mut response = on_gdl(router, Arc::new(PrefillWorker(99)))
+            .generate(SingleIn::new(request()))
             .await
             .unwrap();
         let worker = response.next().await.unwrap().data.unwrap().token_ids[0];
@@ -780,11 +782,11 @@ mod tests {
     }
 
     /// Worker 99 is the downstream aggregated path, which must never be reached.
-    async fn await_activation(router: &PrefillRouter, expected_prefill_worker: u32) {
+    async fn await_activation(router: &Arc<PrefillRouter>, expected_prefill_worker: u32) {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                match router
-                    .generate(SingleIn::new(request()), Arc::new(PrefillWorker(99)))
+                match on_gdl(router, Arc::new(PrefillWorker(99)))
+                    .generate(SingleIn::new(request()))
                     .await
                 {
                     Err(error) => {
@@ -1113,9 +1115,9 @@ mod tests {
             let cancelled = self.0.clone();
             let response = async_stream::stream! {
                 yield Annotated::from_data(LLMEngineOutput {
-                    disaggregated_params: Some(serde_json::json!({
+                    disaggregated_params: Some(Box::new(serde_json::json!({
                         "bootstrap_host": "127.0.0.1", "bootstrap_port": 1, "bootstrap_room": 7,
-                    })),
+                    }))),
                     ..Default::default()
                 });
                 worker_context.stopped().await;
@@ -1287,7 +1289,7 @@ mod tests {
                 let downstream = Arc::new(RejectingDecodeHost { stream: streamed });
                 let result = tokio::time::timeout(
                     Duration::from_secs(5),
-                    router.generate(input, downstream),
+                    on_gdl(&router, downstream).generate(input),
                 )
                 .await
                 .unwrap();
@@ -1342,9 +1344,9 @@ mod tests {
             let held = self.held.clone();
             let response = async_stream::stream! {
                 yield Annotated::from_data(LLMEngineOutput {
-                    disaggregated_params: Some(serde_json::json!({
+                    disaggregated_params: Some(Box::new(serde_json::json!({
                         "bootstrap_host": "127.0.0.1", "bootstrap_port": 1, "bootstrap_room": 7,
-                    })),
+                    }))),
                     ..Default::default()
                 });
                 tokio::select! {
@@ -1381,7 +1383,7 @@ mod tests {
             use std::sync::atomic::Ordering;
             if self
                 .failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_err()
             {
                 let token = LLMEngineOutput {
@@ -1410,28 +1412,6 @@ mod tests {
         }
     }
 
-    /// Remote prefill followed by decode, as the pipeline below `Migration`.
-    struct PrefillThenDecode {
-        router: Arc<PrefillRouter>,
-        decode: Arc<UnreachableDecodeHost>,
-    }
-
-    #[async_trait::async_trait]
-    impl
-        AsyncEngine<
-            SingleIn<PreprocessedRequest>,
-            ManyOut<Annotated<LLMEngineOutput>>,
-            anyhow::Error,
-        > for PrefillThenDecode
-    {
-        async fn generate(
-            &self,
-            request: SingleIn<PreprocessedRequest>,
-        ) -> Result<ManyOut<Annotated<LLMEngineOutput>>> {
-            self.router.generate(request, self.decode.clone()).await
-        }
-    }
-
     /// Run one request through `Migration` with up to one retry, returning its
     /// first decode tokens or the error the client would see.
     async fn migrate(
@@ -1445,19 +1425,21 @@ mod tests {
             "test-model".into(),
             Arc::new(crate::http::service::metrics::Metrics::new()),
         );
-        let next: dynamo_runtime::pipeline::ServerStreamingEngine<
+        // Migration over remote prefill followed by decode, as the frontend composes them.
+        let decode: dynamo_runtime::pipeline::ServerStreamingEngine<
             PreprocessedRequest,
             Annotated<LLMEngineOutput>,
-        > = Arc::new(PrefillThenDecode {
-            router: router.clone(),
-            decode: Arc::new(decode),
-        });
+        > = Arc::new(decode);
+        let pipeline = testing::engine(testing::native::<_, LLMEngineOutput, _>(
+            migration,
+            testing::native::<_, PreprocessedRequest, _>(router.clone(), testing::sink(decode)),
+        ));
         let request = dynamo_runtime::pipeline::Context::with_id_and_metadata(
             request(),
             id.to_string(),
             Default::default(),
         );
-        let mut response = migration.generate(request, next).await?;
+        let mut response = pipeline.generate(request).await?;
         let item = response.next().await.expect("decode must respond");
         if let Some(error) = item.err() {
             return Err(error.into());
@@ -1620,15 +1602,12 @@ mod tests {
                 crate::migration::is_migratable(error.as_ref()),
                 "decode failure must be migratable: {error:#}"
             );
-            let rebook = router
-                .generate(
-                    dynamo_runtime::pipeline::Context::with_id_and_metadata(
-                        request(),
-                        id,
-                        Default::default(),
-                    ),
-                    Arc::new(PrefillWorker(7)),
-                )
+            let rebook = on_gdl(&router, Arc::new(PrefillWorker(7)))
+                .generate(dynamo_runtime::pipeline::Context::with_id_and_metadata(
+                    request(),
+                    id,
+                    Default::default(),
+                ))
                 .await;
             match rebook {
                 Ok(_) => panic!("the final attempt's prefill booking must be retained"),

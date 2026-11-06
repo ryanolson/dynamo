@@ -276,7 +276,9 @@ async fn vllm_format_preserves_binding_terminal_status_and_wire_shape() {
 async fn unary_dispatch_joins_chunks_and_maps_stream_errors() {
     let chunk = |ids: Value| {
         Annotated::from_data(LLMEngineOutput {
-            engine_data: Some(serde_json::json!({"sglang_response": {"output_ids": ids}})),
+            engine_data: Some(Box::new(
+                serde_json::json!({"sglang_response": {"output_ids": ids}}),
+            )),
             ..Default::default()
         })
     };
@@ -437,9 +439,9 @@ async fn format_request_id_is_correlation_only() {
             let output = LLMEngineOutput {
                 token_ids: vec![7],
                 finish_reason: Some(dynamo_llm::protocols::common::FinishReason::Length),
-                engine_data: Some(serde_json::json!({"sglang_response": {
+                engine_data: Some(Box::new(serde_json::json!({"sglang_response": {
                     "output_ids": [7], "meta_info": {"id": "engine-private"}
-                }})),
+                }}))),
                 ..Default::default()
             };
             Ok(ResponseStream::new(
@@ -494,7 +496,9 @@ impl AsyncEngine<Input, Output, Error> for ConcurrentEchoEngine {
         let output = LLMEngineOutput {
             token_ids: token_ids.clone(),
             finish_reason: Some(dynamo_llm::protocols::common::FinishReason::Stop),
-            engine_data: Some(serde_json::json!({"sglang_response": {"output_ids": token_ids}})),
+            engine_data: Some(Box::new(
+                serde_json::json!({"sglang_response": {"output_ids": token_ids}}),
+            )),
             ..Default::default()
         };
         Ok(ResponseStream::new(
@@ -504,11 +508,10 @@ impl AsyncEngine<Input, Output, Error> for ConcurrentEchoEngine {
     }
 }
 
-/// Concurrent requests sharing a client id each get their own output through
-/// the frontend pipeline, which matches responses to callers by context id.
+/// Concurrent requests sharing a client id each get their own output, and the
+/// engine sees a distinct context id for each.
 #[tokio::test]
 async fn concurrent_requests_sharing_a_client_id_get_their_own_output() {
-    use dynamo_runtime::pipeline::{ServiceBackend, ServiceFrontend, Source};
     for (format, body, header_id) in [
         (
             sglang(),
@@ -525,19 +528,13 @@ async fn concurrent_requests_sharing_a_client_id_get_their_own_output() {
             barrier: tokio::sync::Barrier::new(2),
             seen: std::sync::Mutex::new(Vec::new()),
         });
-        let frontend = ServiceFrontend::<Input, Output>::new();
-        let pipeline = frontend
-            .link(ServiceBackend::from_engine(engine.clone()))
-            .unwrap()
-            .link_terminal(frontend)
-            .unwrap();
         let state = state();
         let mut card = dynamo_llm::model_card::ModelDeploymentCard::with_name_only("test-model");
         card.runtime_config
             .runtime_data
             .insert(format.capability().into(), Value::Bool(true));
         let ws = dynamo_llm::discovery::WorkerSet::new("test".into(), "test".into(), card)
-            .with_generate_engine(pipeline);
+            .with_generate_engine(engine.clone());
         assert!(state.manager().add_worker_set("test-model", "test", ws));
         let (_, router) = format_generate::router(state, None, format.clone());
         let tokens_key = if format.name() == "sglang" {
@@ -601,7 +598,7 @@ async fn streaming_preserves_json_bytes_and_event_order() {
         .map(|value| {
             Annotated::from_data(LLMEngineOutput {
                 token_ids: vec![1],
-                engine_data: Some(serde_json::json!({"sglang_response": value})),
+                engine_data: Some(Box::new(serde_json::json!({"sglang_response": value}))),
                 ..Default::default()
             })
         })

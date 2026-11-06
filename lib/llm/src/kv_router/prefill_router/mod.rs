@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::future::Future;
 use std::sync::atomic::AtomicU8;
 use std::sync::{Arc, OnceLock};
 
@@ -11,6 +12,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use dynamo_gdl_adapters::{Boxed, Carried};
 use dynamo_kv_router::{
     PrefillLoadEstimator, conditional_disagg::ConditionalDisaggPolicy,
     config::RouterConfigOverride, protocols::RoutingConstraints,
@@ -18,16 +20,18 @@ use dynamo_kv_router::{
 use dynamo_runtime::{
     error::{DynamoError, ErrorClass, ErrorType, match_error_chain},
     pipeline::{
-        AsyncEngineContextProvider, Context, ManyOut, Operator, ResponseStream, RouterMode,
-        ServerStreamingEngine, SingleIn, async_trait, propagate_first_response_guard,
+        AsyncEngineContextProvider, Context, ManyOut, ResponseStream, RouterMode, SingleIn,
+        propagate_first_response_guard,
     },
     protocols::{EndpointId, annotated::Annotated},
 };
+use futures::FutureExt;
 use futures::stream::{self, StreamExt};
 
 use crate::{
     discovery::{ModelManager, WorkerSetTarget, WorkerSetTargetId},
     kv_router::{RoutingHost, SelectionPolicySource, routing_host::PrefillDispatch},
+    operator::{GdlDownstream, GdlOperator, detached, native},
     protocols::common::{
         extensions::{SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId},
         llm_backend::{LLMEngineOutput, PreprocessedRequest},
@@ -97,6 +101,17 @@ pub enum PrefillError {
 
     #[error("No disaggregated params in prefill response: {0}")]
     NoDisaggregatedParams(String),
+}
+
+/// What the prefill router does with a request, by its activation state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrefillGate {
+    /// Through remote prefill, then decode.
+    Prefill,
+    /// A target is set but its binding is not built yet: fail closed.
+    Pending,
+    /// Straight to the stage below: no target, or a query-only request.
+    PassThrough,
 }
 
 enum PrefillOutcome {
@@ -212,6 +227,20 @@ fn strip_terminal_disaggregated_params(
 /// Annotation marker set when conditional disagg routes a request directly to
 /// a DECODE-mode worker to run prefill+decode locally.
 pub(crate) const BYPASS_REMOTE_PREFILL_ANNOTATION: &str = "x-bypass-remote-prefill";
+
+/// Remove a client-supplied bypass marker, and say whether there was one.
+///
+/// Conditional-disagg bypass is a router-owned decision. Drop any client-supplied marker before
+/// the policy runs so normal disagg requests cannot accidentally or maliciously skip remote
+/// prefill. A client that lists the marker in `nvext.annotations` is only asking to be told
+/// when the bypass happens (like `request_id`), so the caller remembers that.
+fn remove_bypass_marker(request: &mut PreprocessedRequest) -> bool {
+    let annotations_before = request.annotations.len();
+    request
+        .annotations
+        .retain(|annotation| annotation != BYPASS_REMOTE_PREFILL_ANNOTATION);
+    request.annotations.len() != annotations_before
+}
 
 /// PrefillRouter is a forward-only operator that sits between Migration and the decode router.
 /// It optionally calls a prefill worker before routing to decode, extracting disaggregated_params
@@ -375,43 +404,70 @@ impl Drop for PrefillRouter {
     }
 }
 
-#[async_trait]
-impl
-    Operator<
-        SingleIn<PreprocessedRequest>,
-        ManyOut<Annotated<LLMEngineOutput>>,
-        SingleIn<PreprocessedRequest>,
-        ManyOut<Annotated<LLMEngineOutput>>,
-    > for PrefillRouter
-{
-    async fn generate(
+/// The stage below the prefill router, as its route calls it: gdl's `cx` and `next`, which
+/// takes the preprocessed request boxed.
+type RouteDownstream<N> = GdlDownstream<N, Boxed<PreprocessedRequest>, PreprocessedRequest>;
+
+impl gdl::Operator for GdlOperator<PrefillRouter, PreprocessedRequest> {
+    type UpReq = Boxed<PreprocessedRequest>;
+    type UpItem = Annotated<LLMEngineOutput>;
+    type DownReq = Boxed<PreprocessedRequest>;
+    type DownItem = Annotated<LLMEngineOutput>;
+
+    fn generate<N>(
         &self,
-        request: SingleIn<PreprocessedRequest>,
-        next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
-    ) -> Result<ManyOut<Annotated<LLMEngineOutput>>> {
-        // Extract request data while preserving context
-        let (mut req, mut context) = request.into_parts();
-        let request_id = context.id().to_string();
-        let engine_ctx = context.context();
+        cx: gdl::Cx,
+        mut request: Boxed<PreprocessedRequest>,
+        next: N,
+    ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<LLMEngineOutput>>>> + Send
+    where
+        N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<LLMEngineOutput>>,
+    {
+        let router = Arc::clone(&self.op);
+        async move {
+            let query_only = request.get_annotation_value("query_instance_id").is_some();
+            // Only the remote-prefill path runs the route, in a task of its own: a request
+            // that passes through goes on here, in its box, so this future does not hold the
+            // route.
+            match router.gate(query_only) {
+                PrefillGate::PassThrough => {
+                    remove_bypass_marker(&mut request);
+                    GdlDownstream::<_, _, PreprocessedRequest>::new(cx, next)
+                        .forward_carried(request)
+                        .await
+                }
+                PrefillGate::Pending => Err(router.reject_while_activating(request.id())),
+                // Remote prefill stages KV on the prefill worker that only the decode leg
+                // releases, and gdl drops this future when a kill cancels the request's `cx`.
+                // So the route runs as a task that the drop detaches, and its decode leg runs
+                // under a cleanup `Cx` that the kill does not cancel (`send_cleanup`). The
+                // route's first send goes on in this request's box.
+                gate @ PrefillGate::Prefill => {
+                    let (request, spare) = request.take();
+                    let next = GdlDownstream::with_spare(cx, next, spare);
+                    detached(async move { router.route(request, next, gate).await }).await
+                }
+            }
+        }
+        .map(native)
+    }
+}
 
-        // Conditional-disagg bypass is a router-owned decision. Drop any
-        // client-supplied marker before the policy runs so normal disagg
-        // requests cannot accidentally or maliciously skip remote prefill.
-        // A client that lists the marker in `nvext.annotations` is only asking
-        // to be told when the bypass happens (like `request_id`), so remember
-        // that before the marker is removed.
-        let annotations_before = req.annotations.len();
-        req.annotations
-            .retain(|annotation| annotation != BYPASS_REMOTE_PREFILL_ANNOTATION);
-        let client_requested_bypass_marker = req.annotations.len() != annotations_before;
+impl PrefillRouter {
+    /// The error for a request that arrives while the prefill target is still activating.
+    fn reject_while_activating(&self, request_id: &str) -> anyhow::Error {
+        tracing::debug!(
+            request_id = %request_id,
+            model_name = %self.model_name,
+            namespace = %self.namespace,
+            "Prefill router target is still activating; rejecting request instead of \
+             forwarding it to decode without a prefill hop"
+        );
+        prefill_activation_pending_error(&self.model_name, &self.namespace)
+    }
 
-        // Save original max_tokens for decode
-        let original_max_tokens = req.stop_conditions.max_tokens;
-
-        // Query-only requests are owned by the decode RoutingHost. In particular,
-        // do not turn an advisory worker lookup into conditional local execution.
-        let query_only = req.get_annotation_value("query_instance_id").is_some();
-
+    /// What the router does with a request, read once from its activation state.
+    fn gate(&self, query_only: bool) -> PrefillGate {
         // Hot path: an active router with a published binding never takes the
         // target lock. Anything else is resolved from one locked snapshot.
         if self.lifecycle_state() != PrefillLifecycleState::Active {
@@ -428,30 +484,49 @@ impl
                 // disaggregated decode`). Fail closed with a migratable error instead:
                 // the retry layer re-dispatches and the client sees a retryable 503
                 // rather than a backend failure.
-                ActivationSnapshot::Pending if !query_only => {
-                    tracing::debug!(
-                        request_id = %request_id,
-                        model_name = %self.model_name,
-                        namespace = %self.namespace,
-                        "Prefill router target is still activating; rejecting request instead of \
-                         forwarding it to decode without a prefill hop"
-                    );
-                    return Err(prefill_activation_pending_error(
-                        &self.model_name,
-                        &self.namespace,
-                    ));
-                }
+                ActivationSnapshot::Pending if !query_only => return PrefillGate::Pending,
                 // Query-only previews never reach the engine. Otherwise no prefill
                 // target was ever set (aggregated-capable deployment) or every prefill
                 // worker left (target cleared): route directly to the backend.
                 ActivationSnapshot::Pending | ActivationSnapshot::Untargeted => {
-                    return next.generate(context.map(|_| req)).await;
+                    return PrefillGate::PassThrough;
                 }
             }
         }
-
         if query_only {
-            return next.generate(context.map(|_| req)).await;
+            PrefillGate::PassThrough
+        } else {
+            PrefillGate::Prefill
+        }
+    }
+
+    /// Route `request` through remote prefill, then send its decode leg on: the body of the
+    /// prefill router's native gdl operator for a request it routes. `gate` is the router's
+    /// decision for the request, as its caller read it, so the route acts on the decision the
+    /// caller acted on.
+    async fn route<N>(
+        &self,
+        request: SingleIn<PreprocessedRequest>,
+        next: RouteDownstream<N>,
+        gate: PrefillGate,
+    ) -> Result<gdl::Items<Annotated<LLMEngineOutput>>>
+    where
+        N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<LLMEngineOutput>>,
+    {
+        // Extract request data while preserving context
+        let (mut req, mut context) = request.into_parts();
+        let request_id = context.id().to_string();
+        let engine_ctx = context.context();
+
+        let client_requested_bypass_marker = remove_bypass_marker(&mut req);
+
+        // Save original max_tokens for decode
+        let original_max_tokens = req.stop_conditions.max_tokens;
+
+        match gate {
+            PrefillGate::Prefill => {}
+            PrefillGate::Pending => return Err(self.reject_while_activating(&request_id)),
+            PrefillGate::PassThrough => return next.forward(context.map(|_| req)).await,
         }
 
         let session_affinity = context
@@ -494,7 +569,11 @@ impl
                     let response_stream = decode_host
                         .dispatch_kv_plan(conditional_request, decision.plan)
                         .await?;
-                    return with_bypass_marker(response_stream, client_requested_bypass_marker);
+                    return with_bypass_marker(
+                        response_stream.into_many_out(),
+                        client_requested_bypass_marker,
+                    )
+                    .map(|stream| gdl::items(stream.map(Ok)));
                 }
                 Ok(None) => {
                     (req, context) = conditional_request.into_parts();
@@ -563,7 +642,7 @@ impl
                     ));
                 }
                 ActivationSnapshot::Untargeted => {
-                    return next.generate(context.map(|_| req)).await;
+                    return next.forward(context.map(|_| req)).await;
                 }
             },
         };
@@ -664,10 +743,7 @@ impl
         let outcome = match outcome {
             PrefillOutcome::Terminal { output } => {
                 let output = strip_terminal_disaggregated_params(*output);
-                return Ok(dynamo_runtime::pipeline::ResponseStream::new(
-                    Box::pin(stream::once(async move { output })),
-                    engine_ctx,
-                ));
+                return Ok(gdl::items(stream::once(async move { Ok(output) })));
             }
             outcome => outcome,
         };
@@ -719,14 +795,15 @@ impl
             (true, false) => PrefillNeed::BeforeLast,
             (true, true) => PrefillNeed::BeforeFirst,
         };
-        let decode = next.generate(context.map(|_| decode_req));
+        // The leg that releases the staged KV: a kill of the request must not end it.
+        let decode = next.send_cleanup(context.map(|_| decode_req));
         match prefill_completion {
             Some(completion) => {
                 completion
                     .forward_decode(decode, engine_ctx, output, prefill_engine_ctx)
                     .await
             }
-            None => decode.await,
+            None => decode.await.map(|stream| gdl::items(stream.map(Ok))),
         }
     }
 }
@@ -879,7 +956,10 @@ fn merge_decode_topology_constraints(
 mod tests {
     use super::*;
     use dynamo_kv_router::config::{KvRouterConfig, RouterConfigOverride};
-    use dynamo_runtime::{engine::AsyncEngine, pipeline::Error};
+    use dynamo_runtime::{
+        engine::AsyncEngine,
+        pipeline::{Error, ServerStreamingEngine, async_trait},
+    };
     use futures::StreamExt;
     use std::{
         collections::{HashMap, HashSet},
@@ -894,6 +974,15 @@ mod tests {
     };
 
     const MAX_ROOM: u64 = i64::MAX as u64;
+
+    /// `router` over `next` as the frontend's gdl pipeline runs it: a native operator over the
+    /// hop to `next`.
+    pub(super) fn on_gdl(
+        router: &Arc<PrefillRouter>,
+        next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
+    ) -> ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> {
+        crate::operator::testing::operator::<_, PreprocessedRequest, _, _, _>(router.clone(), next)
+    }
 
     #[derive(Default)]
     struct QueryOnlyDecodeHost {
@@ -911,10 +1000,10 @@ mod tests {
             assert!(request.get_annotation_value("query_instance_id").is_some());
             self.requests.fetch_add(1, Ordering::Relaxed);
             let output = Annotated::from_data(LLMEngineOutput {
-                routing_data: Some(RoutingData {
+                routing_data: Some(Box::new(RoutingData {
                     token_ids: Some(request.token_ids.as_ref().clone()),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             });
             Ok(ResponseStream::new(
@@ -1048,8 +1137,8 @@ mod tests {
         ));
 
         let host = Arc::new(CountingDecodeHost::default());
-        let error = router
-            .generate(SingleIn::new(inference_request()), host.clone())
+        let error = on_gdl(&router, host.clone())
+            .generate(SingleIn::new(inference_request()))
             .await
             .expect_err("a pending prefill target must not pass through to decode");
 
@@ -1077,8 +1166,8 @@ mod tests {
         ));
 
         let host = Arc::new(CountingDecodeHost::default());
-        router
-            .generate(SingleIn::new(inference_request()), host.clone())
+        on_gdl(&router, host.clone())
+            .generate(SingleIn::new(inference_request()))
             .await
             .expect("no target means plain passthrough");
         assert_eq!(host.requests.load(Ordering::Relaxed), 1);
@@ -1096,8 +1185,8 @@ mod tests {
         ));
 
         let host = Arc::new(CountingDecodeHost::default());
-        router
-            .generate(SingleIn::new(inference_request()), host.clone())
+        on_gdl(&router, host.clone())
+            .generate(SingleIn::new(inference_request()))
             .await
             .expect("a deactivated router passes through");
         assert_eq!(host.requests.load(Ordering::Relaxed), 1);
@@ -1111,8 +1200,8 @@ mod tests {
         mark_target_pending(&router);
 
         let host = Arc::new(QueryOnlyDecodeHost::default());
-        router
-            .generate(SingleIn::new(query_only_request()), host.clone())
+        on_gdl(&router, host.clone())
+            .generate(SingleIn::new(query_only_request()))
             .await
             .expect("query-only requests bypass the activation gate");
         assert_eq!(host.requests.load(Ordering::Relaxed), 1);
@@ -1140,7 +1229,7 @@ mod tests {
         let in_flight = tokio::spawn({
             let router = router.clone();
             let host = host.clone();
-            async move { router.generate(SingleIn::new(request), host).await }
+            async move { on_gdl(&router, host).generate(SingleIn::new(request)).await }
         });
         // With paused time this sleep completes only once every other task is
         // idle, i.e. once the request has passed the gate and parked on the barrier.
@@ -1193,9 +1282,9 @@ mod tests {
             let mut outputs = Vec::new();
             if after_handoff {
                 outputs.push(Annotated::from_data(LLMEngineOutput {
-                    disaggregated_params: Some(serde_json::json!({
+                    disaggregated_params: Some(Box::new(serde_json::json!({
                         "bootstrap_host": "prefill", "bootstrap_port": 1, "bootstrap_room": 7,
-                    })),
+                    }))),
                     ..Default::default()
                 }));
             }
@@ -1206,7 +1295,7 @@ mod tests {
             // Decode can enter its phase even though prefill is still observed.
             let _decode_permit = tracker.set_phase(RequestPhase::Decode).await;
             let error = task
-                .forward_decode(
+                .forward_decode_on_gdl(
                     std::future::pending(),
                     Context::new(()).context(),
                     PrefillNeed::None,
@@ -1323,8 +1412,8 @@ mod tests {
 
         // No prefill binding: the old fallback would continue to downstream instead
         // of returning the preview's client error.
-        let error = router
-            .generate(SingleIn::new(request), downstream.clone())
+        let error = on_gdl(&router, downstream.clone())
+            .generate(SingleIn::new(request))
             .await
             .unwrap_err();
         assert!(match_error_chain(
@@ -1344,8 +1433,8 @@ mod tests {
         let next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
             decode_host.clone();
 
-        let mut response = router
-            .generate(SingleIn::new(query_only_request()), next)
+        let mut response = on_gdl(&router, next)
+            .generate(SingleIn::new(query_only_request()))
             .await
             .expect("query-only request should bypass conditional planning");
         let output = response
@@ -1498,8 +1587,8 @@ mod tests {
             } else {
                 Vec::new()
             };
-            let mut stream = router
-                .generate(SingleIn::new(request), downstream.clone())
+            let mut stream = on_gdl(&router, downstream.clone())
+                .generate(SingleIn::new(request))
                 .await
                 .expect("conditional disagg should bypass to the decode host");
             let first = stream.next().await.expect("first frame");
@@ -1561,10 +1650,10 @@ mod tests {
         let output = Annotated::from_data(LLMEngineOutput {
             token_ids: vec![2],
             finish_reason: Some(FinishReason::EoS),
-            disaggregated_params: Some(serde_json::json!({
+            disaggregated_params: Some(Box::new(serde_json::json!({
                 "ctx_request_id": null,
                 "request_type": "context_only",
-            })),
+            }))),
             ..Default::default()
         });
 
@@ -1762,5 +1851,780 @@ mod tests {
             "bootstrap_room": 1,
         });
         assert!(extract_bootstrap_info(&params).is_none());
+    }
+
+    struct KillOnPrefillHandoff {
+        caller: Arc<dyn dynamo_runtime::pipeline::AsyncEngineContext>,
+    }
+
+    #[async_trait]
+    impl
+        dynamo_runtime::pipeline::StreamingDispatch<PreprocessedRequest, Annotated<LLMEngineOutput>>
+        for KillOnPrefillHandoff
+    {
+        async fn generate(
+            &self,
+            request: SingleIn<dynamo_runtime::pipeline::AddressedRequest<PreprocessedRequest>>,
+        ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+            let caller = self.caller.clone();
+            let response = stream::once(async move {
+                caller.kill();
+                Annotated::from_data(LLMEngineOutput {
+                    token_ids: vec![11],
+                    finish_reason: Some(FinishReason::Length),
+                    disaggregated_params: Some(Box::new(serde_json::json!({
+                        "request_type": "context_only",
+                        "ctx_request_id": "staged-prefill",
+                    }))),
+                    ..Default::default()
+                })
+            });
+            Ok(ResponseStream::new(Box::pin(response), request.context()))
+        }
+
+        async fn generate_bidirectional(
+            &self,
+            _: dynamo_runtime::component::Instance,
+            _: String,
+            _: dynamo_runtime::pipeline::ManyIn<PreprocessedRequest>,
+        ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+            unreachable!("prefill dispatch takes a single request")
+        }
+    }
+
+    #[derive(Default)]
+    struct CleanupDecode {
+        requests: Mutex<Vec<(bool, bool)>>,
+    }
+
+    #[async_trait]
+    impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>, Error>
+        for CleanupDecode
+    {
+        async fn generate(
+            &self,
+            request: SingleIn<PreprocessedRequest>,
+        ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+            // A dispatch that waits, as one to a worker does: a kill that cancels the caller
+            // can end the call here, before the leg reaches the worker.
+            tokio::task::yield_now().await;
+            self.requests
+                .lock()
+                .push((request.staged_kv_cleanup, request.context().is_killed()));
+            Ok(ResponseStream::new(
+                Box::pin(stream::empty()),
+                request.context(),
+            ))
+        }
+    }
+
+    /// Routing whose prefill worker kills `caller` as it hands off, and whose decode engine
+    /// records each call it reaches as `(staged_kv_cleanup, killed)`.
+    async fn prefill_handoff_routing(
+        distributed: &dynamo_runtime::DistributedRuntime,
+        namespace: &str,
+        caller: Arc<dyn dynamo_runtime::pipeline::AsyncEngineContext>,
+    ) -> (
+        crate::entrypoint::input::PreprocessedRouting,
+        Arc<CleanupDecode>,
+    ) {
+        prefill_routing(
+            distributed,
+            namespace,
+            Arc::new(KillOnPrefillHandoff { caller }) as crate::kv_router::LlmDispatch,
+        )
+        .await
+    }
+
+    /// Routing whose prefill worker is `prefill`, and whose decode engine records each call it
+    /// reaches as `(staged_kv_cleanup, killed)`.
+    async fn prefill_routing(
+        distributed: &dynamo_runtime::DistributedRuntime,
+        namespace: &str,
+        prefill: crate::kv_router::LlmDispatch,
+    ) -> (
+        crate::entrypoint::input::PreprocessedRouting,
+        Arc<CleanupDecode>,
+    ) {
+        use crate::kv_router::{EncoderRouter, RouterLoadSource, RoutingLoadContext};
+
+        let endpoint = distributed
+            .namespace(namespace)
+            .unwrap()
+            .component("workers")
+            .unwrap()
+            .endpoint("prefill");
+        let client = endpoint.client().await.unwrap();
+        endpoint.register_endpoint_instance().await.unwrap();
+        client.wait_for_instances().await.unwrap();
+        let load_context = RoutingLoadContext::start(
+            client.clone(),
+            RouterLoadSource::Prefill,
+            crate::discovery::LoadThresholdHandle::new(Default::default()),
+            &distributed.child_token(),
+            None,
+        )
+        .await
+        .unwrap();
+        let host = Arc::new(
+            RoutingHost::builder(client, RouterMode::RoundRobin)
+                .load_context(load_context)
+                .dispatch(prefill)
+                .build()
+                .await
+                .unwrap(),
+        );
+        let router =
+            PrefillRouter::disabled(Arc::new(ModelManager::new()), RouterMode::RoundRobin, None);
+        router.binding.store(Some(Arc::new(PrefillBinding {
+            target_id: WorkerSetTargetId::Legacy(endpoint.id()),
+            endpoint_id: endpoint.id(),
+            router: host,
+            prefill_router_mode: RouterMode::RoundRobin,
+        })));
+        router.lifecycle.store(
+            PrefillLifecycleState::Active as u8,
+            std::sync::atomic::Ordering::Release,
+        );
+        let decode = Arc::new(CleanupDecode::default());
+        let routing = crate::entrypoint::input::PreprocessedRouting::new(
+            decode.clone(),
+            router,
+            EncoderRouter::disabled(),
+        );
+        (routing, decode)
+    }
+
+    /// Drain whatever the pipeline returns, within a bound.
+    async fn drain<T: Send + 'static>(
+        response: impl std::future::Future<Output = Result<ManyOut<T>, Error>>,
+    ) {
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
+            .await
+            .expect("the call ends");
+        if let Ok(mut response) = response {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while response.next().await.is_some() {}
+            })
+            .await
+            .expect("the stream ends");
+        }
+    }
+
+    /// The route acts on the gate its caller read, not on a later read of the router's state:
+    /// the native operator chooses whether to run the route as a task from that gate, so a
+    /// router that turns active in between must not send the request to remote prefill from a
+    /// route that runs inline.
+    #[tokio::test]
+    async fn the_route_acts_on_the_gate_its_caller_read() {
+        use dynamo_runtime::{DistributedRuntime, Runtime, distributed::DistributedConfig};
+
+        let runtime = Runtime::from_current().unwrap();
+        let distributed =
+            DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+                .await
+                .unwrap();
+        let request = Context::new(inference_request());
+        let caller = request.context();
+        // An active router whose prefill worker kills the caller if it is ever reached.
+        let (routing, decode) =
+            prefill_handoff_routing(&distributed, "gate-read-once", caller.clone()).await;
+        let router = routing.prefill_router();
+        assert_eq!(router.gate(false), PrefillGate::Prefill);
+
+        let next: Arc<
+            dyn AsyncEngine<
+                    SingleIn<PreprocessedRequest>,
+                    ManyOut<Annotated<LLMEngineOutput>>,
+                    Error,
+                >,
+        > = decode.clone();
+        // The downstream the native operator gives its route: under a `Cx` that follows the
+        // caller, as the frontend's routed pipelines root it.
+        let next = crate::operator::testing::downstream(
+            dynamo_gdl_adapters::CxBridge::cx(caller.as_ref()),
+            next,
+        );
+        let response = router
+            .route(request, next, PrefillGate::PassThrough)
+            .await
+            .unwrap();
+        drop(response);
+        assert!(!caller.is_killed(), "the route went to remote prefill");
+        assert_eq!(decode_calls(&decode, 1).await, [(false, false)]);
+        runtime.shutdown();
+    }
+
+    /// The decode calls `decode` has seen, once it has seen `count` or 5 seconds have passed.
+    /// On gdl a kill cancels the request's `Cx`, so the call can return before the route's
+    /// task has sent the decode leg.
+    async fn decode_calls(decode: &CleanupDecode, count: usize) -> Vec<(bool, bool)> {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while decode.requests.lock().len() < count {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        decode.requests.lock().clone()
+    }
+
+    /// A caller killed at the prefill handoff, on pipeline C composed on gdl: the kill cancels
+    /// the pipeline's `Cx`, so gdl drops the in-flight future of every stage. The prefill
+    /// router's route must still send the decode leg that releases the staged KV, with the
+    /// caller's killed context and its cleanup obligation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pipeline_c_preserves_decode_cleanup_after_kill_at_prefill_handoff() {
+        use crate::http::service::metrics::Metrics;
+        use crate::model_card::ModelDeploymentCard;
+        use dynamo_runtime::{DistributedRuntime, Runtime, distributed::DistributedConfig};
+
+        let runtime = Runtime::from_current().unwrap();
+        let distributed =
+            DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+                .await
+                .unwrap();
+        let card =
+            ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
+                .unwrap();
+        let request = Context::new(inference_request());
+        let caller = request.context();
+        let (routing, decode) =
+            prefill_handoff_routing(&distributed, "cleanup-c-native", caller.clone()).await;
+        let pipeline = routing
+            .build_preprocessed_pipeline(&card, 3, None, Arc::new(Metrics::new()))
+            .unwrap();
+        drain(pipeline.generate(request)).await;
+        assert!(caller.is_killed(), "the prefill handoff kills the caller");
+        assert_eq!(decode_calls(&decode, 1).await, [(true, true)]);
+        runtime.shutdown();
+    }
+
+    /// A caller killed while PrefillRouter hands off from prefill must still get the decode
+    /// leg that releases the staged KV, through the routed chat pipeline (B) and the
+    /// preprocessed pipeline (C).
+    #[tokio::test]
+    async fn routed_pipelines_send_decode_cleanup_after_a_kill_at_prefill_handoff() {
+        use crate::http::service::metrics::Metrics;
+        use crate::model_card::ModelDeploymentCard;
+        use crate::preprocessor::{OpenAIPreprocessor, prompt::prompt_formatter_from_mdc};
+        use crate::protocols::openai::chat_completions::{
+            NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse,
+        };
+        use dynamo_runtime::{DistributedRuntime, Runtime, distributed::DistributedConfig};
+
+        let runtime = Runtime::from_current().unwrap();
+        let distributed =
+            DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+                .await
+                .unwrap();
+        let card =
+            ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
+                .unwrap();
+        let tokenizer = card.tokenizer().unwrap();
+        let mut seen = Vec::new();
+
+        let request = Context::new(inference_request());
+        let caller = request.context();
+        let (routing, decode) =
+            prefill_handoff_routing(&distributed, "cleanup-c", caller.clone()).await;
+        let pipeline = routing
+            .build_preprocessed_pipeline(&card, 0, None, Arc::new(Metrics::new()))
+            .unwrap();
+        drain(pipeline.generate(request)).await;
+        assert!(caller.is_killed(), "the prefill handoff kills the caller");
+        seen.push(("c", decode_calls(&decode, 1).await));
+
+        let chat: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "TinyLlama_v1.1",
+            "messages": [{"role": "user", "content": "Write one sentence about a fox."}],
+            "max_tokens": 8,
+        }))
+        .unwrap();
+        let request = Context::new(chat);
+        let caller = request.context();
+        let (routing, decode) =
+            prefill_handoff_routing(&distributed, "cleanup-b", caller.clone()).await;
+        let dynamo_renderer::PromptFormatter::OAI(formatter) =
+            prompt_formatter_from_mdc(&card).unwrap();
+        let preprocessor =
+            OpenAIPreprocessor::new_with_parts(card.clone(), formatter, tokenizer.clone()).unwrap();
+        let pipeline = routing
+            .build_pipeline::<NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse>(
+                &card,
+                preprocessor,
+                tokenizer.clone(),
+                0,
+                None,
+                Arc::new(Metrics::new()),
+            )
+            .unwrap();
+        drain(pipeline.generate(request)).await;
+        assert!(caller.is_killed(), "the prefill handoff kills the caller");
+        seen.push(("b", decode_calls(&decode, 1).await));
+        runtime.shutdown();
+
+        let cleanup = vec![(true, true)];
+        assert_eq!(seen, [("c", cleanup.clone()), ("b", cleanup)]);
+    }
+
+    /// A prefill worker that stages KV and hands off, then fails: its stream carries an error
+    /// item after the handoff item, as a prefill worker that dies after staging does.
+    struct DiesAfterStaging;
+
+    #[async_trait]
+    impl
+        dynamo_runtime::pipeline::StreamingDispatch<PreprocessedRequest, Annotated<LLMEngineOutput>>
+        for DiesAfterStaging
+    {
+        async fn generate(
+            &self,
+            request: SingleIn<dynamo_runtime::pipeline::AddressedRequest<PreprocessedRequest>>,
+        ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+            let handoff = Annotated::from_data(LLMEngineOutput {
+                token_ids: vec![11],
+                finish_reason: Some(FinishReason::Length),
+                disaggregated_params: Some(Box::new(serde_json::json!({
+                    "request_type": "context_only",
+                    "ctx_request_id": "staged-prefill",
+                }))),
+                ..Default::default()
+            });
+            use dynamo_runtime::protocols::maybe_error::MaybeError;
+            let died = Annotated::from_err(
+                DynamoError::builder()
+                    .error_type(ErrorType::Disconnected)
+                    .message("prefill worker went away")
+                    .build(),
+            );
+            Ok(ResponseStream::new(
+                Box::pin(stream::iter([handoff, died])),
+                request.context(),
+            ))
+        }
+
+        async fn generate_bidirectional(
+            &self,
+            _: dynamo_runtime::component::Instance,
+            _: String,
+            _: dynamo_runtime::pipeline::ManyIn<PreprocessedRequest>,
+        ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+            unreachable!("prefill dispatch takes a single request")
+        }
+    }
+
+    /// What a call of pipeline C gives: an eager error's type, or the item and error count.
+    async fn outcome(
+        response: impl std::future::Future<Output = Result<ManyOut<Annotated<LLMEngineOutput>>, Error>>,
+    ) -> String {
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
+            .await
+            .expect("the call ends");
+        match response {
+            Ok(stream) => {
+                let items: Vec<_> = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    stream.collect::<Vec<_>>(),
+                )
+                .await
+                .expect("the stream ends");
+                format!(
+                    "ok, {} items, {} errors",
+                    items.len(),
+                    items.iter().filter(|item| item.is_error()).count()
+                )
+            }
+            Err(error) => {
+                let found = [ErrorType::WorkerUnavailable, ErrorType::Cancelled]
+                    .into_iter()
+                    .find(|kind| match_error_chain(error.as_ref(), &[*kind], &[]));
+                format!(
+                    "error {found:?}, migratable {}",
+                    crate::migration::is_migratable(error.as_ref())
+                )
+            }
+        }
+    }
+
+    /// A prefill worker that dies after its handoff item: the request fails with the prefill
+    /// error, which Migration may retry (here it has no attempts left), and no decode leg is
+    /// sent. Nothing is left to release:
+    /// the staged blocks were on the worker that died. (The decode leg that releases staged KV
+    /// is for a request killed after a live prefill; see the kill tests above.)
+    #[tokio::test]
+    async fn a_prefill_worker_that_dies_after_its_handoff_fails_the_request() {
+        use crate::http::service::metrics::Metrics;
+        use crate::model_card::ModelDeploymentCard;
+        use dynamo_runtime::{DistributedRuntime, Runtime, distributed::DistributedConfig};
+
+        let runtime = Runtime::from_current().unwrap();
+        let distributed =
+            DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+                .await
+                .unwrap();
+        let card =
+            ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
+                .unwrap();
+        let (routing, decode) = prefill_routing(
+            &distributed,
+            "dies-after-staging",
+            Arc::new(DiesAfterStaging) as crate::kv_router::LlmDispatch,
+        )
+        .await;
+        let pipeline = routing
+            .build_preprocessed_pipeline(&card, 0, None, Arc::new(Metrics::new()))
+            .unwrap();
+        let outcome = outcome(pipeline.generate(Context::new(inference_request()))).await;
+        // The route has ended with its error, in its own task too: a decode leg it sent is
+        // recorded by now.
+        let decode_calls = decode.requests.lock().clone();
+        runtime.shutdown();
+        assert_eq!(
+            (outcome.as_str(), decode_calls),
+            ("error None, migratable true", vec![])
+        );
+    }
+
+    /// A prefill target that is still activating: the request fails closed with a retryable
+    /// `WorkerUnavailable`, Migration retries it, and decode never sees it.
+    #[tokio::test]
+    async fn a_pending_prefill_target_fails_closed() {
+        use crate::entrypoint::input::PreprocessedRouting;
+        use crate::http::service::metrics::Metrics;
+        use crate::kv_router::EncoderRouter;
+        use crate::model_card::ModelDeploymentCard;
+
+        let card =
+            ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
+                .unwrap();
+        let router = fresh_decode_router();
+        mark_target_pending(&router);
+        let decode = Arc::new(CountingDecodeHost::default());
+        let pipeline = PreprocessedRouting::new(decode.clone(), router, EncoderRouter::disabled())
+            .build_preprocessed_pipeline(&card, 1, None, Arc::new(Metrics::new()))
+            .unwrap();
+        let outcome = outcome(pipeline.generate(Context::new(inference_request()))).await;
+        assert_eq!(
+            (outcome.as_str(), decode.requests.load(Ordering::Relaxed)),
+            ("error Some(WorkerUnavailable), migratable true", 0)
+        );
+    }
+
+    /// A prefill worker that dies after a bootstrap handoff: decode starts at the handoff,
+    /// before prefill finishes, so its leg is sent, and the late prefill failure then reaches
+    /// the caller through the response stream.
+    #[tokio::test]
+    async fn a_prefill_worker_that_dies_after_a_bootstrap_handoff_fails_the_stream() {
+        use crate::http::service::metrics::Metrics;
+        use crate::model_card::ModelDeploymentCard;
+        use dynamo_runtime::protocols::maybe_error::MaybeError;
+        use dynamo_runtime::{DistributedRuntime, Runtime, distributed::DistributedConfig};
+        use std::time::Duration;
+
+        struct DiesAfterBootstrap(Arc<tokio::sync::Notify>);
+
+        #[async_trait]
+        impl
+            dynamo_runtime::pipeline::StreamingDispatch<
+                PreprocessedRequest,
+                Annotated<LLMEngineOutput>,
+            > for DiesAfterBootstrap
+        {
+            async fn generate(
+                &self,
+                request: SingleIn<dynamo_runtime::pipeline::AddressedRequest<PreprocessedRequest>>,
+            ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+                let handoff = Annotated::from_data(LLMEngineOutput {
+                    disaggregated_params: Some(Box::new(serde_json::json!({
+                        "bootstrap_host": "prefill",
+                        "bootstrap_port": 1,
+                        "bootstrap_room": 7,
+                    }))),
+                    ..Default::default()
+                });
+                let release = self.0.clone();
+                let failure = stream::once(async move {
+                    release.notified().await;
+                    Annotated::from_err(
+                        DynamoError::builder()
+                            .error_type(ErrorType::Disconnected)
+                            .message("prefill worker went away after bootstrap")
+                            .build(),
+                    )
+                });
+                Ok(ResponseStream::new(
+                    Box::pin(stream::iter([handoff]).chain(failure)),
+                    request.context(),
+                ))
+            }
+
+            async fn generate_bidirectional(
+                &self,
+                _: dynamo_runtime::component::Instance,
+                _: String,
+                _: dynamo_runtime::pipeline::ManyIn<PreprocessedRequest>,
+            ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+                unreachable!("prefill dispatch takes a single request")
+            }
+        }
+
+        let runtime = Runtime::from_current().unwrap();
+        let distributed =
+            DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+                .await
+                .unwrap();
+        let card =
+            ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
+                .unwrap();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (routing, decode) = prefill_routing(
+            &distributed,
+            "review-bootstrap-failure",
+            Arc::new(DiesAfterBootstrap(release.clone())),
+        )
+        .await;
+        let pipeline = routing
+            .build_preprocessed_pipeline(&card, 0, None, Arc::new(Metrics::new()))
+            .unwrap();
+        let reader = tokio::spawn(async move {
+            outcome(pipeline.generate(Context::new(inference_request()))).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while decode.requests.lock().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bootstrap hands the request on before prefill finishes");
+        release.notify_one();
+        let result = reader.await.unwrap();
+        let decode_calls = decode.requests.lock().len();
+        runtime.shutdown();
+        assert_eq!(
+            (decode_calls, result.as_str()),
+            (1, "ok, 1 items, 1 errors")
+        );
+    }
+
+    /// A kill while the prefill leg is still dispatching, and then a handoff: the prefill leg
+    /// was not killed, so it hands off, and the decode leg that releases the staged KV is sent
+    /// with the killed context and its cleanup obligation. The kill cancels the pipeline, so the
+    /// call ends as `Cancelled` before prefill finishes.
+    #[tokio::test]
+    async fn a_kill_before_the_prefill_handoff_still_sends_the_decode_cleanup() {
+        use crate::http::service::metrics::Metrics;
+        use crate::model_card::ModelDeploymentCard;
+        use dynamo_runtime::pipeline::AsyncEngineContext;
+        use dynamo_runtime::{DistributedRuntime, Runtime, distributed::DistributedConfig};
+        use std::time::Duration;
+
+        struct CompletesAfterRelease {
+            entered: tokio::sync::mpsc::UnboundedSender<Arc<dyn AsyncEngineContext>>,
+            release: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait]
+        impl
+            dynamo_runtime::pipeline::StreamingDispatch<
+                PreprocessedRequest,
+                Annotated<LLMEngineOutput>,
+            > for CompletesAfterRelease
+        {
+            async fn generate(
+                &self,
+                request: SingleIn<dynamo_runtime::pipeline::AddressedRequest<PreprocessedRequest>>,
+            ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+                self.entered.send(request.context()).unwrap();
+                self.release.notified().await;
+                let handoff = Annotated::from_data(LLMEngineOutput {
+                    token_ids: vec![11],
+                    finish_reason: Some(FinishReason::Length),
+                    disaggregated_params: Some(Box::new(serde_json::json!({
+                        "request_type": "context_only",
+                        "ctx_request_id": "prefill-after-kill",
+                    }))),
+                    ..Default::default()
+                });
+                Ok(ResponseStream::new(
+                    Box::pin(stream::iter([handoff])),
+                    request.context(),
+                ))
+            }
+
+            async fn generate_bidirectional(
+                &self,
+                _: dynamo_runtime::component::Instance,
+                _: String,
+                _: dynamo_runtime::pipeline::ManyIn<PreprocessedRequest>,
+            ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+                unreachable!("prefill dispatch takes a single request")
+            }
+        }
+
+        let runtime = Runtime::from_current().unwrap();
+        let distributed =
+            DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+                .await
+                .unwrap();
+        let card =
+            ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
+                .unwrap();
+        let (entered, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (routing, decode) = prefill_routing(
+            &distributed,
+            "review-pre-handoff-success",
+            Arc::new(CompletesAfterRelease {
+                entered,
+                release: release.clone(),
+            }),
+        )
+        .await;
+        let pipeline = routing
+            .build_preprocessed_pipeline(&card, 0, None, Arc::new(Metrics::new()))
+            .unwrap();
+        let request = Context::new(inference_request());
+        let caller = request.context();
+        let call = tokio::spawn(async move { outcome(pipeline.generate(request)).await });
+        let prefill = tokio::time::timeout(Duration::from_secs(5), arrivals.recv())
+            .await
+            .expect("prefill enters dispatch before the kill")
+            .unwrap();
+        caller.kill();
+        assert!(!prefill.is_killed());
+        let result = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .expect("the edge cancels before prefill finishes")
+            .unwrap();
+        assert_eq!(result, "error Some(Cancelled), migratable false");
+        release.notify_one();
+        let decode_calls = decode_calls(&decode, 1).await;
+        runtime.shutdown();
+        assert_eq!(decode_calls, [(true, true)]);
+    }
+
+    /// A client disconnect while the prefill leg is still dispatching, before any handoff. The
+    /// prefill leg runs under a context of its own that the kill does not reach, so its dispatch
+    /// goes on. The kill cancels the pipeline, the call ends at once as `Cancelled`, and the
+    /// route goes on as a detached task. Decode is never reached: the prefill gave no handoff.
+    #[tokio::test]
+    async fn a_kill_before_the_prefill_handoff_leaves_the_prefill_leg_running() {
+        use crate::http::service::metrics::Metrics;
+        use crate::model_card::ModelDeploymentCard;
+        use dynamo_runtime::pipeline::AsyncEngineContext;
+        use dynamo_runtime::{DistributedRuntime, Runtime, distributed::DistributedConfig};
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        struct Dropped(Arc<AtomicBool>);
+
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        struct WaitingPrefill {
+            entered: tokio::sync::mpsc::UnboundedSender<Arc<dyn AsyncEngineContext>>,
+            release: Arc<tokio::sync::Notify>,
+            dropped: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl
+            dynamo_runtime::pipeline::StreamingDispatch<
+                PreprocessedRequest,
+                Annotated<LLMEngineOutput>,
+            > for WaitingPrefill
+        {
+            async fn generate(
+                &self,
+                request: SingleIn<dynamo_runtime::pipeline::AddressedRequest<PreprocessedRequest>>,
+            ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+                let _guard = Dropped(self.dropped.clone());
+                self.entered.send(request.context()).unwrap();
+                self.release.notified().await;
+                Ok(ResponseStream::new(
+                    Box::pin(stream::empty()),
+                    request.context(),
+                ))
+            }
+
+            async fn generate_bidirectional(
+                &self,
+                _: dynamo_runtime::component::Instance,
+                _: String,
+                _: dynamo_runtime::pipeline::ManyIn<PreprocessedRequest>,
+            ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+                unreachable!("prefill dispatch takes a single request")
+            }
+        }
+
+        let runtime = Runtime::from_current().unwrap();
+        let distributed =
+            DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+                .await
+                .unwrap();
+        let card =
+            ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
+                .unwrap();
+        let (entered, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (routing, decode) = prefill_routing(
+            &distributed,
+            "kill-before-handoff",
+            Arc::new(WaitingPrefill {
+                entered,
+                release: release.clone(),
+                dropped: dropped.clone(),
+            }),
+        )
+        .await;
+        let pipeline = routing
+            .build_preprocessed_pipeline(&card, 0, None, Arc::new(Metrics::new()))
+            .unwrap();
+        let request = Context::new(inference_request());
+        let caller = request.context();
+        let mut call = tokio::spawn(async move { outcome(pipeline.generate(request)).await });
+        let prefill = tokio::time::timeout(Duration::from_secs(5), arrivals.recv())
+            .await
+            .expect("prefill enters dispatch")
+            .unwrap();
+        caller.kill();
+        let at_once = tokio::time::timeout(Duration::from_millis(200), &mut call)
+            .await
+            .ok()
+            .map(Result::unwrap);
+        let prefill_live = !prefill.is_killed() && !dropped.load(Ordering::Acquire);
+        release.notify_one();
+        let after_release = match at_once {
+            Some(_) => None,
+            None => Some(
+                tokio::time::timeout(Duration::from_secs(5), call)
+                    .await
+                    .expect("the call ends once prefill returns")
+                    .unwrap(),
+            ),
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the released dispatch ends");
+        let decode_calls = decode.requests.lock().len();
+        runtime.shutdown();
+        // The call ends at the kill; the prefill leg runs on, unkilled, and decode is never
+        // reached.
+        assert_eq!(
+            (prefill_live, at_once, after_release, decode_calls),
+            (
+                true,
+                Some("error Some(Cancelled), migratable false".to_string()),
+                None,
+                0
+            )
+        );
     }
 }

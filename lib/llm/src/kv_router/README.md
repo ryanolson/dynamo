@@ -203,6 +203,16 @@ newer booking that reused the same request id and worker.
   that the staged blocks will sit until they expire.
 - A request that took the conditional bypass reached decode without staged KV, so it cancels
   normally.
+- A request killed while its worker's stream ends is aborted, not completed: a killed stream
+  ends cleanly too, so the routing host checks the kill once at the stream's end. The router's
+  plugins see the request as aborted either way.
+- An encode hop that has received the encode worker's transfer handle passes the request on
+  after a disconnect, so the stage below, which owns the transfer and its buffer, receives it.
+- The frontend's routed pipelines are gdl local pipelines: a disconnect cancels the pipeline,
+  and gdl drops every call still in flight. So the encoder and prefill routers, when a request may
+  carry such an obligation, run their work as a task that the drop does not end, and send the
+  leg that carries it under a `Cx` of its own (`CxBridge::cx_for_cleanup`). The prefill router
+  decides whether to do so from the same gate read that the route then acts on.
 
 ## Prefill activation
 

@@ -228,6 +228,21 @@ impl MigrationState {
         lifecycle.abort(error.map(owned_abort_error));
     }
 
+    /// Give a parked classifier lifecycle `error` as the cause to abort with if it is dropped
+    /// unclaimed, and leave it parked: a leg still in flight, such as a detached decode cleanup,
+    /// may take it and finish it. No-op when nothing is parked.
+    pub(crate) fn abort_request_lifecycle_on_drop(&self, error: &AbortCause) {
+        let Some(inner) = self.inner.get() else {
+            return;
+        };
+        let mut inner = inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(lifecycle) = inner.request_lifecycle.as_mut() {
+            lifecycle.abort_on_drop(owned_abort_error(error));
+        }
+    }
+
     /// Park the latest attempt's remote prefill booking. Its prefill can
     /// outlive a failed decode to serve an in-flight KV transfer, so only a
     /// committed retry, which re-books the same request ID, releases it early.
@@ -695,7 +710,9 @@ where
                     "packed token_ids byte length is not a multiple of 4",
                 ));
             }
-            Ok(v.chunks_exact(4)
+            Ok(v.as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| TokenIdType::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect())
         }

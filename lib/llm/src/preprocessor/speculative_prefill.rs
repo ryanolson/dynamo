@@ -135,6 +135,16 @@ impl OAIChatLikeRequest for SpeculativePrefillRequest {
     }
 }
 
+/// Whether `request` asks for a speculative next-turn prefill.
+pub(super) fn enabled(request: &NvCreateChatCompletionRequest) -> bool {
+    request
+        .nvext
+        .as_ref()
+        .and_then(|ext| ext.agent_hints.as_ref())
+        .and_then(|hints| hints.speculative_prefill)
+        .unwrap_or(false)
+}
+
 /// Optionally wraps a chat completion response stream to enable speculative
 /// next-turn prefill. When `nvext.speculative_prefill` is set, the returned
 /// stream accumulates the assistant response text and, on completion, spawns
@@ -157,14 +167,7 @@ pub(super) fn maybe_wrap_stream(
     tokenizer: &Arc<dyn Tokenizer>,
     tasks: &PrefillTasks,
 ) -> Pin<Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>> {
-    let enabled = request
-        .nvext
-        .as_ref()
-        .and_then(|ext| ext.agent_hints.as_ref())
-        .and_then(|hints| hints.speculative_prefill)
-        .unwrap_or(false);
-
-    if !enabled {
+    if !enabled(request) {
         return stream;
     }
 

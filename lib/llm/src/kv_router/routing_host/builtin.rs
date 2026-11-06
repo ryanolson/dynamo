@@ -283,7 +283,7 @@ impl RoutingHost {
         mut request: SingleIn<PreprocessedRequest>,
         phase: RequestPhase,
         prepare: F,
-    ) -> Result<(M, ManyOut<Annotated<LLMEngineOutput>>), Error>
+    ) -> Result<(M, super::RouteResponse), Error>
     where
         F: FnOnce(&mut PreprocessedRequest, AffinityTarget) -> Result<M, Error>,
     {

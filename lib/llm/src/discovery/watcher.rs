@@ -14,17 +14,13 @@ use dynamo_kv_router::PrefillLoadEstimator;
 use dynamo_runtime::{
     DistributedRuntime,
     discovery::{DiscoveryInstance, DiscoveryQuery, DiscoveryStream, ModelCardInstanceId},
-    pipeline::{
-        ManyOut, Operator, RouterMode, SegmentSource, ServiceBackend, SingleIn, Source,
-        network::egress::push_router::PushRouter,
-    },
+    pipeline::{RouterMode, network::egress::push_router::PushRouter},
     protocols::{EndpointId, annotated::Annotated},
 };
 
 use dynamo_renderer::PromptFormatter;
 
 use crate::{
-    backend::Backend,
     discovery::{LoadThresholdHandle, WORKER_TYPE_DECODE, WorkerSet},
     entrypoint::{self, ChatEngineFactoryCallback, RouterConfig},
     http::service::metrics::Metrics,
@@ -1020,16 +1016,9 @@ impl ModelWatcher {
             worker_set.set_load_context(load_context);
         } else if card.model_input == ModelInput::Tokens && card.model_type.supports_embedding() {
             // Case 4: Tokens + Embeddings
-            // Create preprocessing pipeline similar to Backend
-            let frontend = SegmentSource::<
-                SingleIn<NvCreateEmbeddingRequest>,
-                ManyOut<Annotated<NvCreateEmbeddingResponse>>,
-            >::new();
-
-            let preprocessor =
-                OpenAIPreprocessor::new_for_embeddings(card.clone())?.into_operator();
-            let backend = Backend::from_mdc(card).into_operator();
-
+            // Build the preprocessor first: a router started for a card that fails here would
+            // leave its discovery watch running.
+            let preprocessor = OpenAIPreprocessor::new_for_embeddings(card.clone())?;
             let router = PushRouter::<
                 PreprocessedEmbeddingRequest,
                 Annotated<EmbeddingsEngineOutput>,
@@ -1039,16 +1028,8 @@ impl ModelWatcher {
             .await?;
 
             // Note: Embeddings don't need KV routing complexity or load monitoring
-            let service_backend = ServiceBackend::from_engine(Arc::new(router));
-
-            // Link the pipeline: frontend -> preprocessor -> backend -> service_backend -> backend -> preprocessor -> frontend
-            let embedding_engine = frontend
-                .link(preprocessor.forward_edge())?
-                .link(backend.forward_edge())?
-                .link(service_backend)?
-                .link(backend.backward_edge())?
-                .link(preprocessor.backward_edge())?
-                .link_terminal(frontend)?;
+            let embedding_engine =
+                entrypoint::input::build_embeddings_pipeline(preprocessor, Arc::new(router));
 
             worker_set.embeddings_engine = Some(embedding_engine);
         } else if card.model_input == ModelInput::Tensor && card.model_type.supports_tensor() {
@@ -1573,7 +1554,7 @@ mod tests {
     use crate::session_affinity::SessionAffinityMode;
     use dynamo_runtime::discovery::DiscoveryEvent;
     use dynamo_runtime::engine::AsyncEngine;
-    use dynamo_runtime::pipeline::Error;
+    use dynamo_runtime::pipeline::{Error, ManyOut, SingleIn};
     use dynamo_runtime::{Runtime, distributed::DistributedConfig};
     use futures::StreamExt;
 
@@ -1702,22 +1683,12 @@ mod tests {
             let cancellation = runtime_cancellation.child_token();
             let preprocessor =
                 worker_set_chat_preprocessor(&card, card.tokenizer().unwrap(), &cancellation)
-                    .unwrap()
-                    .into_operator();
+                    .unwrap();
             let backend = Arc::new(CompletingBackend::default());
-            let source = SegmentSource::<
-                SingleIn<NvCreateChatCompletionRequest>,
-                ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>,
-            >::new();
-            let engine = source
-                .link(preprocessor.forward_edge())
-                .unwrap()
-                .link(ServiceBackend::from_engine(backend.clone()))
-                .unwrap()
-                .link(preprocessor.backward_edge())
-                .unwrap()
-                .link_terminal(source)
-                .unwrap();
+            let engine = crate::operator::testing::preprocessor::<
+                NvCreateChatCompletionRequest,
+                NvCreateChatCompletionStreamResponse,
+            >(preprocessor, backend.clone());
             let mut worker_set = WorkerSet::new("retired-prefill".into(), "test".into(), card);
             worker_set.set_lifecycle_cancellation(cancellation.clone());
             worker_set.chat_engine = Some(engine);
@@ -2558,6 +2529,90 @@ request_classifier:
             desired.card.runtime_config.tokenizer_fallback_enabled,
             Some(false)
         );
+    }
+
+    /// An embeddings card whose preprocessor cannot be built must fail before its router
+    /// exists. A `PushRouter` starts a discovery watch that outlives the router and holds the
+    /// runtime's TCP callback server until shutdown.
+    #[tokio::test]
+    async fn embeddings_preprocessor_failure_starts_no_router() {
+        use dynamo_runtime::{Runtime, distributed::DistributedConfig};
+
+        let runtime = Runtime::from_current().unwrap();
+        let drt = DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+            .await
+            .unwrap();
+        let callbacks = drt.tcp_server().await.unwrap();
+        let references_before = Arc::strong_count(&callbacks);
+        let watcher = ModelWatcher::new(
+            drt.clone(),
+            Arc::new(ModelManager::new()),
+            RouterConfig::default(),
+            0,
+            None,
+            None,
+            None,
+            Arc::new(Metrics::new_with_prefix(Some(
+                "watcher_embeddings_failure_test".to_string(),
+            ))),
+        );
+        let mcid = ModelCardInstanceId {
+            namespace: "embeddings-failure-ns".to_string(),
+            component: "workers".to_string(),
+            endpoint: "generate".to_string(),
+            instance_id: 1,
+            model_suffix: None,
+        };
+        // No tokenizer, so the embeddings preprocessor cannot be built.
+        let mut card = ModelDeploymentCard::with_name_only("embeddings-no-tokenizer");
+        card.model_input = ModelInput::Tokens;
+        card.model_type = ModelType::Embedding;
+        card.worker_type = Some(WorkerType::Aggregated);
+
+        let endpoint_id = model_card_endpoint_id(&mcid);
+        let key = GroupKey {
+            model_name: card.name().to_string(),
+            worker_set_key: worker_set_key(&endpoint_id, card.model_type, card.worker_type),
+        };
+        let desired = DesiredInstance {
+            key: mcid.to_path(),
+            mcid,
+            endpoint_id,
+            mdc_checksum: card.mdcsum().to_string(),
+            projection_fingerprint: lora_projection_fingerprint(&card).unwrap(),
+            video_contract: qwen_video_contract_digest(&card),
+            card,
+            group_key: key.clone(),
+        };
+        let spec = GroupSpec {
+            key,
+            mdc_checksum: desired.mdc_checksum.clone(),
+            fingerprint: desired.mdc_checksum.clone(),
+            generation: 1,
+            representative: desired.clone(),
+            video_contract: desired.video_contract.clone(),
+        };
+        let (_admission_tx, admission_rx) = tokio::sync::watch::channel(vec![1]);
+        let error = watcher
+            .prepare_worker_set(&spec, admission_rx, CancellationToken::new())
+            .await
+            .err()
+            .expect("an embeddings card without a tokenizer must fail");
+        assert!(
+            format!("{error:#}").contains("tokenizer"),
+            "unexpected error: {error:#}"
+        );
+
+        // Let anything the failed preparation spawned take its references.
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            Arc::strong_count(&callbacks),
+            references_before,
+            "a failed embeddings preparation left a router's discovery watch running"
+        );
+        runtime.shutdown();
     }
 
     #[tokio::test]

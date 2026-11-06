@@ -1,15 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-/// In a Pipeline, the [`AsyncEngine`] is constrained to take a [`Context`] as input and return
-/// a [`super::engine::ResponseStream`] as output.
-use serde::{Deserialize, Serialize};
-
-mod nodes;
-pub use nodes::{
-    Operator, PipelineNode, PipelineOperator, SegmentSink, SegmentSource, Service, ServiceBackend,
-    ServiceFrontend, Sink, Source,
-};
+//! In a Pipeline, the [`AsyncEngine`] is constrained to take a [`Context`] as input and return
+//! a [`super::engine::ResponseStream`] as output.
 
 pub mod context;
 pub mod error;
@@ -148,9 +141,4 @@ impl<T: Data> PipelineIO for EngineStream<T> {
     fn id(&self) -> String {
         self.context().id().to_string()
     }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Event {
-    pub id: String,
 }

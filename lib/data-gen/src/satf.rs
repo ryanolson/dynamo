@@ -602,8 +602,6 @@ fn session_first_start_us(session: &SatfSession) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
-
     use tempfile::NamedTempFile;
 
     use super::*;

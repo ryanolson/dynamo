@@ -35,33 +35,9 @@ pub enum PipelineError {
     #[error("Generic error: {0}")]
     Generic(String),
 
-    /// Edges can only be set once. This error is thrown on subsequent attempts to set an edge.s
-    #[error("Link failed: Edge already set")]
-    EdgeAlreadySet,
-
-    /// The source node is not connected to an edge.
-    #[error("Disconnected source; no edge on which to send data")]
-    NoEdge,
-
-    #[error("SegmentSink is not connected to an EgressPort")]
-    NoNetworkEdge,
-
-    /// In the interim between when a request was made and when the stream was received, the
-    /// requesting task was dropped. This maybe a logic error in the pipeline; and become a
-    /// panic/fatal error in the future. This error is thrown when the `on_data` method of a
-    /// terminating sink either cannot find the `oneshot` channel sender or the corresponding
-    /// receiver was dropped
-    #[error("Unlinked request; initiating request task was dropped or cancelled")]
-    DetachedStreamReceiver,
-
-    // In the interim between when a response was made and when the stream was received, the
-    // Sender for the stream was dropped. This maybe a logic error in the pipeline; and become a
-    // panic/fatal error in the future.
-    #[error("Unlinked response; response task was dropped or cancelled")]
-    DetachedStreamSender,
-
-    /// A request was issued while another in-flight request through the same source already
-    /// uses this id. Responses are routed back by id, so the new request is refused.
+    /// A request reached a worker's ingress while another in-flight request already uses
+    /// this id. The ingress never lets its engine see two calls with one id, so the new
+    /// request is refused.
     #[error("Duplicate in-flight request id: {0}")]
     DuplicateRequestId(String),
 
@@ -70,9 +46,6 @@ pub enum PipelineError {
 
     #[error("Deserialization Error: {0}")]
     DeserializationError(String),
-
-    #[error("Failed to issue request to the control plane: {0}")]
-    ControlPlaneRequestError(String),
 
     #[error("Failed to establish a streaming connection: {0}")]
     ConnectionFailed(String),
