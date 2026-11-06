@@ -29,7 +29,7 @@ use futures::stream::{Stream, StreamExt};
 
 use crate::model_card::ModelDeploymentCard;
 use crate::operator::{GdlOperator, checked, checked_mut, gdl_error};
-use dynamo_gdl_adapters::{Boxed, CheckedItems};
+use dynamo_gdl_adapters::{Boxed, CheckedItems, CutShort};
 use dynamo_runtime::dynamo_nvtx_range;
 use dynamo_runtime::{
     error::{DynamoError, ErrorClass},
@@ -321,7 +321,10 @@ struct DecoderStream<S> {
 
 impl<S> Stream for DecoderStream<S>
 where
-    S: Stream<Item = gdl::Result<Annotated<LLMEngineOutput>>> + AsyncEngineContextProvider + Unpin,
+    S: Stream<Item = gdl::Result<Annotated<LLMEngineOutput>>>
+        + AsyncEngineContextProvider
+        + CutShort
+        + Unpin,
 {
     type Item = gdl::Result<Annotated<BackendOutput>>;
 
@@ -342,7 +345,10 @@ where
 
 impl<S> DecoderState<S>
 where
-    S: Stream<Item = gdl::Result<Annotated<LLMEngineOutput>>> + AsyncEngineContextProvider + Unpin,
+    S: Stream<Item = gdl::Result<Annotated<LLMEngineOutput>>>
+        + AsyncEngineContextProvider
+        + CutShort
+        + Unpin,
 {
     /// The next item, detokenized in place, or `None` when the stream has ended.
     fn poll_step(
@@ -679,6 +685,12 @@ where
                 // incomplete hidden-stop-sequence match before the decoders are
                 // dropped, and drain the flushed choices one synthetic chunk at a time.
                 self.stream_ended = true;
+                // Unless the request was killed or passed its deadline: then the stream
+                // ended because the answer was cut short, and a flush would mark it
+                // finished. Checked once, here, never per item.
+                if self.stream.cut_short() {
+                    return Poll::Ready(None);
+                }
                 for (idx, decoder) in self.decoders.iter_mut() {
                     // A choice that already finished -- successfully or with an error --
                     // was already given its chance to flush (see the decoder-driven and
@@ -3090,5 +3102,131 @@ mod tests {
             vec![FinishReason::Error("worker failed".to_string())],
             "the worker's error must survive a local EOS stop in the same chunk: {outputs:?}"
         );
+    }
+
+    /// One choice that releases "abc" and withholds "STOP", a strict prefix of the stop
+    /// sequence "STOPPED", so a bare end of the engine's stream flushes it with a
+    /// `finish_reason` (see `backend_flushes_multiple_jailed_choices_on_bare_eof_without_repolling`).
+    fn withholding_chunks() -> Vec<Annotated<LLMEngineOutput>> {
+        [1, 2]
+            .into_iter()
+            .map(|token| {
+                Annotated::from_data(LLMEngineOutput {
+                    token_ids: vec![token],
+                    index: Some(0),
+                    ..Default::default()
+                })
+            })
+            .collect()
+    }
+
+    /// Sends [`withholding_chunks`], then does `at_end` to the request's context, then ends
+    /// cleanly: a stop or kill that lands before the engine's stream ends.
+    struct SignalAtEndEngine {
+        at_end: fn(&dyn AsyncEngineContext),
+    }
+
+    #[async_trait]
+    impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>, Error>
+        for SignalAtEndEngine
+    {
+        async fn generate(
+            &self,
+            request: SingleIn<PreprocessedRequest>,
+        ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+            let context = request.context();
+            let signalled = context.clone();
+            let at_end = self.at_end;
+            let end = futures::stream::poll_fn(move |_| {
+                at_end(signalled.as_ref());
+                std::task::Poll::Ready(None)
+            });
+            let stream = futures::stream::iter(withholding_chunks()).chain(end);
+            Ok(ResponseStream::new(Box::pin(stream), context))
+        }
+    }
+
+    /// Backend's response when the engine's stream ends cleanly after `at_end`.
+    async fn signalled_at_end(
+        at_end: fn(&dyn AsyncEngineContext),
+    ) -> Vec<Annotated<BackendOutput>> {
+        let tokenizer: Arc<dyn traits::Tokenizer> = Arc::new(JailingTokenizer);
+        let backend = Backend::from_tokenizer(Tokenizer::from(tokenizer));
+        let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
+            Arc::new(SignalAtEndEngine { at_end });
+        on_gdl(&backend, engine)
+            .generate(SingleIn::new(jailing_request(1)))
+            .await
+            .expect("backend generation succeeds")
+            .collect()
+            .await
+    }
+
+    fn finish_reasons(outputs: &[Annotated<BackendOutput>]) -> Vec<FinishReason> {
+        outputs
+            .iter()
+            .filter_map(|output| output.data.as_ref()?.finish_reason.clone())
+            .collect()
+    }
+
+    /// A kill before the engine's stream ends cuts the answer: the clean end that follows
+    /// is not a finish, so Backend flushes nothing and marks no choice finished.
+    #[tokio::test]
+    async fn backend_writes_no_finish_after_a_kill() {
+        let outputs = signalled_at_end(|context| context.kill()).await;
+        assert_eq!(finish_reasons(&outputs), vec![], "{outputs:?}");
+        let text: String = outputs
+            .iter()
+            .filter_map(|output| output.data.as_ref()?.text.as_deref())
+            .collect();
+        assert_eq!(text, "abc", "the withheld text must not be flushed");
+    }
+
+    /// A graceful stop still ends the answer: Backend flushes the withheld text and marks
+    /// the choice finished, as on any clean end.
+    #[tokio::test]
+    async fn backend_still_finishes_after_a_stop() {
+        let outputs = signalled_at_end(|context| context.stop_generating()).await;
+        assert_eq!(
+            finish_reasons(&outputs),
+            vec![FinishReason::Stop],
+            "{outputs:?}"
+        );
+    }
+
+    /// Backend's backward half under `cx`, over [`withholding_chunks`] that end cleanly.
+    async fn backward_under(cx: &gdl::Cx) -> Vec<Annotated<BackendOutput>> {
+        use gdl::Around;
+        let tokenizer: Arc<dyn traits::Tokenizer> = Arc::new(JailingTokenizer);
+        let backend = Backend::from_tokenizer(Tokenizer::from(tokenizer));
+        let op = GdlOperator::<Backend, PreprocessedRequest>::new(backend);
+        let (_sent, state) = op
+            .forward(cx, Box::new(SingleIn::new(jailing_request(1))))
+            .await
+            .expect("Backend accepts the request");
+        let input = gdl::items(futures::stream::iter(
+            withholding_chunks().into_iter().map(Ok),
+        ));
+        op.backward(cx, state, input)
+            .map(|item| item.expect("Backend ends no stream with an `Err`"))
+            .collect()
+            .await
+    }
+
+    /// A request past its deadline when the engine's stream ends cleanly was cut, as after a
+    /// kill. No Dynamo caller sets a deadline, so this drives the node with a `Cx` that has
+    /// one; the control without one shows the same input does finish.
+    #[tokio::test]
+    async fn backend_writes_no_finish_after_the_deadline() {
+        let control = backward_under(&gdl::Cx::new()).await;
+        assert_eq!(
+            finish_reasons(&control),
+            vec![FinishReason::Stop],
+            "{control:?}"
+        );
+
+        let past = gdl::Cx::new().with_timeout(std::time::Duration::ZERO);
+        let outputs = backward_under(&past).await;
+        assert_eq!(finish_reasons(&outputs), vec![], "{outputs:?}");
     }
 }
