@@ -11,6 +11,7 @@
 //!
 //! The Preprocessor will accept any IngressRequest and transform it to a BackendRequest.
 
+mod cut;
 mod edit;
 pub mod media;
 #[cfg(feature = "mm-routing")]
@@ -80,7 +81,7 @@ use crate::protocols::common::preprocessor::{
 };
 use crate::protocols::common::timing::RequestTracker;
 use crate::tokenizers::Encoding;
-use dynamo_gdl_adapters::{AnnotatedItems, Boxed};
+use dynamo_gdl_adapters::{AnnotatedItems, Boxed, CutShort};
 
 use dynamo_parsers::tool_calling::ToolDefinition;
 use dynamo_parsers::{
@@ -5803,7 +5804,7 @@ impl OpenAIPreprocessor {
         guided_tool_constraint: crate::protocols::openai::GuidedToolConstraint,
         tool_processing_route: ToolProcessingRoute,
         tool_definitions: Option<Vec<ToolDefinition>>,
-    ) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static
+    ) -> Pin<Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static>>
     where
         S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
     {
@@ -6156,7 +6157,7 @@ impl OpenAIPreprocessor {
         Resp: Send + Sync + Clone + 'static + std::fmt::Debug,
     {
         Self::transform_postprocessor_stream_with_image_tokens(
-            Box::pin(stream),
+            cut::NeverCut(Box::pin(stream)),
             generator,
             context,
             emit_payload_usage_chunk,
@@ -6164,12 +6165,17 @@ impl OpenAIPreprocessor {
             trace_finish_reason_metadata,
             mm_counts,
             None,
+            None,
         )
     }
 
     /// The response transform over `stream`, Backend's items. The stream is held as it is, not
     /// boxed: on the Dynamo path it is already a box, and a second one cost an allocation per
     /// request.
+    ///
+    /// When `stream` ends, it writes the usage chunk, unless the request was cut short (see
+    /// [`CutShort`]): then it ends with nothing more, and sets `cut`, when given, so the stages
+    /// above it that write on end can be stopped too ([`cut::UntilCut`]).
     // hot path: per-item-response
     #[allow(clippy::too_many_arguments)]
     fn transform_postprocessor_stream_with_image_tokens<S, Resp>(
@@ -6181,9 +6187,10 @@ impl OpenAIPreprocessor {
         trace_finish_reason_metadata: Option<crate::request_trace::SharedFinishReasonMetadata>,
         mm_counts: MultimodalCounts,
         image_tokens: Option<usize>,
+        cut: Option<cut::CutFlag>,
     ) -> impl Stream<Item = Annotated<Resp>> + Send + use<S, Resp>
     where
-        S: Stream<Item = Annotated<BackendOutput>> + Send + Unpin + 'static,
+        S: Stream<Item = Annotated<BackendOutput>> + CutShort + Send + Unpin + 'static,
         Resp: Send + Sync + Clone + 'static + std::fmt::Debug,
     {
         struct DetokenizeMetricsGuard {
@@ -6230,6 +6237,8 @@ impl OpenAIPreprocessor {
             trace_finish_reason_metadata: Option<crate::request_trace::SharedFinishReasonMetadata>,
             mm_counts: MultimodalCounts,
             image_tokens: Option<usize>,
+            /// Set when the response stream ended because the request was cut short.
+            cut: Option<cut::CutFlag>,
         }
 
         let tracker = generator.tracker();
@@ -6249,6 +6258,7 @@ impl OpenAIPreprocessor {
             trace_finish_reason_metadata,
             mm_counts,
             image_tokens,
+            cut,
         };
 
         /// The response stream: a stream that owns its state, in place of `unfold` and
@@ -6272,7 +6282,7 @@ impl OpenAIPreprocessor {
 
         impl<S, Resp> Stream for Postprocessed<S, Resp>
         where
-            S: Stream<Item = Annotated<BackendOutput>> + Unpin,
+            S: Stream<Item = Annotated<BackendOutput>> + CutShort + Unpin,
             Resp: Send + Sync + Clone + 'static + std::fmt::Debug,
         {
             type Item = Annotated<Resp>;
@@ -6295,7 +6305,7 @@ impl OpenAIPreprocessor {
 
         impl<S, Resp> State<S, Resp>
         where
-            S: Stream<Item = Annotated<BackendOutput>> + Unpin,
+            S: Stream<Item = Annotated<BackendOutput>> + CutShort + Unpin,
             Resp: Send + Sync + Clone + 'static + std::fmt::Debug,
         {
             /// The next chunk of the response, or `None` when it has ended.
@@ -6426,6 +6436,15 @@ impl OpenAIPreprocessor {
                     // Stream has ended - must set finished to true to prevent unfold from polling
                     // again. The stream is exhausted and will panic if polled after None.
                     self.finished = true;
+
+                    // A request killed or past its deadline ends its stream cleanly too, and
+                    // its answer is not whole: write nothing more. Checked once, here.
+                    if self.response_stream.cut_short() {
+                        if let Some(cut) = &self.cut {
+                            cut.set();
+                        }
+                        return Poll::Ready(None);
+                    }
 
                     if self.finish_reason_sent && !self.usage_chunk_sent {
                         self.usage_chunk_sent = true;
@@ -8794,11 +8813,25 @@ impl OpenAIPreprocessor {
         warmup: W,
     ) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static + use<S, W>
     where
-        S: Stream<Item = Annotated<BackendOutput>> + Send + Unpin + 'static,
+        S: Stream<Item = Annotated<BackendOutput>> + CutShort + Send + Unpin + 'static,
         W: FnOnce() -> Arc<
             dyn AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>,
         >,
     {
+        // Whether the request was cut short is decided once, where the response stream ends
+        // (see `transform_postprocessor_stream_with_image_tokens`). The response parsers and the
+        // payload capture write on that end too, so they read the decision through a shared
+        // flag: allocated only when one of them runs, never on the default path. Every parser
+        // that writes on end runs only with a reasoning parser or a tool-call route (see
+        // `postprocessor_parsing_stream_with_tools`).
+        let parsers_write_on_end = self.runtime_config.reasoning_parser.is_some()
+            || !matches!(
+                state.tool_processing_route,
+                ToolProcessingRoute::PassThrough
+            );
+        let cut =
+            (parsers_write_on_end || state.payload_handle.is_some()).then(cut::CutFlag::default);
+
         // transform the postprocessor stream (no boxing yet) - detokenize
         let stream = Self::transform_postprocessor_stream_with_image_tokens(
             response_stream,
@@ -8809,6 +8842,7 @@ impl OpenAIPreprocessor {
             state.trace_finish_reason_metadata,
             state.mm_counts,
             state.image_tokens,
+            cut.clone(),
         );
 
         let transformed_stream = self.postprocessor_parsing_stream_with_tools(
@@ -8819,6 +8853,12 @@ impl OpenAIPreprocessor {
             state.tool_processing_route,
             tool_definitions,
         );
+        // The parsers' closing output, such as a tool call closed at the end, ends with them.
+        // Their stream is already a box, so the default path adds no allocation here.
+        let transformed_stream = match cut.as_ref().filter(|_| parsers_write_on_end) {
+            Some(cut) => Box::pin(cut::UntilCut::new(transformed_stream, cut.clone())),
+            None => transformed_stream,
+        };
         let transformed_stream = Self::normalize_chat_stream_roles(transformed_stream);
 
         // Request payload capture is a pass-through: every chunk reaches the HTTP
@@ -8836,8 +8876,12 @@ impl OpenAIPreprocessor {
 
             // Spawn the payload emit off the request path. The outcome carries a drop
             // reason and any recovered partial response, so emit the record either way.
+            let cut = cut.expect("payload capture shares the cut flag");
             tokio::spawn(async move {
-                let outcome = agg_fut.await;
+                let mut outcome = agg_fut.await;
+                if cut.is_set() {
+                    outcome.drop_reason = Some(cut::DROP_CUT_SHORT.to_string());
+                }
                 if let Some(reason) = outcome.drop_reason.as_deref() {
                     tracing::debug!(
                         request_id = %payload.request_id(),
@@ -9098,7 +9142,7 @@ impl OpenAIPreprocessor {
         context: Arc<dyn AsyncEngineContext>,
     ) -> impl Stream<Item = Annotated<NvCreateCompletionResponse>> + Send + 'static + use<S>
     where
-        S: Stream<Item = Annotated<BackendOutput>> + Send + Unpin + 'static,
+        S: Stream<Item = Annotated<BackendOutput>> + CutShort + Send + Unpin + 'static,
     {
         let CompletionState {
             response_generator,
@@ -9118,6 +9162,7 @@ impl OpenAIPreprocessor {
             trace_tokens_enabled,
             trace_finish_reason_metadata,
             MultimodalCounts::default(),
+            None,
             None,
         );
 
@@ -9951,7 +9996,7 @@ mod tests {
             &request,
             state,
             None,
-            stream::pending(),
+            cut::NeverCut(stream::pending()),
             controller,
             || panic!("this request does not enable speculative prefill"),
         );
