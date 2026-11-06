@@ -873,4 +873,64 @@ mod tests {
             assert_ambiguous_decode_error_preserves_prefill(output).await;
         }
     }
+    /// A kill lands while decode's stream ends cleanly. The handoff still sends prefill's
+    /// output, which reports a prefill that did complete, but nothing that marks the answer
+    /// finished: no `finish_reason` and no error.
+    #[tokio::test]
+    async fn a_kill_as_decode_ends_adds_no_finish() {
+        for output in [
+            PrefillNeed::None,
+            PrefillNeed::BeforeLast,
+            PrefillNeed::BeforeFirst,
+        ] {
+            let (tx, task) = pending_prefill();
+            let context = Arc::new(Controller::default());
+            let killed = context.clone();
+            let decode: ManyOut<Annotated<LLMEngineOutput>> = ResponseStream::new(
+                Box::pin(
+                    stream::iter([Annotated::from_data(LLMEngineOutput {
+                        token_ids: vec![42],
+                        ..Default::default()
+                    })])
+                    .chain(stream::poll_fn(move |_| {
+                        killed.kill();
+                        std::task::Poll::Ready(None)
+                    })),
+                ),
+                context.clone(),
+            );
+            tx.send(Ok(Some(serde_json::json!({"prefill": "done"}))))
+                .unwrap();
+            let response = task
+                .forward_decode_on_gdl(
+                    async { Ok(decode) },
+                    context.clone(),
+                    output,
+                    Arc::new(Controller::default()),
+                )
+                .await
+                .unwrap();
+            let items: Vec<_> = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                response.collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+            assert!(context.is_killed());
+            assert!(
+                items.iter().all(|item| item.err().is_none()
+                    && item
+                        .data
+                        .as_ref()
+                        .is_none_or(|data| data.finish_reason.is_none())),
+                "{output:?}: {items:?}"
+            );
+            assert!(
+                items
+                    .iter()
+                    .any(|item| item.data.as_ref().is_some_and(|d| d.token_ids == [42])),
+                "{output:?}: {items:?}"
+            );
+        }
+    }
 }
