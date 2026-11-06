@@ -18,6 +18,9 @@
 //!   `dynamo_llm::operator` builds Backend, the preprocessor, Migration and the
 //!   routers this way; the stages that edit items in place read through
 //!   `CheckedItems`, which leaves each item in its gdl `Result`.
+//! - [`cut_short`] and [`CutShort`]: whether a node's input that ended cleanly
+//!   was cut short by a kill or a passed deadline, for a node that writes
+//!   closing output when its input ends.
 //! - [`metrics`]: a gdl node's metrics on a Dynamo endpoint.
 //! - [`config`]: how a gdl node in Dynamo gets its configuration.
 //!
@@ -52,7 +55,7 @@ mod request;
 mod sink;
 
 pub use bridge::{CxBridge, REQUEST_ID};
-pub use engine::{AnnotatedItems, CheckedItems, PipelineEngine};
+pub use engine::{AnnotatedItems, CheckedItems, CutShort, PipelineEngine, cut_short};
 pub use error::enter;
 pub use request::{Boxed, Carried, SpareBox};
 pub use sink::EngineSink;

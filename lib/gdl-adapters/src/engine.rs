@@ -167,6 +167,38 @@ impl<T: Data> Stream for AnnotatedItems<T> {
     }
 }
 
+/// Whether the request that `cx` and `context` belong to was cut short: killed through its
+/// Dynamo context, or cancelled or past its deadline through `cx` ([`gdl::Cx::check`]). A stop
+/// does not cut a request short: the answer that ends after it is whole.
+///
+/// A nested call whose request is killed or passes its deadline ends quietly, as if it had
+/// finished; only the request's edge reports why. So a node that writes closing output when
+/// its input ends, such as a `finish_reason`, a usage chunk or a flush of held text, asks this
+/// once, on that clean end, and writes nothing when it is `true`. It reads both sides: under a
+/// pipeline rooted with [`PipelineEngine::for_dynamo_stages`], a kill does not cancel `cx`.
+pub fn cut_short(cx: &gdl::Cx, context: &dyn AsyncEngineContext) -> bool {
+    cx.check().is_err() || context.is_killed()
+}
+
+/// A node's input that can say, once it has ended, whether its request was cut short
+/// ([`cut_short`]). A node asks once per stream, on the clean end, never per item.
+pub trait CutShort {
+    /// Whether the request this stream answers was cut short.
+    fn cut_short(&self) -> bool;
+}
+
+impl<T> CutShort for AnnotatedItems<T> {
+    fn cut_short(&self) -> bool {
+        cut_short(&self.root, self.context.as_ref())
+    }
+}
+
+impl<T> CutShort for CheckedItems<T> {
+    fn cut_short(&self) -> bool {
+        cut_short(&self.root, self.context.as_ref())
+    }
+}
+
 /// gdl's `Err` rule, which [`AnnotatedItems`] and [`CheckedItems`] share: the
 /// last item of a stream that ended in `error`, or `None` when it is a cancel
 /// of a request that was killed, since a killed Dynamo stream just ends.
@@ -250,5 +282,82 @@ impl<T: Data> Stream for CheckedItems<T> {
             Poll::Ready(None) => self.items = None,
         }
         poll
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use dynamo_runtime::pipeline::Context;
+
+    use super::*;
+    use crate::bridge::CxBridge;
+
+    fn request() -> Context<()> {
+        Context::with_id_and_metadata((), "req-1".to_string(), Default::default())
+    }
+
+    /// Read as a node reads its input: under a `Cx` of a pipeline rooted with
+    /// `for_dynamo_stages`, which a Dynamo kill does not cancel.
+    fn input(request: &Context<()>, cx: gdl::Cx) -> (AnnotatedItems<()>, CheckedItems<()>) {
+        let context = request.context();
+        let empty = || gdl::items(futures::stream::empty());
+        (
+            AnnotatedItems::new(empty(), cx.clone(), context.clone()),
+            CheckedItems::new(empty(), cx, context),
+        )
+    }
+
+    fn cut(request: &Context<()>, cx: gdl::Cx) -> [bool; 3] {
+        let (annotated, checked) = input(request, cx.clone());
+        [
+            cut_short(&cx, request.controller()),
+            annotated.cut_short(),
+            checked.cut_short(),
+        ]
+    }
+
+    #[test]
+    fn a_live_request_is_not_cut_short() {
+        let request = request();
+        let cx = CxBridge::cx_for_dynamo_stages(request.controller());
+        assert_eq!(cut(&request, cx), [false; 3]);
+    }
+
+    /// A Dynamo kill reaches the node through the request's context only.
+    #[test]
+    fn a_kill_cuts_the_request_short() {
+        let request = request();
+        let cx = CxBridge::cx_for_dynamo_stages(request.controller());
+        request.controller().kill();
+        assert!(cx.check().is_ok(), "the kill does not cancel this `Cx`");
+        assert_eq!(cut(&request, cx), [true; 3]);
+    }
+
+    #[test]
+    fn a_cancel_of_the_cx_cuts_the_request_short() {
+        let request = request();
+        let cx = CxBridge::cx_for_dynamo_stages(request.controller());
+        cx.cancel();
+        assert_eq!(cut(&request, cx), [true; 3]);
+    }
+
+    #[test]
+    fn a_passed_deadline_cuts_the_request_short() {
+        let request = request();
+        let cx = CxBridge::cx_for_dynamo_stages(request.controller()).with_timeout(Duration::ZERO);
+        assert_eq!(cut(&request, cx), [true; 3]);
+    }
+
+    /// A stop asks for a graceful end: the answer that ends after it is whole.
+    #[test]
+    fn a_stop_does_not_cut_the_request_short() {
+        let request = request();
+        let cx = CxBridge::cx(request.controller());
+        request.controller().stop_generating();
+        assert!(cx.is_stopping(), "the stop reaches the `Cx`");
+        assert!(cx.check().is_ok(), "gdl's check does not report a stop");
+        assert_eq!(cut(&request, cx), [false; 3]);
     }
 }
