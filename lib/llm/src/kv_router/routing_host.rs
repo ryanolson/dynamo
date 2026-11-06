@@ -175,7 +175,11 @@ fn monitor_response_stream(
                         if drainable_terminal {
                             guard.record_migration_failure(None);
                         }
-                        break !drainable_terminal;
+                        // A kill that lands while the worker's stream ends is not seen by
+                        // the `stopped` arm above, and the stream then ends cleanly: the
+                        // request was cut short, not completed. Checked once, here. The
+                        // sink's `cx` cannot tell: gdl cancels it at every attempt's end.
+                        break !drainable_terminal && !context.is_killed();
                     };
                     let outcome = classify_response_item(&item);
                     guard.on_item(&item).await;
