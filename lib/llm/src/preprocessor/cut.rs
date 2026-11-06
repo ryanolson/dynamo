@@ -496,6 +496,51 @@ mod tests {
         assert_eq!(jail(past_deadline()).await, Markers::default());
     }
 
+    #[tokio::test]
+    async fn custom_tool_stream_ends_quietly_after_a_kill() {
+        use crate::protocols::openai::chat_completions::{
+            NvCreateChatCompletionStreamResponse, custom_tools::ChatCustomToolAdapter,
+        };
+
+        async fn response(
+            at_end: fn(&dyn AsyncEngineContext),
+        ) -> Vec<Annotated<NvCreateChatCompletionStreamResponse>> {
+            let mut request: NvCreateChatCompletionRequest =
+                serde_json::from_value(serde_json::json!({
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Calculate"}],
+                    "stream": true,
+                    "tools": [{
+                        "type": "custom",
+                        "custom": {"name": "run_python", "format": {"type": "text"}}
+                    }],
+                    "tool_choice": {"type": "custom", "custom": {"name": "run_python"}}
+                }))
+                .unwrap();
+            let custom_tools = ChatCustomToolAdapter::prepare(&mut request).unwrap();
+            let below = Arc::new(SignalAtEnd {
+                outputs: vec![output(r#"{"input":"print(1"#, None)],
+                at_end,
+            });
+            let pipeline = crate::operator::testing::preprocessor::<
+                _,
+                NvCreateChatCompletionStreamResponse,
+            >(preprocessor(TOOL_MODEL, None), below);
+            let stream = pipeline.generate(Context::new(request)).await.unwrap();
+            custom_tools.stream(stream).collect().await
+        }
+
+        let stopped = response(stop).await;
+        assert!(stopped.iter().all(|item| !item.is_error()), "{stopped:?}");
+        assert!(markers(&stopped).tool_calls > 0, "{stopped:?}");
+
+        let killed = response(kill).await;
+        assert!(
+            killed.iter().all(|item| !item.is_error()),
+            "a killed custom-tool stream must end quietly: {killed:?}"
+        );
+    }
+
     /// The payload record of a chat request whose stream sends [`finished_answer`] and then
     /// does `at_end`: whether the payload is complete, and its drop reason.
     async fn payload_after(
