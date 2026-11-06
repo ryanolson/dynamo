@@ -527,7 +527,8 @@ mod tests {
                 NvCreateChatCompletionStreamResponse,
             >(preprocessor(TOOL_MODEL, None), below);
             let stream = pipeline.generate(Context::new(request)).await.unwrap();
-            custom_tools.stream(stream).collect().await
+            let context = stream.context();
+            custom_tools.stream(stream, context).collect().await
         }
 
         let stopped = response(stop).await;
