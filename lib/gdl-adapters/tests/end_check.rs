@@ -3,9 +3,8 @@
 
 //! The closing output of the frontend's own chat pipelines when the worker's stream ends
 //! cleanly: written for a whole answer, and not for one cut short by a kill. Run on the
-//! in-process pipeline (A), whose `Cx` a kill does not cancel, and on the routed one (B), whose
-//! `Cx` a kill cancels, so a node's end check is neither blind to a kill nor set off by a
-//! normal end on either root.
+//! in-process pipeline (A) and on the routed one (B). A kill reaches neither as a cancel of the
+//! `Cx`, so a node's end check reads the request's context.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

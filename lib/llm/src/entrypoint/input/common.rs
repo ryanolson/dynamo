@@ -575,9 +575,13 @@ impl PreprocessedRouting {
     {
         let token_backend = Backend::from_tokenizer(tokenizer);
         let migration = Migration::from_mdc(card, migration_limit, migration_max_seq_len, metrics);
-        Ok(Arc::new(PipelineEngine::<_, Req, Resp, Boxed<Req>>::new(
-            self.gdl_pipeline(preprocessor, migration, token_backend),
-        )))
+        Ok(Arc::new(
+            PipelineEngine::<_, Req, Resp, Boxed<Req>>::for_dynamo_stages(self.gdl_pipeline(
+                preprocessor,
+                migration,
+                token_backend,
+            )),
+        ))
     }
 
     /// The stages of [`build_pipeline`](Self::build_pipeline), each a native gdl operator,
@@ -652,8 +656,8 @@ impl PreprocessedRouting {
             PreprocessedRequest,
             LLMEngineOutput,
             Boxed<PreprocessedRequest>,
-        >::new(
-            self.gdl_preprocessed_pipeline(migration)
+        >::for_dynamo_stages(
+            self.gdl_preprocessed_pipeline(migration),
         )))
     }
 

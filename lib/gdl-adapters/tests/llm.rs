@@ -564,25 +564,22 @@ async fn a_stop_and_a_kill_reach_the_terminal_through_pipeline_b() {
 }
 
 /// A kill while the terminal is still dispatching, through all of pipeline B (see
-/// `kill_during_dispatch`). Pipeline B is native and rooted with `PipelineEngine::new`, so the
-/// kill cancels it and gdl drops the terminal's call.
+/// `kill_during_dispatch`).
 #[tokio::test]
 async fn a_kill_during_dispatch_ends_pipeline_b() {
     let pipeline = pipeline_b(Arc::new(Hanging), 3);
     assert_eq!(
         kill_during_dispatch(pipeline, chat_request()).await,
-        "error Cancelled"
+        "ok, 0 items"
     );
 }
 
 /// What a kill while the terminal is still dispatching does to `pipeline`'s call.
 ///
-/// On a pipeline with a Dynamo engine inside it (A and embeddings, rooted with
-/// `PipelineEngine::for_dynamo_stages`), the stages see the kill through their own context and
-/// end the request with an empty stream. A native gdl pipeline (B and C) is rooted with
-/// `PipelineEngine::new`: the kill cancels its `Cx`, gdl drops every call still in flight, as a
-/// client disconnect drops the handler's call, and the call fails as `Cancelled`. The HTTP
-/// handler reports both as a client disconnect.
+/// Every frontend pipeline is rooted with `PipelineEngine::for_dynamo_stages`: the kill reaches
+/// the stages and the terminal through the request's context, not as a cancel of the `Cx`, so
+/// gdl drops no call. The terminal sees the kill and answers with no item, and the call ends
+/// with an empty stream.
 async fn kill_during_dispatch<Req: Data, T: Data>(
     pipeline: Arc<dyn AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, Error>>,
     request: SingleIn<Req>,
@@ -683,7 +680,7 @@ async fn a_kill_during_dispatch_ends_pipeline_c() {
     let pipeline = pipeline_c(Arc::new(Hanging), 3);
     assert_eq!(
         kill_during_dispatch(pipeline, request()).await,
-        "error Cancelled"
+        "ok, 0 items"
     );
 }
 

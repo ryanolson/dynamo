@@ -367,7 +367,7 @@ async fn a_kill_during_a_stall_ends_pipeline_a_quietly() {
     assert_eq!(outcome, STALL_THEN_KILL);
 }
 
-/// As for pipeline A, through pipeline B, which is rooted so that a kill cancels its `Cx`.
+/// As for pipeline A, through pipeline B.
 #[tokio::test]
 async fn a_kill_during_a_stall_ends_pipeline_b_quietly() {
     let (worker, _) = Worker::new(vec![Turn::Stream(vec![token(450)], Then::HoldUntilKilled)]);
@@ -600,21 +600,19 @@ async fn a_kill_during_the_dispatch_of_a_retry_ends_pipeline_c() {
             None => format!("error {error:#}"),
         },
     };
-    // As in `kill_during_dispatch`: the kill drops the call in flight and the call fails as
-    // `Cancelled`. The HTTP handler reports it as a client disconnect. (Dynamo's `link` chain
-    // ended the call with an empty stream; the difference was accepted.)
-    assert_eq!(outcome, "error Cancelled");
+    // As in `kill_during_dispatch`: the worker sees the kill and answers with no item, and the
+    // call ends with an empty stream.
+    assert_eq!(outcome, "ok, 0 items");
 }
 
 /// A worker that ignores the kill and keeps sending ready items, 200 in all. The kill is sent
 /// after the first item, and the caller keeps reading.
 ///
-/// Pipeline C is rooted so that a kill cancels its `Cx`, and each attempt boundary checks the
-/// cancel every 64 ready items, so the stream ends within 64 items of the kill. In the frontend
-/// the HTTP handler stops reading at the kill, so a client never sees the overrun. (Dynamo's
-/// `link` chain checked nothing: the caller read everything the worker sent.)
+/// Pipeline C is rooted so that a kill does not cancel its `Cx`, so nothing cuts the stream
+/// off: the caller reads everything the worker sends. In the frontend the HTTP handler stops
+/// reading at the kill, so a client never sees the overrun.
 #[tokio::test]
-async fn a_worker_that_ignores_the_kill_is_cut_off() {
+async fn a_worker_that_ignores_the_kill_is_read_to_its_end() {
     let items: Vec<_> = (0..200).map(token).collect();
     let (worker, _) = Worker::new(vec![Turn::Stream(items, Then::End)]);
     let request = preprocessed();
@@ -634,8 +632,8 @@ async fn a_worker_that_ignores_the_kill_is_cut_off() {
         after.len() == 199,
         after.iter().any(|item| item.is_error()),
     );
-    // Ends within 64 items of the kill, and sends no error.
-    assert_eq!(outcome, (true, false, false));
+    // Reads all 199 items after the kill, and sends no error.
+    assert_eq!(outcome, (false, true, false));
 }
 
 /// Every migration outcome `metrics` recorded, as `type/outcome xN`.

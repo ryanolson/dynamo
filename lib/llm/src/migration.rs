@@ -513,24 +513,25 @@ where
     unrecorded_migration: Option<MigrationEvent>,
 }
 
-/// The drop guard of a migration in flight. A kill drops the response in flight, and the HTTP
-/// handler drops it when the client disconnects. Either drops this manager inside [`RetryManager::new_stream`], before it records the migration's
-/// outcome. Record it here as cancelled, as `new_stream` does when it sees the cancel.
+/// The drop guard of a migration in flight. The HTTP handler drops the response when the client
+/// disconnects, and with it this manager inside [`RetryManager::new_stream`], before it records
+/// the migration's outcome. Record it here as cancelled, as `new_stream` does when it sees the
+/// cancel.
 ///
 /// The guard gives the classifier lifecycle parked for the retry the cancel as its cause, but
-/// leaves it parked rather than abort it: a remote prefill's route outlives the kill as a
-/// detached task, and its decode leg, which releases the staged KV, takes the parked
-/// lifecycle and finishes it. Aborting it here would make that leg start and classify a second
-/// one. Unclaimed, the lifecycle aborts with the cause when it is dropped.
+/// leaves it parked rather than abort it: a leg still in flight, such as a decode leg that
+/// releases staged KV, may take the parked lifecycle and finish it. Aborting it here would make
+/// that leg start and classify a second one. Unclaimed, the lifecycle aborts with the cause when
+/// it is dropped.
 impl<Resp, N> Drop for RetryManager<Resp, N>
 where
     Resp: Data + HasTokenIds,
 {
     fn drop(&mut self) {
-        // A drop in flight is the request's cancel, whether its context is killed first (gdl's
-        // kill) or after (the HTTP handler drops the response, then its disconnect monitor
-        // kills the context), so the context cannot tell. A panic unwinding through the
-        // dispatch is not a cancel and records none.
+        // A drop in flight is the request's cancel, whether its context is killed first or
+        // after (the HTTP handler drops the response, then its disconnect monitor kills the
+        // context), so the context cannot tell. A panic unwinding through the dispatch is not
+        // a cancel and records none.
         if self.unrecorded_migration.is_some() && !std::thread::panicking() {
             self.record_migration_outcome(frontend_service::migration_outcome::CANCELLED);
             self.abort_request_lifecycle_on_drop_cancelled();

@@ -31,7 +31,7 @@ use futures::stream::{self, StreamExt};
 use crate::{
     discovery::{ModelManager, WorkerSetTarget, WorkerSetTargetId},
     kv_router::{RoutingHost, SelectionPolicySource, routing_host::PrefillDispatch},
-    operator::{GdlDownstream, GdlOperator, detached, native},
+    operator::{GdlDownstream, GdlOperator, boxed_work, native},
     protocols::common::{
         extensions::{SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId},
         llm_backend::{LLMEngineOutput, PreprocessedRequest},
@@ -437,15 +437,13 @@ impl gdl::Operator for GdlOperator<PrefillRouter, PreprocessedRequest> {
                         .await
                 }
                 PrefillGate::Pending => Err(router.reject_while_activating(request.id())),
-                // Remote prefill stages KV on the prefill worker that only the decode leg
-                // releases, and gdl drops this future when a kill cancels the request's `cx`.
-                // So the route runs as a task that the drop detaches, and its decode leg runs
-                // under a cleanup `Cx` that the kill does not cancel (`send_cleanup`). The
-                // route's first send goes on in this request's box.
+                // The route's first send goes on in this request's box. Its decode leg, which
+                // releases the KV staged on the prefill worker, runs under a cleanup `Cx`
+                // (`send_cleanup`).
                 gate @ PrefillGate::Prefill => {
                     let (request, spare) = request.take();
                     let next = GdlDownstream::with_spare(cx, next, spare);
-                    detached(async move { router.route(request, next, gate).await }).await
+                    boxed_work(async move { router.route(request, next, gate).await }).await
                 }
             }
         }
@@ -2056,8 +2054,6 @@ mod tests {
     }
 
     /// The decode calls `decode` has seen, once it has seen `count` or 5 seconds have passed.
-    /// On gdl a kill cancels the request's `Cx`, so the call can return before the route's
-    /// task has sent the decode leg.
     async fn decode_calls(decode: &CleanupDecode, count: usize) -> Vec<(bool, bool)> {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while decode.requests.lock().len() < count {
@@ -2068,10 +2064,9 @@ mod tests {
         decode.requests.lock().clone()
     }
 
-    /// A caller killed at the prefill handoff, on pipeline C composed on gdl: the kill cancels
-    /// the pipeline's `Cx`, so gdl drops the in-flight future of every stage. The prefill
-    /// router's route must still send the decode leg that releases the staged KV, with the
-    /// caller's killed context and its cleanup obligation.
+    /// A caller killed at the prefill handoff, on pipeline C: the prefill router's route must
+    /// still send the decode leg that releases the staged KV, with the caller's killed context
+    /// and its cleanup obligation.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pipeline_c_preserves_decode_cleanup_after_kill_at_prefill_handoff() {
         use crate::http::service::metrics::Metrics;
@@ -2407,8 +2402,7 @@ mod tests {
 
     /// A kill while the prefill leg is still dispatching, and then a handoff: the prefill leg
     /// was not killed, so it hands off, and the decode leg that releases the staged KV is sent
-    /// with the killed context and its cleanup obligation. The kill cancels the pipeline, so the
-    /// call ends as `Cancelled` before prefill finishes.
+    /// with the killed context and its cleanup obligation. The call ends after prefill finishes.
     #[tokio::test]
     async fn a_kill_before_the_prefill_handoff_still_sends_the_decode_cleanup() {
         use crate::http::service::metrics::Metrics;
@@ -2491,12 +2485,11 @@ mod tests {
             .unwrap();
         caller.kill();
         assert!(!prefill.is_killed());
-        let result = tokio::time::timeout(Duration::from_secs(5), call)
-            .await
-            .expect("the edge cancels before prefill finishes")
-            .unwrap();
-        assert_eq!(result, "error Some(Cancelled), migratable false");
         release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .expect("the caller ends after prefill finishes")
+            .unwrap();
         let decode_calls = decode_calls(&decode, 1).await;
         runtime.shutdown();
         assert_eq!(decode_calls, [(true, true)]);
@@ -2504,8 +2497,8 @@ mod tests {
 
     /// A client disconnect while the prefill leg is still dispatching, before any handoff. The
     /// prefill leg runs under a context of its own that the kill does not reach, so its dispatch
-    /// goes on. The kill cancels the pipeline, the call ends at once as `Cancelled`, and the
-    /// route goes on as a detached task. Decode is never reached: the prefill gave no handoff.
+    /// goes on, and the call ends when the prefill dispatch returns. Decode is never reached: the
+    /// prefill gave no handoff.
     #[tokio::test]
     async fn a_kill_before_the_prefill_handoff_leaves_the_prefill_leg_running() {
         use crate::http::service::metrics::Metrics;
@@ -2615,16 +2608,108 @@ mod tests {
         .expect("the released dispatch ends");
         let decode_calls = decode.requests.lock().len();
         runtime.shutdown();
-        // The call ends at the kill; the prefill leg runs on, unkilled, and decode is never
-        // reached.
+        // The call ends when the prefill dispatch returns; the prefill leg runs on, unkilled,
+        // and decode is never reached.
         assert_eq!(
             (prefill_live, at_once, after_release, decode_calls),
             (
                 true,
-                Some("error Some(Cancelled), migratable false".to_string()),
                 None,
+                Some("error None, migratable false".to_string()),
                 0
             )
         );
+    }
+
+    /// A client disconnect while the prefill leg is still dispatching: the HTTP handler drops
+    /// the call. The route runs inside the call, so the drop ends the prefill dispatch too, and
+    /// decode is never reached.
+    #[tokio::test]
+    async fn dropping_the_call_before_the_prefill_handoff_drops_the_prefill_dispatch() {
+        use crate::http::service::metrics::Metrics;
+        use crate::model_card::ModelDeploymentCard;
+        use dynamo_runtime::{DistributedRuntime, Runtime, distributed::DistributedConfig};
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        struct Dropped(Arc<AtomicBool>);
+
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        struct HeldPrefill {
+            entered: tokio::sync::mpsc::UnboundedSender<()>,
+            dropped: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl
+            dynamo_runtime::pipeline::StreamingDispatch<
+                PreprocessedRequest,
+                Annotated<LLMEngineOutput>,
+            > for HeldPrefill
+        {
+            async fn generate(
+                &self,
+                _request: SingleIn<dynamo_runtime::pipeline::AddressedRequest<PreprocessedRequest>>,
+            ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+                let _guard = Dropped(self.dropped.clone());
+                self.entered.send(()).unwrap();
+                std::future::pending().await
+            }
+
+            async fn generate_bidirectional(
+                &self,
+                _: dynamo_runtime::component::Instance,
+                _: String,
+                _: dynamo_runtime::pipeline::ManyIn<PreprocessedRequest>,
+            ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+                unreachable!("prefill dispatch takes a single request")
+            }
+        }
+
+        let runtime = Runtime::from_current().unwrap();
+        let distributed =
+            DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+                .await
+                .unwrap();
+        let card =
+            ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
+                .unwrap();
+        let (entered, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (routing, decode) = prefill_routing(
+            &distributed,
+            "drop-before-handoff",
+            Arc::new(HeldPrefill {
+                entered,
+                dropped: dropped.clone(),
+            }),
+        )
+        .await;
+        let pipeline = routing
+            .build_preprocessed_pipeline(&card, 0, None, Arc::new(Metrics::new()))
+            .unwrap();
+        let request = Context::new(inference_request());
+        let call = tokio::spawn(async move { pipeline.generate(request).await.map(|_| ()) });
+        tokio::time::timeout(Duration::from_secs(5), arrivals.recv())
+            .await
+            .expect("prefill enters dispatch")
+            .unwrap();
+        call.abort();
+        let _ = call.await;
+        let ended = tokio::time::timeout(Duration::from_secs(2), async {
+            while !dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        let decode_calls = decode.requests.lock().len();
+        runtime.shutdown();
+        assert_eq!((ended, decode_calls), (true, 0));
     }
 }

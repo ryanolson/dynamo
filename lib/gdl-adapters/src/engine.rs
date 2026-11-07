@@ -38,8 +38,6 @@ use crate::request::Carried;
 pub struct PipelineEngine<N, Req, T, R = SingleIn<Req>> {
     next: N,
     /// Whether a kill of the request cancels the `Cx` (see [`CxBridge`]).
-    ///
-    /// Transition: remove when no Dynamo stage runs inside a gdl pipeline.
     cancel_on_kill: bool,
     types: PhantomData<fn(Req, R) -> T>,
 }
@@ -58,9 +56,8 @@ impl<N, Req, T, R> PipelineEngine<N, Req, T, R> {
     /// Wrap a gdl pipeline with a Dynamo engine in it: a kill reaches the
     /// engine through the request's context only, so gdl does not drop its
     /// call, and the request ends as the engine ends it
-    /// ([`CxBridge::cx_for_dynamo_stages`]).
-    ///
-    /// Transition: remove when no Dynamo stage runs inside a gdl pipeline.
+    /// ([`CxBridge::cx_for_dynamo_stages`]). Every frontend pipeline is rooted
+    /// with it, so a kill ends a request as Dynamo's operators end it.
     pub fn for_dynamo_stages(next: N) -> Self {
         Self {
             next,

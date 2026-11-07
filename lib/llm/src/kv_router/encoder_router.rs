@@ -21,7 +21,7 @@ use dynamo_runtime::{
 };
 
 use crate::discovery::{WorkerSetTarget, WorkerSetTargetId};
-use crate::operator::{GdlDownstream, GdlOperator, detached, native};
+use crate::operator::{GdlDownstream, GdlOperator, boxed_work, native};
 use crate::protocols::common::{
     llm_backend::{LLMEngineOutput, PreprocessedRequest},
     preprocessor::TraceLink,
@@ -405,10 +405,8 @@ impl gdl::Operator for GdlOperator<EncoderRouter, PreprocessedRequest> {
             // The body sends the request on in the box it came in.
             let (request, spare) = request.take();
             let next = GdlDownstream::with_spare(cx, next, spare);
-            // The encode worker's transfer handle must reach the stage below, and gdl drops
-            // this future when a kill cancels the request's `cx`. So the encode runs as a task
-            // that the drop detaches, and the handle goes on under a cleanup `Cx`.
-            detached(async move { router.encode(request, next).await }).await
+            // The handle the encode worker returns goes on under a cleanup `Cx`.
+            boxed_work(async move { router.encode(request, next).await }).await
         }
         .map(native)
     }
@@ -1278,7 +1276,7 @@ mod tests {
             receiver.results.lock().unwrap().clear();
             let request = Context::new(multimodal_request());
             *caller.lock().unwrap() = Some(request.context());
-            let cx = CxBridge::cx(request.controller());
+            let cx = CxBridge::cx_for_dynamo_stages(request.controller());
             if let Ok(items) = pipeline.generate(cx, Box::new(request)).await {
                 let _: Vec<_> = items.collect().await;
             }

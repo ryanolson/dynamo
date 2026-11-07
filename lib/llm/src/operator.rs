@@ -30,7 +30,6 @@ use dynamo_runtime::engine::Data;
 use dynamo_runtime::pipeline::{AsyncEngineContextProvider, SingleIn};
 use dynamo_runtime::protocols::annotated::Annotated;
 use futures::FutureExt;
-use tracing::Instrument;
 
 #[cfg(test)]
 pub(crate) mod testing;
@@ -216,26 +215,14 @@ impl<O, K> GdlOperator<O, K> {
     }
 }
 
-/// Run `work` as a task that a drop of the caller's future detaches rather than cancels, and
-/// wait for its result: for a native operator whose work must outlive a gdl cancel, which
-/// drops the operator's future. A panic in `work` resumes in the caller.
-///
-/// Not an `async fn`: the task starts here, so the future the caller holds is the task's
-/// handle alone, not `work` as well. `work` is boxed, one allocation per call: a router's work
-/// holds the stages below it, and the task's future type would otherwise nest all of them
-/// inside tokio's task wrappers, deeper than the compiler's recursion limit.
-pub(crate) fn detached<T: Send + 'static>(
+/// `work` on the heap, run in the caller's future: a drop of that future cancels it, as a drop
+/// of Dynamo's call cancels the route inside it. One allocation per call: a router's work holds
+/// the stages below it, and held inline its future type nests all of them, deeper than the
+/// compiler's recursion limit.
+pub(crate) fn boxed_work<T: Send + 'static>(
     work: impl Future<Output = anyhow::Result<T>> + Send + 'static,
-) -> impl Future<Output = anyhow::Result<T>> + Send {
-    let work: Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send>> = Box::pin(work);
-    let task = tokio::spawn(work.instrument(tracing::Span::current()));
-    async move {
-        match task.await {
-            Ok(result) => result,
-            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-            Err(error) => Err(anyhow::Error::new(error).context("detached operator task ended")),
-        }
-    }
+) -> Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send>> {
+    Box::pin(work)
 }
 
 /// A body's error as a native operator's: an error that came from below leaves as the same

@@ -106,7 +106,7 @@ where
     T: Data,
     R: Carried<Req>,
 {
-    // Transition: root with PipelineEngine::new when no Dynamo stage runs inside a gdl pipeline.
+    // Rooted as every frontend pipeline is: a kill does not cancel the `Cx`.
     Arc::new(PipelineEngine::<_, Req, T, R>::for_dynamo_stages(
         Source::new(next),
     ))
