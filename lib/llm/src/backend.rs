@@ -97,6 +97,27 @@ struct DecoderState<S> {
     context: Arc<dyn AsyncEngineContext>,
 }
 
+impl DecoderState<()> {
+    /// The state reading `stream`, the engine's response to the request it was built for.
+    fn reading<S>(self, stream: S) -> DecoderState<S> {
+        DecoderState {
+            stream,
+            decoders: self.decoders,
+            finished_choices: self.finished_choices,
+            validate_engine_decode: self.validate_engine_decode,
+            no_stop_trim: self.no_stop_trim,
+            retain_model_stop_token_text: self.retain_model_stop_token_text,
+            finished: self.finished,
+            tokenizer: self.tokenizer,
+            skip_special_tokens: self.skip_special_tokens,
+            pending_flush: self.pending_flush,
+            stream_ended: self.stream_ended,
+            migration_possible: self.migration_possible,
+            context: self.context,
+        }
+    }
+}
+
 /// Decodes one vocabulary ID for per-token logprob metadata.
 ///
 /// This intentionally uses single-ID decode rather than incremental content decode: the
@@ -205,12 +226,13 @@ impl Backend {
         }
     }
 
-    fn decoder<S>(
+    /// The decoders for one request, before its stream: the check that the request can be
+    /// decoded at all (a tokenizer, and a migration checkpoint that fits the prompt).
+    fn decoder(
         &self,
-        stream: S,
         params: DecoderParams,
         context: Arc<dyn AsyncEngineContext>,
-    ) -> anyhow::Result<DecoderState<S>> {
+    ) -> anyhow::Result<DecoderState<()>> {
         let Some(tokenizer) = self.tokenizer.as_ref() else {
             anyhow::bail!("Backend built from blank ModelDeploymentCard, no tokenizer");
         };
@@ -225,7 +247,7 @@ impl Backend {
         }
 
         Ok(DecoderState {
-            stream,
+            stream: (),
             decoders,
             finished_choices: HashSet::new(),
             validate_engine_decode: self.validate_engine_decode,
@@ -256,13 +278,14 @@ impl
         request: SingleIn<PreprocessedRequest>,
         next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
     ) -> Result<ManyOut<Annotated<BackendOutput>>> {
-        let decoder_params = DecoderParams::from_request(&request);
-        let request_context = request.context();
+        // Checked before the request is sent on: a request this Backend cannot decode never
+        // reaches the engine, and an eager error below cannot hide the reason.
+        let state = self.decoder(DecoderParams::from_request(&request), request.context())?;
 
         let next_stream = next.generate(request).await?;
 
         let context = next_stream.context();
-        let state = self.decoder(next_stream, decoder_params, request_context)?;
+        let state = state.reading(next_stream);
 
         Ok(ResponseStream::new(
             Box::pin(DecoderStream { state: Some(state) }),
@@ -3155,6 +3178,49 @@ mod tests {
             finish_reasons(&outputs),
             vec![FinishReason::Stop],
             "{outputs:?}"
+        );
+    }
+
+    /// An engine that counts its calls and fails each one eagerly.
+    #[derive(Default)]
+    struct CountingFailEngine {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>, Error>
+        for CountingFailEngine
+    {
+        async fn generate(
+            &self,
+            _request: SingleIn<PreprocessedRequest>,
+        ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(anyhow::anyhow!("the engine is unavailable"))
+        }
+    }
+
+    /// A Backend that cannot decode (no tokenizer) fails before it sends the request on: the
+    /// engine is never called, and its eager error cannot hide the reason.
+    #[tokio::test]
+    async fn a_backend_that_cannot_decode_fails_before_dispatch() {
+        let backend = Backend::from_mdc(&ModelDeploymentCard::with_name_only("blank"));
+        let engine = Arc::new(CountingFailEngine::default());
+        let next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
+            engine.clone();
+        let error =
+            match Operator::generate(backend.as_ref(), SingleIn::new(jailing_request(1)), next)
+                .await
+            {
+                Ok(_) => panic!("a Backend without a tokenizer must fail"),
+                Err(error) => error,
+            };
+        assert!(error.to_string().contains("no tokenizer"), "{error:#}");
+        assert_eq!(
+            engine.calls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the engine must not be called"
         );
     }
 }
