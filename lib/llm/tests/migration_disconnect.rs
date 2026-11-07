@@ -158,7 +158,6 @@ async fn rest<T: Data>(stream: ManyOut<T>) -> Vec<T> {
         .expect("the stream ends")
 }
 
-
 /// Every migration outcome `metrics` recorded, as `type/outcome xN`.
 fn migration_outcomes(metrics: &Metrics) -> Vec<String> {
     use dynamo_runtime::metrics::prometheus_names::frontend_service::{
