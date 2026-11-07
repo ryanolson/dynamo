@@ -591,7 +591,7 @@ fn parse_fixed_hex<const N: usize>(value: &str) -> Result<[u8; N], IdentityParse
     }
 
     let mut result = [0; N];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = hex_nibble(pair[0]);
         let low = hex_nibble(pair[1]);
         result[index] = high << 4 | low;

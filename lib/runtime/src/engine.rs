@@ -154,10 +154,10 @@ pub trait AsyncEngineContext: Send + Sync + Debug {
     fn kill(&self);
 
     /// Links child AsyncEngineContext to this AsyncEngineContext. If the `stop_generating`, `stop`
-    /// or `kill` on this AsyncEngineContext is called, this AsyncEngineContext publishes its new
-    /// state first, and then the same method is called on all linked child AsyncEngineContext, in
-    /// the order they are linked. So a child linked while a signal is under way is either told,
-    /// or reads the new state when it checks this AsyncEngineContext after linking.
+    /// or `kill` on this AsyncEngineContext is called, the same method is called on all linked
+    /// child AsyncEngineContext, in the order they are linked. Dynamo's `Controller` publishes its
+    /// own new state before it tells the children, so a child linked while a signal is under way
+    /// is either told, or reads the new state when it checks the Controller after linking.
     fn link_child(&self, child: Arc<dyn AsyncEngineContext>);
 
     /// Retain request-scoped state until the engine context is dropped.
@@ -234,7 +234,18 @@ pub struct ResponseStream<R: Data> {
 
 impl<R: Data> ResponseStream<R> {
     pub fn new(stream: DataStream<R>, ctx: Arc<dyn AsyncEngineContext>) -> Pin<Box<Self>> {
-        Box::pin(Self { stream, ctx })
+        Box::pin(Self::from_parts(stream, ctx))
+    }
+
+    /// A response stream not yet boxed, for a caller that may take it apart again with
+    /// [`into_parts`](Self::into_parts) instead of boxing it as a [`ManyOut`](crate::pipeline::ManyOut).
+    pub fn from_parts(stream: DataStream<R>, ctx: Arc<dyn AsyncEngineContext>) -> Self {
+        Self { stream, ctx }
+    }
+
+    /// The stream and the context the response stream holds.
+    pub fn into_parts(self) -> (DataStream<R>, Arc<dyn AsyncEngineContext>) {
+        (self.stream, self.ctx)
     }
 }
 
@@ -441,6 +452,22 @@ impl DowncastAnyAsyncEngine for Arc<dyn AnyAsyncEngine> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// A response stream taken apart gives back the stream and the context it was built from,
+    /// and the stream still reads the same items.
+    #[tokio::test]
+    async fn response_stream_parts_round_trip() {
+        use futures::StreamExt;
+        let ctx: Arc<dyn AsyncEngineContext> = crate::pipeline::Context::new(()).context();
+        let response = ResponseStream::from_parts(
+            Box::pin(futures::stream::iter([1u32, 2, 3])),
+            Arc::clone(&ctx),
+        );
+        assert_eq!(response.context().id(), ctx.id());
+        let (stream, parts_ctx) = response.into_parts();
+        assert!(Arc::ptr_eq(&parts_ctx, &ctx));
+        assert_eq!(stream.collect::<Vec<_>>().await, [1, 2, 3]);
+    }
 
     // 1. Define mock data structures
     #[derive(Debug, PartialEq)]

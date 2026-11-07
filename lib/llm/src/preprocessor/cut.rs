@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The chat and completions preprocessors' closing output after a request is killed.
+//! The chat and completions preprocessors' closing output after a request is cut short.
 //!
-//! A killed request can end its response stream cleanly, as if it had finished. The
-//! preprocessor's response transform decides once, where its input ends, whether the request
-//! was killed, and then writes no usage chunk. The response parsers above it (reasoning, tool calls, the jail of the published
+//! A request that is killed or passes its deadline ends its response stream cleanly, as if it
+//! had finished (see [`dynamo_gdl_adapters::cut_short`]). The preprocessor's response transform
+//! decides once, where its input ends, whether the request was cut short, and then writes no
+//! usage chunk. The response parsers above it (reasoning, tool calls, the jail of the published
 //! `dynamo-parsers`) write on their own input's end and cannot be asked, so the decision reaches
 //! them as a [`CutFlag`], and [`UntilCut`] ends their output where it is set.
 
@@ -14,12 +15,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, ready};
 
+use dynamo_gdl_adapters::CutShort;
 use futures::Stream;
 
-/// The payload capture's drop reason for a killed request.
+/// The payload capture's drop reason for a request cut short.
 pub(super) const DROP_CUT_SHORT: &str = "request_cut_short";
 
-/// The decision that a request was killed, shared by the stage that makes it and the stages
+/// The decision that a request was cut short, shared by the stage that makes it and the stages
 /// that write on end. One allocation per request, made only where such a stage runs.
 #[derive(Clone, Debug, Default)]
 pub(super) struct CutFlag(Arc<AtomicBool>);
@@ -36,8 +38,8 @@ impl CutFlag {
     }
 }
 
-/// `S` until `cut` is set, then ended: what `S` writes after the stage below it saw a killed
-/// request is closing output, and is dropped.
+/// `S` until `cut` is set, then ended: what `S` writes after the stage below it saw a request
+/// cut short is closing output, and is dropped.
 ///
 /// Per item it reads the flag once, a load. It runs only on a request with response parsers,
 /// which cost far more per item.
@@ -74,30 +76,40 @@ impl<S: Stream + Unpin> Stream for UntilCut<S> {
     }
 }
 
-/// What the response transform does when its input ends after the request was killed.
-pub(super) enum OnKill {
-    /// Nothing: the caller drives the transform with a stream of its own, and no request is
-    /// behind it.
-    Ignore,
-    /// End with no usage chunk, and set the flag, when given, so the stages above that write on
-    /// end stop too ([`UntilCut`]).
-    End(Option<CutFlag>),
+/// A response stream with no request behind it to cut short, for the public response
+/// transform that tests and benchmarks drive with streams of their own.
+pub(super) struct NeverCut<S>(pub(super) S);
+
+impl<S: Stream + Unpin> Stream for NeverCut<S> {
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<S::Item>> {
+        Pin::new(&mut self.0).poll_next(cx)
+    }
+}
+
+impl<S> CutShort for NeverCut<S> {
+    fn cut_short(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use dynamo_runtime::engine::{AsyncEngine, AsyncEngineContext, ResponseStream};
     use dynamo_runtime::pipeline::{
-        AsyncEngineContextProvider, Context, Error, ManyOut, Operator, SingleIn, async_trait,
+        AsyncEngineContextProvider, Context, Error, ManyOut, SingleIn, async_trait,
     };
     use dynamo_runtime::protocols::annotated::Annotated;
     use futures::{StreamExt, stream};
+    use gdl::Around;
     use serde::Serialize;
 
     use crate::model_card::ModelDeploymentCard;
-    use crate::preprocessor::OpenAIPreprocessor;
+    use crate::preprocessor::{BelowEngine, OpenAIPreprocessor, PreprocessorNode};
     use crate::protocols::common::llm_backend::{BackendOutput, FinishReason, PreprocessedRequest};
     use crate::protocols::openai::chat_completions::NvCreateChatCompletionRequest;
     use crate::protocols::openai::completions::NvCreateCompletionRequest;
@@ -267,19 +279,62 @@ mod tests {
     where
         Req: dynamo_runtime::engine::Data,
         Resp: dynamo_runtime::engine::Data,
-        OpenAIPreprocessor: Operator<
-                SingleIn<Req>,
-                ManyOut<Annotated<Resp>>,
-                SingleIn<PreprocessedRequest>,
-                ManyOut<Annotated<BackendOutput>>,
+        PreprocessorNode<Req>: gdl::Around<
+                UpReq = dynamo_gdl_adapters::Boxed<Req>,
+                UpItem = Annotated<Resp>,
+                DownReq = dynamo_gdl_adapters::Boxed<PreprocessedRequest>,
+                DownItem = Annotated<BackendOutput>,
             >,
     {
         let below = Arc::new(SignalAtEnd { outputs, at_end });
-        Operator::generate(preprocessor.as_ref(), Context::new(request), below)
+        crate::operator::testing::preprocessor::<Req, Resp>(preprocessor, below)
+            .generate(Context::new(request))
             .await
             .expect("the preprocessor accepts the request")
             .collect()
             .await
+    }
+
+    /// The request's response from the preprocessor node alone under `cx`, over stages whose
+    /// stream sends `outputs` and ends cleanly. No Dynamo caller sets a deadline on a gdl
+    /// request, so a deadline test drives the node with a `Cx` that has one.
+    async fn through_node<Req, Resp>(
+        preprocessor: Arc<OpenAIPreprocessor>,
+        request: Req,
+        outputs: Vec<BackendOutput>,
+        cx: &gdl::Cx,
+    ) -> Vec<Annotated<Resp>>
+    where
+        Req: dynamo_runtime::engine::Data,
+        PreprocessorNode<Req>: gdl::Around<
+                UpReq = dynamo_gdl_adapters::Boxed<Req>,
+                UpItem = Annotated<Resp>,
+                DownReq = dynamo_gdl_adapters::Boxed<PreprocessedRequest>,
+                DownItem = Annotated<BackendOutput>,
+            >,
+    {
+        let below: BelowEngine = Arc::new(SignalAtEnd {
+            outputs: vec![],
+            at_end: |_| {},
+        });
+        let node = PreprocessorNode::<Req>::new(preprocessor, below);
+        let (_sent, state) = node
+            .forward(cx, Box::new(Context::new(request)))
+            .await
+            .unwrap_or_else(|_| panic!("the preprocessor accepts the request"));
+        let input = gdl::items(stream::iter(
+            outputs
+                .into_iter()
+                .map(|output| Ok(Annotated::from_data(output))),
+        ));
+        node.backward(cx, state, input)
+            .map(|item| item.unwrap_or_else(|_| panic!("the node ends no stream with an `Err`")))
+            .collect()
+            .await
+    }
+
+    fn past_deadline() -> gdl::Cx {
+        gdl::Cx::new().with_timeout(Duration::ZERO)
     }
 
     fn finished(usage_chunks: usize) -> Markers {
@@ -323,6 +378,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_writes_no_usage_chunk_after_the_deadline() {
+        let control = through_node::<
+            _,
+            crate::types::openai::chat_completions::NvCreateChatCompletionStreamResponse,
+        >(
+            preprocessor(TINY_LLAMA, None),
+            chat_request(),
+            finished_answer(),
+            &gdl::Cx::new(),
+        )
+        .await;
+        assert_eq!(markers(&control), finished(1), "{control:?}");
+
+        let items = through_node::<
+            _,
+            crate::types::openai::chat_completions::NvCreateChatCompletionStreamResponse,
+        >(
+            preprocessor(TINY_LLAMA, None),
+            chat_request(),
+            finished_answer(),
+            &past_deadline(),
+        )
+        .await;
+        assert_eq!(markers(&items), finished(0), "{items:?}");
+    }
+
+    #[tokio::test]
     async fn completion_writes_no_usage_chunk_after_a_kill() {
         let items =
             through_pipeline::<_, crate::types::openai::completions::NvCreateCompletionResponse>(
@@ -348,6 +430,29 @@ mod tests {
         assert_eq!(markers(&items), finished(1), "{items:?}");
     }
 
+    #[tokio::test]
+    async fn completion_writes_no_usage_chunk_after_the_deadline() {
+        let control =
+            through_node::<_, crate::types::openai::completions::NvCreateCompletionResponse>(
+                preprocessor(TINY_LLAMA, None),
+                completion_request(),
+                finished_answer(),
+                &gdl::Cx::new(),
+            )
+            .await;
+        assert_eq!(markers(&control), finished(1), "{control:?}");
+
+        let items =
+            through_node::<_, crate::types::openai::completions::NvCreateCompletionResponse>(
+                preprocessor(TINY_LLAMA, None),
+                completion_request(),
+                finished_answer(),
+                &past_deadline(),
+            )
+            .await;
+        assert_eq!(markers(&items), finished(0), "{items:?}");
+    }
+
     /// What the tool-call jail writes when the stream ends with a call still open.
     async fn jail_after(at_end: fn(&dyn AsyncEngineContext)) -> Markers {
         let items = through_pipeline::<
@@ -370,6 +475,25 @@ mod tests {
         let stopped = jail_after(stop).await;
         assert_ne!(stopped, Markers::default(), "the control must write on end");
         assert_eq!(jail_after(kill).await, Markers::default());
+    }
+
+    #[tokio::test]
+    async fn the_jail_writes_no_tool_call_or_finish_after_the_deadline() {
+        let jail = |cx: gdl::Cx| async move {
+            let items = through_node::<
+                _,
+                crate::types::openai::chat_completions::NvCreateChatCompletionStreamResponse,
+            >(
+                preprocessor(TOOL_MODEL, Some("hermes")),
+                tool_request(),
+                open_tool_call(),
+                &cx,
+            )
+            .await;
+            markers(&items)
+        };
+        assert_ne!(jail(gdl::Cx::new()).await, Markers::default());
+        assert_eq!(jail(past_deadline()).await, Markers::default());
     }
 
     #[tokio::test]
@@ -398,11 +522,11 @@ mod tests {
                 outputs: vec![output(r#"{"input":"print(1"#, None)],
                 at_end,
             });
-            let preprocessor = preprocessor(TOOL_MODEL, None);
-            let stream: ManyOut<Annotated<NvCreateChatCompletionStreamResponse>> =
-                Operator::generate(preprocessor.as_ref(), Context::new(request), below)
-                    .await
-                    .unwrap();
+            let pipeline = crate::operator::testing::preprocessor::<
+                _,
+                NvCreateChatCompletionStreamResponse,
+            >(preprocessor(TOOL_MODEL, None), below);
+            let stream = pipeline.generate(Context::new(request)).await.unwrap();
             let context = stream.context();
             custom_tools.stream(stream, context).collect().await
         }
@@ -415,6 +539,83 @@ mod tests {
         assert!(
             killed.iter().all(|item| !item.is_error()),
             "a killed custom-tool stream must end quietly: {killed:?}"
+        );
+    }
+
+    /// The payload record of a chat request whose stream sends [`finished_answer`] and then
+    /// does `at_end`: whether the payload is complete, and its drop reason.
+    async fn payload_after(
+        request_id: &str,
+        at_end: fn(&dyn AsyncEngineContext),
+    ) -> (bool, Option<String>) {
+        use crate::request_trace::{RequestTraceEventType, subscribe};
+        let mut records = subscribe();
+        let preprocessor = preprocessor(TINY_LLAMA, None);
+        let mut request = chat_request();
+        let context = Context::with_id_and_metadata((), request_id.to_string(), Default::default());
+        let controller = context.context();
+        let (_, mut state, _) = preprocessor
+            .chat_forward(&mut request, context)
+            .await
+            .unwrap();
+        state.payload_handle = Some(
+            crate::request_trace::payload::RequestPayloadHandle::for_test(
+                request_id,
+                "test-model",
+                true,
+            ),
+        );
+        state.payload_parsing_options =
+            Some(crate::protocols::openai::ParsingOptions::new(None, None));
+        let signalled = controller.clone();
+        let end = stream::poll_fn(move |_| {
+            at_end(signalled.as_ref());
+            std::task::Poll::Ready(None)
+        });
+        let input = stream::iter(
+            finished_answer()
+                .into_iter()
+                .map(|o| Ok(Annotated::from_data(o))),
+        )
+        .chain(end);
+        let input = dynamo_gdl_adapters::AnnotatedItems::new(
+            gdl::items(input),
+            gdl::Cx::new(),
+            controller.clone(),
+        );
+        let _: Vec<_> = preprocessor
+            .chat_backward(&request, state, None, input, controller, || {
+                panic!("this request does not enable speculative prefill")
+            })
+            .collect()
+            .await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let record = records.recv().await.expect("the trace bus is open");
+                if record.event_type != RequestTraceEventType::RequestPayload {
+                    continue;
+                }
+                let Some(payload) = record.payload else {
+                    continue;
+                };
+                if payload.request_id == request_id {
+                    return (payload.payload_complete, payload.payload_drop_reason);
+                }
+            }
+        })
+        .await
+        .expect("the payload record arrives")
+    }
+
+    /// The payload capture records a request cut short as incomplete, not as a finished one.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_payload_capture_records_a_killed_request_as_cut_short() {
+        crate::request_trace::init_bus_for_test(16);
+        assert_eq!(payload_after("payload-stopped", stop).await, (true, None));
+        assert_eq!(
+            payload_after("payload-killed", kill).await,
+            (false, Some(super::DROP_CUT_SHORT.to_string()))
         );
     }
 }

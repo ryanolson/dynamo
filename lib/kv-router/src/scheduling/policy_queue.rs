@@ -2082,8 +2082,8 @@ policy_classes:
         let dispatches = (0..80)
             .map(|_| queue.pop_next(|_, _, _| true).unwrap().into_payload())
             .collect::<Vec<_>>();
-        for round in dispatches.chunks_exact(4) {
-            assert_eq!(round, ["one", "three", "three", "three"]);
+        for round in dispatches.as_chunks::<4>().0 {
+            assert_eq!(*round, ["one", "three", "three", "three"]);
         }
     }
 

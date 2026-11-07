@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use super::{
     AsyncTransportEngine, Context, Data, Error, ManyIn, ManyOut, PipelineError, PipelineIO,
-    SegmentSource, ServiceBackend, ServiceEngine, SingleIn, Source, context,
+    ServiceEngine, SingleIn, context,
 };
 use crate::metrics::MetricsHierarchy;
 use crate::metrics::prometheus_names::work_handler;
@@ -1330,9 +1330,44 @@ where
     }
 }
 
+/// A worker's request-plane entry point for one engine.
+///
+/// Build it with [`Ingress::for_engine`] or one of its variants, which take the engine it
+/// serves:
+///
+/// ```
+/// use dynamo_runtime::pipeline::{ManyOut, ServiceEngine, SingleIn, network::Ingress};
+/// use dynamo_runtime::protocols::annotated::Annotated;
+///
+/// fn build(engine: ServiceEngine<SingleIn<String>, ManyOut<Annotated<String>>>) {
+///     let _ingress = Ingress::for_engine(engine).unwrap();
+/// }
+/// ```
+///
+/// There is no public way to build one without an engine, because nothing could set it
+/// afterwards and the first request would panic:
+///
+/// ```compile_fail,E0624
+/// use dynamo_runtime::pipeline::{ManyOut, SingleIn, network::Ingress};
+/// use dynamo_runtime::protocols::annotated::Annotated;
+///
+/// let _ingress = Ingress::<SingleIn<String>, ManyOut<Annotated<String>>>::new();
+/// ```
+///
+/// ```compile_fail,E0624
+/// use dynamo_runtime::pipeline::{
+///     ManyOut, SingleIn,
+///     network::{Ingress, SerdeIngressPayloadAdapter},
+/// };
+/// use dynamo_runtime::protocols::annotated::Annotated;
+///
+/// let _ingress = Ingress::<SingleIn<String>, ManyOut<Annotated<String>>>::new_with_adapter(
+///     SerdeIngressPayloadAdapter,
+/// );
+/// ```
 pub struct Ingress<Req: PipelineIO, Resp: PipelineIO, Adapter = SerdeIngressPayloadAdapter> {
-    /// Called directly for each request: the engine's stream is the call's
-    /// return value, so no response map sits between them.
+    /// Called directly for each request; the engine's stream is the call's
+    /// return value.
     engine: OnceLock<ServiceEngine<Req, Resp>>,
     /// Ids whose engine call has not returned; refuses a second request with one.
     in_flight_ids: ingress::inflight::InFlightIds,
@@ -1349,20 +1384,10 @@ pub struct Ingress<Req: PipelineIO, Resp: PipelineIO, Adapter = SerdeIngressPayl
 }
 
 impl<Req: PipelineIO + Sync, Resp: PipelineIO> Ingress<Req, Resp> {
-    pub fn new() -> Arc<Self> {
+    /// An ingress with no engine; a request that reaches it panics. Private so only the
+    /// `for_engine` constructors and tests that never reach the engine use it.
+    fn new() -> Arc<Self> {
         Ingress::new_with_adapter(SerdeIngressPayloadAdapter)
-    }
-
-    pub fn link(segment: Arc<SegmentSource<Req, Resp>>) -> Result<Arc<Self>> {
-        let ingress = Ingress::new();
-        ingress.attach(segment)?;
-        Ok(ingress)
-    }
-
-    pub fn for_pipeline(segment: Arc<SegmentSource<Req, Resp>>) -> Result<Arc<Self>> {
-        let ingress = Ingress::new();
-        ingress.attach(segment)?;
-        Ok(ingress)
     }
 
     pub fn for_engine(engine: ServiceEngine<Req, Resp>) -> Result<Arc<Self>> {
@@ -1384,7 +1409,8 @@ where
     Resp: PipelineIO,
     Adapter: Send + Sync + 'static,
 {
-    pub fn new_with_adapter(payload_adapter: Adapter) -> Arc<Self> {
+    /// An ingress with no engine, like [`Ingress::new`].
+    fn new_with_adapter(payload_adapter: Adapter) -> Arc<Self> {
         Arc::new(Self {
             engine: OnceLock::new(),
             in_flight_ids: Default::default(),
@@ -1412,10 +1438,6 @@ where
             .set(role)
             .expect("new ingress lifecycle role source must be empty");
         ingress
-    }
-
-    pub fn attach(&self, segment: Arc<SegmentSource<Req, Resp>>) -> Result<()> {
-        self.set_engine(segment)
     }
 
     fn set_engine(&self, engine: ServiceEngine<Req, Resp>) -> Result<()> {

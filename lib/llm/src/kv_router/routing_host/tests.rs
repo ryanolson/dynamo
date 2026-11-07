@@ -26,8 +26,8 @@ use dynamo_runtime::{
     distributed::{DiscoveryBackend, DistributedConfig, RequestPlaneMode},
     error::{BackendError, ErrorType, match_error_chain},
     pipeline::{
-        AddressedRequest, AsyncEngineContext, Context, ManyIn, Operator, RouterMode,
-        ServerStreamingEngine, StreamingDispatch, context::Controller,
+        AddressedRequest, AsyncEngineContext, Context, ManyIn, RouterMode, ServerStreamingEngine,
+        StreamingDispatch, context::Controller,
     },
     storage::kv::Selector,
     traits::DistributedRuntimeProvider,
@@ -47,6 +47,15 @@ use crate::{
         timing::RequestTracker,
     },
 };
+
+/// `migration` over `next` as the frontend's gdl pipeline runs it: a native operator over the
+/// hop to `next`.
+fn on_gdl(
+    migration: &Arc<Migration>,
+    next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
+) -> ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> {
+    crate::operator::testing::operator::<_, LLMEngineOutput, _, _, _>(migration.clone(), next)
+}
 
 fn request() -> PreprocessedRequest {
     PreprocessedRequest::builder()
@@ -2266,8 +2275,8 @@ async fn typed_classifier_rejection_reaches_client_without_migration() {
         let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
             Arc::new(router);
         let migration = Migration::new(2, None, "test".to_string(), Arc::new(Metrics::new()));
-        let client_error = match migration
-            .generate(Context::new(request()), engine.clone())
+        let client_error = match on_gdl(&migration, engine.clone())
+            .generate(Context::new(request()))
             .await
         {
             Ok(_) => panic!("typed rejection unexpectedly selected a worker"),
@@ -3675,8 +3684,8 @@ async fn worker_overload_stream_migration_releases_and_reselects() {
         two_worker_migration_harness("worker-overload-migration", dispatch.clone(), None).await;
     let migration = Migration::new(1, None, "test".to_string(), Arc::new(Metrics::new()));
 
-    let responses: Vec<_> = migration
-        .generate(Context::new(request()), harness.engine.clone())
+    let responses: Vec<_> = on_gdl(&migration, harness.engine.clone())
+        .generate(Context::new(request()))
         .await
         .unwrap()
         .collect()
@@ -3726,8 +3735,8 @@ async fn stream_migration_retry_continues_one_classifier_lifecycle() {
     .await;
     let migration = Migration::new(1, None, "test".to_string(), Arc::new(Metrics::new()));
 
-    let responses: Vec<_> = migration
-        .generate(Context::new(request()), harness.engine.clone())
+    let responses: Vec<_> = on_gdl(&migration, harness.engine.clone())
+        .generate(Context::new(request()))
         .await
         .unwrap()
         .collect()
@@ -3904,8 +3913,8 @@ async fn pinned_request_stream_failure_aborts_parked_lifecycle_with_cause() {
         ..Default::default()
     });
 
-    let responses: Vec<_> = migration
-        .generate(Context::new(content), harness.engine.clone())
+    let responses: Vec<_> = on_gdl(&migration, harness.engine.clone())
+        .generate(Context::new(content))
         .await
         .unwrap()
         .collect()
@@ -3998,8 +4007,8 @@ async fn exhausted_migration_aborts_parked_lifecycle_with_worker_failure() {
     .await;
     let migration = Migration::new(1, None, "test".to_string(), Arc::new(Metrics::new()));
 
-    let responses: Vec<_> = migration
-        .generate(Context::new(request()), harness.engine.clone())
+    let responses: Vec<_> = on_gdl(&migration, harness.engine.clone())
+        .generate(Context::new(request()))
         .await
         .unwrap()
         .collect()
@@ -4083,7 +4092,7 @@ async fn retry_dispatch_failure_releases_classifier_id(error_type: ErrorType) {
     let first = Context::with_id_and_metadata(request(), context_id.to_owned(), Default::default());
     let context = first.context();
     let migration = Migration::new(1, None, "test".to_owned(), Arc::new(Metrics::new()));
-    let mut failed_stream = migration.generate(first, engine).await.unwrap();
+    let mut failed_stream = on_gdl(&migration, engine).generate(first).await.unwrap();
     let terminal = tokio::time::timeout(Duration::from_secs(5), failed_stream.next())
         .await
         .expect("the failed retry returns its terminal error")
@@ -4206,10 +4215,12 @@ impl StreamingDispatch<PreprocessedRequest, Annotated<LLMEngineOutput>> for Unav
     }
 }
 
-/// What a client disconnect during Migration's retry records through pipeline C, when the first attempt's worker fails through `dispatch` and the host
-/// parks the classifier lifecycle for the retry: what the caller received with every
-/// migration outcome recorded, and the classifier's terminal events.
+/// What a client disconnect during Migration's retry records through pipeline C, when the
+/// first attempt's worker fails through `dispatch` and the host parks the classifier lifecycle
+/// for the retry: what the caller received with every migration outcome recorded, and the
+/// classifier's terminal events. `name` keeps each call's namespace apart.
 async fn kill_during_a_parked_retry(
+    name: &str,
     dispatch: Arc<dyn StreamingDispatch<PreprocessedRequest, Annotated<LLMEngineOutput>>>,
 ) -> (String, String) {
     use crate::entrypoint::input::PreprocessedRouting;
@@ -4223,7 +4234,7 @@ async fn kill_during_a_parked_retry(
         .unwrap();
     let (observations_tx, mut observations_rx) = mpsc::unbounded_channel();
     let harness = two_worker_migration_harness(
-        "kill-during-parked-retry",
+        &format!("kill-during-parked-retry-{name}"),
         dispatch,
         Some(RecordingClassifier {
             calls: Arc::new(AtomicUsize::new(0)),
@@ -4306,10 +4317,15 @@ async fn kill_during_a_parked_retry(
 /// A client disconnect while Migration's retry after an eager `WorkerUnavailable` is still
 /// dispatching, with the classifier lifecycle parked for that retry: Migration records the
 /// retry's outcome as `cancelled` once.
+///
+/// The retry is part of the call, so the kill drops Migration's future in flight and the call
+/// fails as `Cancelled` (`kill_during_dispatch` pins this). Only Migration's drop can then
+/// record the outcome.
 #[tokio::test]
 #[serial_test::serial]
 async fn a_kill_during_a_retry_at_dispatch_records_cancelled_once() {
-    let (outcome, _) = kill_during_a_parked_retry(Arc::new(UnavailableDispatch)).await;
+    let (outcome, _) =
+        kill_during_a_parked_retry("at-dispatch", Arc::new(UnavailableDispatch)).await;
     assert_eq!(
         outcome,
         "error Cancelled, outcomes [\"new_request/cancelled x1\"]"
@@ -4317,14 +4333,15 @@ async fn a_kill_during_a_retry_at_dispatch_records_cancelled_once() {
 }
 
 /// As [`a_kill_during_a_retry_at_dispatch_records_cancelled_once`], for a retry after a
-/// mid-stream failure: the call has returned, and the retry runs while the caller reads. The
-/// caller receives the failure that caused the retry, because the host fails the killed
+/// mid-stream failure: the call has returned, and the retry runs while the caller reads.
+/// The caller receives the failure that caused the retry, because the host fails the killed
 /// dispatch.
 #[tokio::test]
 #[serial_test::serial]
 async fn a_kill_during_a_retry_mid_stream_records_cancelled_once() {
     let (outcome, _) =
-        kill_during_a_parked_retry(Arc::new(AlwaysOverloadedDispatch::default())).await;
+        kill_during_a_parked_retry("mid-stream", Arc::new(AlwaysOverloadedDispatch::default()))
+            .await;
     assert_eq!(
         outcome,
         "1 items, outcomes [\"ongoing_request/cancelled x1\"]"
@@ -4337,21 +4354,31 @@ async fn a_kill_during_a_retry_mid_stream_records_cancelled_once() {
 #[serial_test::serial]
 async fn a_kill_during_a_retry_aborts_the_parked_lifecycle_with_its_cause() {
     let mut causes = Vec::new();
-    for dispatch in [
-        Arc::new(UnavailableDispatch)
-            as Arc<dyn StreamingDispatch<PreprocessedRequest, Annotated<LLMEngineOutput>>>,
-        Arc::new(AlwaysOverloadedDispatch::default()),
+    for (name, dispatch) in [
+        (
+            "at-dispatch",
+            Arc::new(UnavailableDispatch)
+                as Arc<dyn StreamingDispatch<PreprocessedRequest, Annotated<LLMEngineOutput>>>,
+        ),
+        ("mid-stream", Arc::new(AlwaysOverloadedDispatch::default())),
     ] {
-        let (_, cause) = kill_during_a_parked_retry(dispatch).await;
+        let (_, cause) = kill_during_a_parked_retry(name, dispatch).await;
         causes.push(cause);
     }
-    assert_eq!(causes, ["[Aborted { cause: Some(Cancelled) }]"; 2]);
+    assert_eq!(
+        causes,
+        [
+            "[Aborted { cause: Some(Cancelled) }]",
+            "[Aborted { cause: Some(Cancelled) }]",
+        ]
+    );
 }
 
 /// A remote prefill's route can send its decode leg, which releases the staged KV, after
-/// Migration has seen the kill. That leg takes the classifier lifecycle parked for the retry,
-/// so the request is classified once, for both retry shapes, when the hop answers the kill with
-/// an empty stream. Migration must leave the parked lifecycle to it.
+/// Migration has seen the kill: the route outlives the kill as a detached task. That leg takes
+/// the classifier lifecycle parked for the retry, so the request is classified once, for both
+/// retry shapes, when the hop answers the kill with an empty stream. Migration must leave the
+/// parked lifecycle to it.
 #[tokio::test]
 #[serial_test::serial]
 async fn killed_migration_preserves_one_classifier_lifecycle_through_detached_cleanup() {
@@ -4366,11 +4393,11 @@ async fn killed_migration_preserves_one_classifier_lifecycle_through_detached_cl
 /// hop fails the kill as `Cancelled`. Migration aborts the parked lifecycle at once on a
 /// cancelled dispatch, so that the request id is released
 /// (`cancelled_retry_dispatch_releases_classifier_id_before_stream_drop`), and the cleanup leg
-/// then classifies a second lifecycle on dynamo. No hop does this today: dynamo's prefill router
-/// waits for its decode leg before it returns.
+/// then classifies a second lifecycle. No hop does this today: the prefill router waits for its
+/// decode leg before it returns.
 #[tokio::test]
 #[serial_test::serial]
-#[ignore = "an Err(Cancelled) hop with a pending detached cleanup classifies twice on dynamo: \
+#[ignore = "an Err(Cancelled) hop with a pending detached cleanup classifies twice: \
             deferring the abort would hold the request id until the stream drops"]
 async fn a_cancelled_dispatch_preserves_one_classifier_lifecycle_through_detached_cleanup() {
     assert_eq!(
@@ -4418,7 +4445,7 @@ async fn detached_cleanup_classifications(fail_on_kill: bool) -> Vec<usize> {
             let host = self.host.clone();
             let release = self.release_cleanup.clone();
             let finished = self.cleanup_finished.clone();
-            // A detached leg, as a hop that runs its route as a task sends it: it survives the kill.
+            // The prefill router detaches its route; its decode cleanup survives the kill.
             tokio::spawn(async move {
                 release.notified().await;
                 if let Ok(stream) = host.generate(request).await {
@@ -4442,76 +4469,73 @@ async fn detached_cleanup_classifications(fail_on_kill: bool) -> Vec<usize> {
     let card = ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
         .unwrap();
     let mut classifications = Vec::new();
-    {
-        for eager_failure in [true, false] {
-            let calls = Arc::new(AtomicUsize::new(0));
-            let (observations, mut events) = mpsc::unbounded_channel();
-            let dispatch: Arc<
-                dyn StreamingDispatch<PreprocessedRequest, Annotated<LLMEngineOutput>>,
-            > = if eager_failure {
+    for eager_failure in [true, false] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (observations, mut events) = mpsc::unbounded_channel();
+        let dispatch: Arc<dyn StreamingDispatch<PreprocessedRequest, Annotated<LLMEngineOutput>>> =
+            if eager_failure {
                 Arc::new(UnavailableDispatch)
             } else {
                 Arc::new(RejectFirstDispatch::default())
             };
-            let harness = two_worker_migration_harness(
-                &format!("late-cleanup-{eager_failure}-{fail_on_kill}"),
-                dispatch,
-                Some(RecordingClassifier {
-                    calls: calls.clone(),
-                    observations,
-                }),
-            )
-            .await;
-            let release_cleanup = Arc::new(Notify::new());
-            let (retry_entered, mut retries) = mpsc::unbounded_channel();
-            let (cleanup_finished, mut finished) = mpsc::unbounded_channel();
-            let engine = Arc::new(LateCleanup {
-                host: harness.engine.clone(),
-                calls: AtomicUsize::new(0),
-                retry_entered,
-                release_cleanup: release_cleanup.clone(),
-                cleanup_finished,
-                fail_on_kill,
-            });
-            let pipeline = PreprocessedRouting::new(
-                engine,
-                PrefillRouter::disabled(
-                    Arc::new(crate::discovery::ModelManager::new()),
-                    RouterMode::KV,
-                    None,
-                ),
-                EncoderRouter::disabled(),
-            )
-            .build_preprocessed_pipeline(&card, 3, None, Arc::new(Metrics::new()))
+        let harness = two_worker_migration_harness(
+            &format!("late-cleanup-{eager_failure}-{fail_on_kill}"),
+            dispatch,
+            Some(RecordingClassifier {
+                calls: calls.clone(),
+                observations,
+            }),
+        )
+        .await;
+        let release_cleanup = Arc::new(Notify::new());
+        let (retry_entered, mut retries) = mpsc::unbounded_channel();
+        let (cleanup_finished, mut finished) = mpsc::unbounded_channel();
+        let engine = Arc::new(LateCleanup {
+            host: harness.engine.clone(),
+            calls: AtomicUsize::new(0),
+            retry_entered,
+            release_cleanup: release_cleanup.clone(),
+            cleanup_finished,
+            fail_on_kill,
+        });
+        let pipeline = PreprocessedRouting::new(
+            engine,
+            PrefillRouter::disabled(
+                Arc::new(crate::discovery::ModelManager::new()),
+                RouterMode::KV,
+                None,
+            ),
+            EncoderRouter::disabled(),
+        )
+        .build_preprocessed_pipeline(&card, 3, None, Arc::new(Metrics::new()))
+        .unwrap();
+        let request = Context::new(request());
+        let context = request.context();
+        let call = tokio::spawn(async move {
+            if let Ok(stream) = pipeline.generate(request).await {
+                stream.collect::<Vec<_>>().await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), retries.recv())
+            .await
+            .unwrap()
             .unwrap();
-            let request = Context::new(request());
-            let context = request.context();
-            let call = tokio::spawn(async move {
-                if let Ok(stream) = pipeline.generate(request).await {
-                    stream.collect::<Vec<_>>().await;
-                }
-            });
-            tokio::time::timeout(Duration::from_secs(5), retries.recv())
-                .await
-                .unwrap()
-                .unwrap();
-            context.kill();
-            tokio::time::timeout(Duration::from_secs(5), call)
-                .await
-                .unwrap()
-                .unwrap();
-            release_cleanup.notify_one();
-            tokio::time::timeout(Duration::from_secs(5), finished.recv())
-                .await
-                .expect("decode cleanup must finish after the kill")
-                .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), events.recv())
-                .await
-                .expect("the classifier must receive a terminal event")
-                .unwrap();
-            classifications.push(calls.load(Ordering::Acquire));
-            harness.runtime.shutdown();
-        }
+        context.kill();
+        tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .unwrap()
+            .unwrap();
+        release_cleanup.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), finished.recv())
+            .await
+            .expect("decode cleanup must finish after the kill")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("the classifier must receive a terminal event")
+            .unwrap();
+        classifications.push(calls.load(Ordering::Acquire));
+        harness.runtime.shutdown();
     }
     classifications
 }
@@ -4584,8 +4608,8 @@ async fn engine_shutdown_after_cancel_frame_migrates_and_reselects() {
         two_worker_migration_harness("engine-shutdown-migration", dispatch.clone(), None).await;
     let migration = Migration::new(1, None, "test".to_string(), Arc::new(Metrics::new()));
 
-    let responses: Vec<_> = migration
-        .generate(Context::new(request()), harness.engine.clone())
+    let responses: Vec<_> = on_gdl(&migration, harness.engine.clone())
+        .generate(Context::new(request()))
         .await
         .unwrap()
         .collect()
@@ -5528,6 +5552,135 @@ async fn committed_session_lease_lives_as_long_as_the_response_stream() {
     tokio::time::sleep(ttl + Duration::from_millis(300)).await;
     assert_eq!(affinity.query_target(&session_id, None).unwrap(), None);
     drop(router);
+    runtime.shutdown();
+}
+
+/// The host as the sink of a gdl local pipeline routes and dispatches as the host as a Dynamo
+/// engine does, and an eager error enters gdl with the host's error as its source.
+#[tokio::test]
+#[serial_test::serial]
+async fn the_host_as_a_gdl_sink_routes_as_the_dynamo_engine_does() {
+    use gdl::{Hop, SinkStage, Source};
+
+    let (router, dispatch, worker_id, runtime) =
+        router_with_recorded_dispatch("kv-gdl-sink-parity").await;
+    let router = Arc::new(router);
+    let pipeline = Source::new(Hop::new((), SinkStage::new(router.clone()), ()));
+
+    let engine: Vec<_> = AsyncEngine::generate(router.as_ref(), Context::new(request()))
+        .await
+        .unwrap()
+        .collect()
+        .await;
+    let sink: Vec<_> = pipeline
+        .call(gdl::Cx::new(), Box::new(Context::new(request())))
+        .await
+        .unwrap()
+        .map(|item| item.expect("an Annotated item"))
+        .collect()
+        .await;
+    assert_eq!(
+        serde_json::to_value(&engine).unwrap(),
+        serde_json::to_value(&sink).unwrap()
+    );
+    assert_eq!(*dispatch.worker_ids.lock().unwrap(), [worker_id, worker_id]);
+
+    let pinned = || {
+        let mut request = request();
+        request.routing_mut().backend_instance_id = Some(worker_id + 1);
+        Context::new(request)
+    };
+    let Err(engine) = AsyncEngine::generate(router.as_ref(), pinned()).await else {
+        panic!("the engine refuses an unknown pinned worker");
+    };
+    let Err(sink) = pipeline.call(gdl::Cx::new(), Box::new(pinned())).await else {
+        panic!("the sink refuses an unknown pinned worker");
+    };
+    let mut chain =
+        std::iter::successors(Some(&sink as &(dyn std::error::Error + 'static)), |error| {
+            error.source()
+        });
+    assert!(
+        chain.any(|error| error.to_string() == engine.to_string()),
+        "{sink:?} does not carry {engine:#}"
+    );
+    assert_eq!(dispatch.worker_ids.lock().unwrap().len(), 2);
+
+    drop(pipeline);
+    drop(router);
+    runtime.shutdown();
+}
+
+/// Pipelines B and C on gdl over a KV routing host, as the frontend builds them for aggregated
+/// serving, on tokio workers with the frontend's stack size. The whole pipeline is one nested
+/// future, polled on one stack, down to the host's dispatch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn routed_gdl_pipelines_reach_a_kv_routing_host() {
+    use crate::entrypoint::input::PreprocessedRouting;
+    use crate::kv_router::{EncoderRouter, PrefillRouter};
+    use crate::model_card::ModelDeploymentCard;
+    use crate::preprocessor::{OpenAIPreprocessor, prompt::prompt_formatter_from_mdc};
+    use crate::protocols::openai::chat_completions::{
+        NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse,
+    };
+
+    let (router, dispatch, worker_id, runtime) =
+        router_with_recorded_dispatch("kv-gdl-pipelines").await;
+    let card = ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
+        .unwrap();
+    let tokenizer = card.tokenizer().unwrap();
+    let routing = PreprocessedRouting::with_routing_host(
+        Arc::new(router),
+        PrefillRouter::disabled(
+            Arc::new(crate::discovery::ModelManager::new()),
+            RouterMode::KV,
+            None,
+        ),
+        EncoderRouter::disabled(),
+    );
+
+    let c = routing
+        .build_preprocessed_pipeline(&card, 3, None, Arc::new(Metrics::new()))
+        .unwrap();
+    let items: Vec<_> = c
+        .generate(Context::new(request()))
+        .await
+        .unwrap()
+        .collect()
+        .await;
+    assert!(items.iter().all(|item| !item.is_error()), "{items:?}");
+
+    let dynamo_renderer::PromptFormatter::OAI(formatter) =
+        prompt_formatter_from_mdc(&card).unwrap();
+    let preprocessor =
+        OpenAIPreprocessor::new_with_parts(card.clone(), formatter, tokenizer.clone()).unwrap();
+    let b = routing
+        .build_pipeline::<NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse>(
+            &card,
+            preprocessor,
+            tokenizer,
+            3,
+            None,
+            Arc::new(Metrics::new()),
+        )
+        .unwrap();
+    let chat: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "TinyLlama_v1.1",
+        "messages": [{"role": "user", "content": "Write one sentence about a fox."}],
+        "max_tokens": 8,
+    }))
+    .unwrap();
+    let items: Vec<_> = b
+        .generate(Context::new(chat))
+        .await
+        .unwrap()
+        .collect()
+        .await;
+    assert!(items.iter().all(|item| !item.is_error()), "{items:?}");
+    assert_eq!(*dispatch.worker_ids.lock().unwrap(), [worker_id, worker_id]);
+
+    drop((b, c, routing));
     runtime.shutdown();
 }
 

@@ -163,7 +163,7 @@ harness = false
 name = "ingress_response_encode"
 harness = false
 
-# A plain binary, so lib/llm/benches/callgrind.sh can run one row under callgrind.
+# A plain binary, so lib/llm/benches/hotpath.sh can run one row under callgrind.
 [[test]]
 name = "ingress_allocations"
 harness = false

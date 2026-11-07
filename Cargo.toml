@@ -9,6 +9,7 @@ members = [
     "lib/tokens",
     "lib/truthy",
     "lib/data-gen",
+    "lib/gdl-adapters",
     "lib/kv-hashing",
     "lib/mocker",
     "lib/kv-router",
@@ -68,6 +69,7 @@ aisimulate-core = { version = "=0.13.0-dev.202610290000000087" }
 
 # Local crates
 dynamo-runtime = { path = "lib/runtime", version = "1.7.0" }
+dynamo-gdl-adapters = { path = "lib/gdl-adapters", version = "1.7.0" }
 dynamo-llm = { path = "lib/llm", version = "1.7.0", default-features = false }
 dynamo-sglang-generate = { path = "lib/generate-formats/sglang", version = "1.7.0" }
 dynamo-vllm-generate = { path = "lib/generate-formats/vllm", version = "1.7.0" }
@@ -98,6 +100,10 @@ dynamo-sidecar-common = { path = "lib/sidecar/common", version = "1.7.0" }
 
 # velo
 velo = { version = "=0.21.0", default-features = false }
+
+# gdl's node traits, without its runtime, which takes velo from git rather
+# than the crates.io release above.
+gdl = { git = "https://github.com/ryanolson/gdl", rev = "83319c8fb235d75754cd733c21e0acf384275c37" }
 
 # External dependencies
 anyhow = { version = "1" }

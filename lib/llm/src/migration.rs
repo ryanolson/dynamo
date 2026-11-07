@@ -3,17 +3,20 @@
 
 use std::collections::BTreeMap;
 use std::error::Error as StdError;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Poll, ready};
 use std::time::Instant;
 
 use anyhow::{Error, Result};
-use futures::{Stream, stream::StreamExt};
+use dynamo_gdl_adapters::{Boxed, Carried, CheckedItems};
+use futures::{FutureExt, Stream, stream::StreamExt};
 
 use crate::{
     http::service::metrics::Metrics,
     model_card::ModelDeploymentCard,
+    operator::{GdlDownstream, GdlOperator, checked_mut, into_checked, native},
     protocols::{
         TokenIdType,
         common::{
@@ -32,8 +35,7 @@ use dynamo_runtime::engine::Data;
 use dynamo_runtime::error::{self, DynamoError, ErrorReason, ErrorType};
 use dynamo_runtime::metrics::prometheus_names::frontend_service;
 use dynamo_runtime::pipeline::{
-    AsyncEngineContext, AsyncEngineContextProvider, Context, ManyOut, Operator, PipelineOperator,
-    ResponseStream, ServerStreamingEngine, SingleIn, async_trait, attach_first_response_guard,
+    AsyncEngineContext, AsyncEngineContextProvider, Context, SingleIn, attach_first_response_guard,
     network::egress::route_span::{RouteTraceContext, attach_route_trace_context, error_type_name},
 };
 use dynamo_runtime::protocols::annotated::Annotated;
@@ -281,49 +283,56 @@ impl Migration {
             metrics,
         )
     }
-
-    /// Wrap as a `PipelineOperator` over the given response type to
-    /// disambiguate between the `Operator` impls on `Migration` since
-    /// the response type doesn't appear in the struct.
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn into_operator_for<Resp>(
-        self: &Arc<Self>,
-    ) -> Arc<
-        PipelineOperator<
-            SingleIn<PreprocessedRequest>,
-            ManyOut<Annotated<Resp>>,
-            SingleIn<PreprocessedRequest>,
-            ManyOut<Annotated<Resp>>,
-        >,
-    >
-    where
-        Resp: Data + HasTokenIds,
-    {
-        Operator::into_operator(self)
-    }
 }
 
-#[async_trait]
-impl<Resp>
-    Operator<
-        SingleIn<PreprocessedRequest>,
-        ManyOut<Annotated<Resp>>,
-        SingleIn<PreprocessedRequest>,
-        ManyOut<Annotated<Resp>>,
-    > for Migration
+/// The stage below Migration, as its body calls it: gdl's `cx` and `next`, which takes the
+/// preprocessed request boxed.
+type MigrationDownstream<N> = GdlDownstream<N, Boxed<PreprocessedRequest>, PreprocessedRequest>;
+
+impl<Resp> gdl::Operator for GdlOperator<Migration, Resp>
 where
     Resp: Data + HasTokenIds,
 {
-    async fn generate(
+    type UpReq = Boxed<PreprocessedRequest>;
+    type UpItem = Annotated<Resp>;
+    type DownReq = Boxed<PreprocessedRequest>;
+    type DownItem = Annotated<Resp>;
+
+    fn generate<N>(
+        &self,
+        cx: gdl::Cx,
+        request: Boxed<PreprocessedRequest>,
+        next: N,
+    ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<Resp>>>> + Send
+    where
+        N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<Resp>>,
+    {
+        // Each attempt is a new request, built from the one kept here: the first goes on in
+        // this request's box. Each attempt is a call of `next` under `cx`, so gdl runs it in a
+        // child of `cx`.
+        let (request, spare) = request.take();
+        self.op
+            .migrate(request, GdlDownstream::with_spare(cx, next, spare))
+            .map(native)
+    }
+}
+
+impl Migration {
+    /// Send `request` on, and send it again on a migratable failure: the body of Migration's
+    /// native gdl operator.
+    async fn migrate<Resp, N>(
         &self,
         request: SingleIn<PreprocessedRequest>,
-        next: ServerStreamingEngine<PreprocessedRequest, Annotated<Resp>>,
-    ) -> Result<ManyOut<Annotated<Resp>>> {
+        next: MigrationDownstream<N>,
+    ) -> Result<gdl::Items<Annotated<Resp>>>
+    where
+        Resp: Data + HasTokenIds,
+        N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<Resp>> + 'static,
+    {
         // NOTE: Keep the migration operator in the request path at limit zero. The limit controls
         // replacement attempts; RetryManager continues to own the initial attempt uniformly.
         let (preprocessed_request, context) = request.transfer(());
         let engine_ctx = context.context();
-        let engine_ctx_ = engine_ctx.clone();
         let session_affinity = context
             .get_optional::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
             .map_err(Error::msg)?
@@ -340,10 +349,7 @@ where
             session_affinity,
         )
         .await?;
-        Ok(ResponseStream::new(
-            Box::pin(Migrated::Streaming(retry_manager)),
-            engine_ctx_,
-        ))
+        Ok(gdl::items(Migrated::Streaming(retry_manager)))
     }
 }
 
@@ -357,39 +363,41 @@ where
 // enum would cost an allocation per request and an indirection per item, for the sake of the
 // rare variants.
 #[allow(clippy::large_enum_variant)]
-enum Migrated<Resp>
+enum Migrated<Resp, N>
 where
     Resp: Data + HasTokenIds,
 {
     /// Reading the active attempt.
-    Streaming(RetryManager<Resp>),
+    Streaming(RetryManager<Resp, N>),
     /// Migrating on a failure of the active attempt, or reading after the manager lost its
     /// attempt: [`RetryManager::migrate_on`] and [`RetryManager::next`] in a future. Its output
     /// gives the manager back with the next item, or with `None` at the end.
-    Migrating(MigrationFuture<Resp>),
+    Migrating(MigrationFuture<Resp, N>),
     /// Ended. The manager, and with it the attempt's stream, is dropped when the stream ends,
     /// as `unfold` dropped it, rather than when its caller drops the stream.
     Ended,
 }
 
 /// The future of [`Migrated::Migrating`].
-type MigrationFuture<Resp> =
-    Pin<Box<dyn Future<Output = (RetryManager<Resp>, Option<Annotated<Resp>>)> + Send>>;
+type MigrationFuture<Resp, N> =
+    Pin<Box<dyn Future<Output = (RetryManager<Resp, N>, Option<Annotated<Resp>>)> + Send>>;
 
 // Nothing in the stream is pinned: the manager is moved freely, as `unfold` moved it, and the
 // future is boxed.
-impl<Resp> Unpin for Migrated<Resp> where Resp: Data + HasTokenIds {}
+impl<Resp, N> Unpin for Migrated<Resp, N> where Resp: Data + HasTokenIds {}
 
-impl<Resp> Stream for Migrated<Resp>
+impl<Resp, N> Stream for Migrated<Resp, N>
 where
     Resp: Data + HasTokenIds,
+    N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<Resp>> + 'static,
 {
-    type Item = Annotated<Resp>;
+    type Item = gdl::Result<Annotated<Resp>>;
 
+    // hot path: per-item-response
     fn poll_next(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> Poll<Option<Annotated<Resp>>> {
+    ) -> Poll<Option<gdl::Result<Annotated<Resp>>>> {
         let this = &mut *self;
         loop {
             match this {
@@ -406,7 +414,7 @@ where
                                 return poll;
                             }
                             Poll::Ready(Some(response)) => {
-                                if manager.accept(response) {
+                                if manager.accept(checked_mut(response)) {
                                     return poll;
                                 }
                             }
@@ -414,6 +422,7 @@ where
                         let Poll::Ready(Some(response)) = poll else {
                             unreachable!("only a failure to migrate on gets here");
                         };
+                        let response = into_checked(response);
                         let Migrated::Streaming(mut manager) =
                             std::mem::replace(this, Migrated::Ended)
                         else {
@@ -445,7 +454,7 @@ where
                         Some(_) => Migrated::Streaming(manager),
                         None => Migrated::Ended,
                     };
-                    return Poll::Ready(next);
+                    return Poll::Ready(next.map(Ok));
                 }
                 Migrated::Ended => return Poll::Ready(None),
             }
@@ -467,7 +476,7 @@ impl MigrationEvent {
     }
 }
 
-struct RetryManager<Resp>
+struct RetryManager<Resp, N>
 where
     Resp: Data + HasTokenIds,
 {
@@ -475,8 +484,8 @@ where
     metadata: BTreeMap<String, String>,
     request: PreprocessedRequest,
     session_affinity: Option<SessionAffinityId>,
-    next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<Resp>>,
-    next_stream: Option<ManyOut<Annotated<Resp>>>,
+    next_generate: MigrationDownstream<N>,
+    next_stream: Option<CheckedItems<Resp>>,
     attempts: AttemptBudget,
     max_seq_len: Option<u32>,
     model_name: Arc<String>,
@@ -514,7 +523,7 @@ where
 /// releases staged KV, may take the parked lifecycle and finish it. Aborting it here would make
 /// that leg start and classify a second one. Unclaimed, the lifecycle aborts with the cause when
 /// it is dropped.
-impl<Resp> Drop for RetryManager<Resp>
+impl<Resp, N> Drop for RetryManager<Resp, N>
 where
     Resp: Data + HasTokenIds,
 {
@@ -540,16 +549,51 @@ struct MigrationCause {
     attempt: u32,
 }
 
-impl<Resp> RetryManager<Resp>
+/// What the manager's `Drop` calls, so it needs no bound on the stage below.
+impl<Resp, N> RetryManager<Resp, N>
 where
     Resp: Data + HasTokenIds,
+{
+    /// Record the outcome of the migration in flight, if any, once.
+    fn record_migration_outcome(&mut self, outcome: &str) {
+        if let Some(event) = self.unrecorded_migration.take() {
+            self.metrics.observe_migration_duration(
+                &self.model_name,
+                event.migration_type,
+                outcome,
+                event.started_at.elapsed(),
+            );
+        }
+    }
+
+    /// Give any classifier lifecycle parked for a retry the request's cancel as the cause it
+    /// aborts with if no leg takes it (see [`MigrationState::abort_request_lifecycle_on_drop`]).
+    /// The cause is built only when a lifecycle can be parked.
+    fn abort_request_lifecycle_on_drop_cancelled(&self) {
+        if let Some(state) = self.request.migration_state.as_ref() {
+            let error = DynamoError::builder()
+                .error_type(ErrorType::Cancelled)
+                .message(format!(
+                    "Context id {} is stopped or killed",
+                    self.context.id()
+                ))
+                .build();
+            state.abort_request_lifecycle_on_drop(&error);
+        }
+    }
+}
+
+impl<Resp, N> RetryManager<Resp, N>
+where
+    Resp: Data + HasTokenIds,
+    N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<Resp>>,
 {
     #[allow(clippy::too_many_arguments)]
     pub async fn build(
         context: Arc<dyn AsyncEngineContext>,
         metadata: BTreeMap<String, String>,
         mut preprocessed_request: PreprocessedRequest,
-        next: ServerStreamingEngine<PreprocessedRequest, Annotated<Resp>>,
+        next: MigrationDownstream<N>,
         mut retries_left: u32,
         max_seq_len: Option<u32>,
         model_name: Arc<String>,
@@ -639,10 +683,10 @@ where
                 }
             };
             let mut response = response_stream.next().await?;
-            if self.accept(&mut response) {
-                return Some(response);
+            if self.accept(checked_mut(&mut response)) {
+                return Some(into_checked(response));
             }
-            if let Some(response) = self.migrate_on(response).await {
+            if let Some(response) = self.migrate_on(into_checked(response)).await {
                 return Some(response);
             }
         }
@@ -726,22 +770,6 @@ where
     fn abort_request_lifecycle(&self, error: &AbortCause) {
         if let Some(state) = self.request.migration_state.as_ref() {
             state.abort_request_lifecycle(Some(error));
-        }
-    }
-
-    /// Give any classifier lifecycle parked for a retry the request's cancel as the cause it
-    /// aborts with if no leg takes it (see [`MigrationState::abort_request_lifecycle_on_drop`]).
-    /// The cause is built only when a lifecycle can be parked.
-    fn abort_request_lifecycle_on_drop_cancelled(&self) {
-        if let Some(state) = self.request.migration_state.as_ref() {
-            let error = DynamoError::builder()
-                .error_type(ErrorType::Cancelled)
-                .message(format!(
-                    "Context id {} is stopped or killed",
-                    self.context.id()
-                ))
-                .build();
-            state.abort_request_lifecycle_on_drop(&error);
         }
     }
 
@@ -846,7 +874,7 @@ where
             {
                 release.release().await;
             }
-            let response_stream = self.next_generate.generate(request).await;
+            let response_stream = self.next_generate.send_items(request).await;
             match response_stream {
                 Ok(next_stream) => {
                     // A dispatch cancelled before its response prologue returns `Ok` empty,
@@ -961,18 +989,6 @@ where
             },
             "migration retries exhausted"
         );
-    }
-
-    /// Record the outcome of the migration in flight, if any, once.
-    fn record_migration_outcome(&mut self, outcome: &str) {
-        if let Some(event) = self.unrecorded_migration.take() {
-            self.metrics.observe_migration_duration(
-                &self.model_name,
-                event.migration_type,
-                outcome,
-                event.started_at.elapsed(),
-            );
-        }
     }
 
     fn track_response(&mut self, response: &Annotated<Resp>) {
@@ -1104,12 +1120,33 @@ mod tests {
     use dynamo_runtime::error::{BackendError, DynamoError, ErrorType};
     use dynamo_runtime::pipeline::AsyncEngine;
     use dynamo_runtime::pipeline::context::Controller;
+    use dynamo_runtime::pipeline::{ManyOut, ResponseStream, ServerStreamingEngine, async_trait};
     use dynamo_runtime::protocols::maybe_error::MaybeError;
     use futures::stream;
     use std::sync::atomic::{AtomicU32, Ordering};
     use tokio::sync::mpsc;
 
+    use crate::operator::testing::{self, EngineDownstream};
+
     const TEST_MODEL: &str = "test-model";
+
+    /// `next` as the downstream Migration's body gets on gdl for a request with `context`: under
+    /// a `Cx` that follows `context`, as the frontend's routed pipelines root it.
+    fn gdl_next<Resp: Data>(
+        context: &dyn AsyncEngineContext,
+        next: ServerStreamingEngine<PreprocessedRequest, Annotated<Resp>>,
+    ) -> EngineDownstream<PreprocessedRequest, Resp> {
+        testing::downstream(dynamo_gdl_adapters::CxBridge::cx(context), next)
+    }
+
+    /// `migration` over `next` as the frontend's gdl pipeline runs it: a native operator over the
+    /// hop to `next`.
+    fn on_gdl(
+        migration: &Arc<Migration>,
+        next: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>>,
+    ) -> ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> {
+        testing::operator::<_, BackendOutput, _, _, _>(migration.clone(), next)
+    }
 
     fn migration_duration_count(metrics: &Metrics, migration_type: &str, outcome: &str) -> u64 {
         metrics.get_migration_duration_sample_count(TEST_MODEL, migration_type, outcome)
@@ -1427,11 +1464,13 @@ mod tests {
         let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> = Arc::new(
             MockEngine::new(MockBehavior::Success, 1, 100, context_id.clone()),
         );
+        let ctx = Arc::new(Controller::new(context_id));
+        let next = gdl_next(&*ctx, engine);
         let manager = RetryManager::build(
-            Arc::new(Controller::new(context_id)),
+            ctx,
             BTreeMap::new(),
             request,
-            engine,
+            next,
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -1994,11 +2033,12 @@ mod tests {
 
         let ctx = Arc::new(Controller::new(context_id.clone()));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            next,
             0,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2029,7 +2069,7 @@ mod tests {
         behavior: MockBehavior,
         migration_limit: u32,
     ) -> (
-        RetryManager<BackendOutput>,
+        RetryManager<BackendOutput, testing::SinkHop<PreprocessedRequest, BackendOutput>>,
         std::sync::Weak<Vec<TokenIdType>>,
     ) {
         let context_id = uuid::Uuid::new_v4().to_string();
@@ -2037,11 +2077,13 @@ mod tests {
         let prompt = Arc::downgrade(&request.token_ids);
         let next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
             Arc::new(MockEngine::new(behavior, 10, 100, context_id.clone()));
+        let ctx = Arc::new(Controller::new(context_id));
+        let next = gdl_next(&*ctx, next_generate);
         let retry_manager = RetryManager::build(
-            Arc::new(Controller::new(context_id)),
+            ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            next,
             migration_limit,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2114,8 +2156,8 @@ mod tests {
             Arc::new(Metrics::new()),
         );
 
-        let responses = migration
-            .generate(request, mock_engine)
+        let responses = on_gdl(&migration, mock_engine)
+            .generate(request)
             .await
             .unwrap()
             .collect::<Vec<_>>()
@@ -2144,7 +2186,10 @@ mod tests {
         );
 
         let migration = Migration::new(1, None, TEST_MODEL.to_string(), Arc::new(Metrics::new()));
-        let mut stream = migration.generate(request, mock_engine).await.unwrap();
+        let mut stream = on_gdl(&migration, mock_engine)
+            .generate(request)
+            .await
+            .unwrap();
         while stream.next().await.is_some() {}
 
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -2210,7 +2255,7 @@ mod tests {
         let request =
             Context::with_id_and_metadata(create_mock_request(2), context_id, BTreeMap::new());
         let migration = Migration::new(1, None, TEST_MODEL.to_string(), Arc::new(Metrics::new()));
-        let mut stream = migration.generate(request, engine).await.unwrap();
+        let mut stream = on_gdl(&migration, engine).generate(request).await.unwrap();
 
         assert!(stream.next().await.is_some());
         assert!(stream.next().await.is_some());
@@ -2241,7 +2286,7 @@ mod tests {
         let request = Context::with_id_and_metadata(content, context_id, BTreeMap::new());
 
         let migration = Migration::new(3, None, TEST_MODEL.to_string(), Arc::new(Metrics::new()));
-        let result = migration.generate(request, mock_engine).await;
+        let result = on_gdl(&migration, mock_engine).generate(request).await;
 
         assert!(result.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -2263,7 +2308,10 @@ mod tests {
             Context::with_id_and_metadata(create_mock_request(1), context_id, BTreeMap::new());
 
         let migration = Migration::new(2, None, TEST_MODEL.to_string(), Arc::new(Metrics::new()));
-        let mut stream = migration.generate(request, mock_engine).await.unwrap();
+        let mut stream = on_gdl(&migration, mock_engine)
+            .generate(request)
+            .await
+            .unwrap();
         let responses = stream.by_ref().collect::<Vec<_>>().await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 3);
@@ -2293,11 +2341,12 @@ mod tests {
 
         let ctx = Arc::new(Controller::new(context_id.clone()));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            next,
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2355,11 +2404,12 @@ mod tests {
 
         let ctx = Arc::new(Controller::new(context_id.clone()));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            next,
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2415,8 +2465,8 @@ mod tests {
         let request = Context::with_id_and_metadata(request, context_id, BTreeMap::new());
         let migration = Migration::new(1, None, TEST_MODEL.to_string(), Arc::new(Metrics::new()));
 
-        let responses = migration
-            .generate(request, mock_engine)
+        let responses = on_gdl(&migration, mock_engine)
+            .generate(request)
             .await
             .unwrap()
             .collect::<Vec<_>>()
@@ -2448,11 +2498,12 @@ mod tests {
         // Should fail to build due to initial stream creation failure after exhausting all 3 retries
         let ctx = Arc::new(Controller::new(context_id.clone()));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let retry_manager_result = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            next,
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2498,11 +2549,12 @@ mod tests {
 
         let ctx = Arc::new(Controller::new(context_id.clone()));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            next,
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2567,11 +2619,12 @@ mod tests {
 
         let ctx = Arc::new(Controller::new(context_id.clone()));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            next,
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2649,11 +2702,12 @@ mod tests {
 
         // Should fail to build due to stopped context
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let retry_manager_result = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            next,
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2702,11 +2756,12 @@ mod tests {
             mock_engine;
         let metrics = Arc::new(Metrics::new());
 
+        let next = gdl_next(&*ctx, next_generate);
         let result = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            next,
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2757,11 +2812,13 @@ mod tests {
             mock_engine;
         let metrics = Arc::new(Metrics::new());
 
+        let ctx = Arc::new(Controller::new(context_id));
+        let next = gdl_next(&*ctx, next_generate);
         let result = RetryManager::build(
-            Arc::new(Controller::new(context_id)),
+            ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            next,
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -2774,9 +2831,7 @@ mod tests {
             Ok(_) => panic!("cancelled migration must fail"),
             Err(error) => error,
         };
-        let dynamo_error = error
-            .downcast_ref::<DynamoError>()
-            .expect("error should be a DynamoError");
+        let dynamo_error = testing::dynamo_error(&error).expect("error should be a DynamoError");
         assert_eq!(dynamo_error.error_type(), ErrorType::Cancelled);
         assert_eq!(metrics.get_migration_new_request_count(TEST_MODEL), 1);
         assert_eq!(
@@ -2838,11 +2893,12 @@ mod tests {
         };
 
         let consume = async {
+            let next = gdl_next(&*ctx, next_generate);
             let mut retry_manager = RetryManager::build(
                 ctx.clone(),
                 BTreeMap::new(),
                 create_mock_request(10),
-                next_generate,
+                next,
                 3,
                 None,
                 Arc::new(TEST_MODEL.to_string()),
@@ -2965,11 +3021,12 @@ mod tests {
 
         let ctx = Arc::new(Controller::new(context_id.clone()));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            next,
             3, // migration_limit=3 — should be ignored for guided-decoding requests
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -3044,11 +3101,12 @@ mod tests {
 
         let ctx = Arc::new(Controller::new(context_id.clone()));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            next,
             3,
             Some(5), // prompt(3) + 3 generated = 6 > 5 → disables migration
             Arc::new(TEST_MODEL.to_string()),
@@ -3117,11 +3175,12 @@ mod tests {
 
         let ctx = Arc::new(Controller::new(context_id.clone()));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            next,
             3,
             Some(5), // prompt(3) + 2 generated = 5 == max_seq_len → still migratable
             Arc::new(TEST_MODEL.to_string()),
@@ -3182,11 +3241,12 @@ mod tests {
 
         let ctx = Arc::new(Controller::new(context_id.clone()));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            next,
             3,
             Some(2), // prompt(3) > max_seq_len(2) → migration disabled at build time
             Arc::new(TEST_MODEL.to_string()),
@@ -3264,11 +3324,12 @@ mod tests {
 
         let ctx = Arc::new(Controller::new(context_id.clone()));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            next,
             1,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -3379,11 +3440,12 @@ mod tests {
 
         let ctx = Arc::new(Controller::new(context_id.clone()));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            next,
             1,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -3485,11 +3547,13 @@ mod tests {
                 failing_attempts,
                 context_id: context_id.clone(),
             });
+        let ctx = Arc::new(Controller::new(context_id));
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
-            Arc::new(Controller::new(context_id)),
+            ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            next,
             failing_attempts.max(1),
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -3627,11 +3691,12 @@ mod tests {
                 root: root.clone(),
                 context_id,
             });
+        let next = gdl_next(&*root, next_generate);
         let mut retry_manager = RetryManager::build(
             root,
             BTreeMap::new(),
             create_mock_request(5),
-            next_generate,
+            next,
             2,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -3776,11 +3841,12 @@ mod tests {
 
         let ctx = Arc::new(Controller::new(context_id));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
             ctx,
             BTreeMap::new(),
             request,
-            next_generate,
+            next,
             3,
             None,
             Arc::new(TEST_MODEL.to_string()),
@@ -3959,11 +4025,12 @@ mod tests {
         let retries = 1;
         let manager = tracing::subscriber::with_default(subscriber, || {
             futures::executor::block_on(async {
+                let next = gdl_next(&*root, next_generate);
                 let mut manager = RetryManager::build(
                     root,
                     BTreeMap::new(),
                     create_mock_request(50),
-                    next_generate,
+                    next,
                     retries,
                     None,
                     Arc::new(TEST_MODEL.to_string()),
@@ -4143,7 +4210,9 @@ mod tests {
             &self,
             request: SingleIn<PreprocessedRequest>,
         ) -> Result<ManyOut<Annotated<BackendOutput>>> {
-            Operator::generate(self.backend.as_ref(), request, self.raw_engine.clone()).await
+            crate::operator::testing::backend(self.backend.clone(), self.raw_engine.clone())
+                .generate(request)
+                .await
         }
     }
 
@@ -4171,11 +4240,12 @@ mod tests {
 
         let ctx = Arc::new(Controller::new(context_id.clone()));
         let metrics = Arc::new(Metrics::new());
+        let next = gdl_next(&*ctx, next_generate);
         let mut retry_manager = RetryManager::build(
             ctx,
             BTreeMap::new(),
             jail_request(stop),
-            next_generate,
+            next,
             1,
             None,
             Arc::new(TEST_MODEL.to_string()),

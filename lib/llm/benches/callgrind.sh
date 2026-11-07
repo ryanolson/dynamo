@@ -14,7 +14,7 @@
 #
 # Usage: lib/llm/benches/callgrind.sh [ROW ITEMS]...
 #   With no arguments it measures every row at 1 and 16 items.
-#   ROW is engine, a, b, c, embed-engine or embed (see
+#   ROW is engine, a-gdl, b-gdl, c-gdl, embed-engine, embeddings-gdl (see
 #   tests/allocations.rs) or ingress (see lib/runtime/tests/ingress_allocations.rs).
 #   CALLGRIND_REQUESTS sets N (default 200). CALLGRIND_JOBS sets how many rows run at once
 #   (default: the number of CPUs). CALLGRIND_PROFILE sets the cargo profile (default
@@ -29,7 +29,7 @@
 #
 # MEMCPY counts what the instructions cannot show: each move of a large value (a stream item of
 # about 1 KB) that the compiler does not elide is one call, of 100 to 200 instructions, below
-# a per-item instruction tolerance of 2%. It counts calls from any function that is not itself
+# the instruction tolerance of hotpath.sh. It counts calls from any function that is not itself
 # a memcpy or memmove, so `__memcpy_chk` calling `memcpy` counts once. The names match glibc's
 # on aarch64 (`__GI_memcpy`) and x86_64 (`__memmove_avx_unaligned_erms` and the like).
 #
@@ -42,7 +42,8 @@
 # writes its counts, and a binary whose client requests did nothing writes only the count of the
 # whole run, so a number from either would be wrong.
 #
-# On aarch64, use valgrind 3.28 or newer: 3.25 cannot decode `neoverse-n1` code.
+# The pipeline rows die with SIGSEGV under valgrind unless built with `--cfg rustix_use_libc`; see
+# the "callgrind.sh and hotpath.sh" section of benches/README.md for the build.
 
 set -euo pipefail
 
@@ -57,8 +58,8 @@ crate_dir=$(cd "$(dirname "$0")/.." && pwd)
 out_dir=$(mktemp -d "${TMPDIR:-/tmp}/callgrind.XXXXXX")
 
 if [[ $# -eq 0 ]]; then
-    set -- engine 1 engine 16 a 1 a 16 b 1 b 16 c 1 c 16 embed-engine 1 embed-engine 16 \
-        embed 1 embed 16 ingress 1 ingress 16
+    set -- engine 1 engine 16 a-gdl 1 a-gdl 16 b-gdl 1 b-gdl 16 c-gdl 1 c-gdl 16 \
+        embed-engine 1 embed-engine 16 embeddings-gdl 1 embeddings-gdl 16 ingress 1 ingress 16
 fi
 if (( $# % 2 != 0 )); then
     echo "callgrind.sh: arguments must be ROW ITEMS pairs" >&2
@@ -148,7 +149,7 @@ measure() {
     fi
     # Every request of a row makes the same copies, so the window's count divides by N. A
     # remainder is a copy that not every request makes; dividing would round it away, and a
-    # rise hidden that way would pass a zero tolerance.
+    # rise hidden that way would pass the zero tolerance of hotpath.sh.
     if (( memcpy % n != 0 )); then
         echo "callgrind.sh: $what: $memcpy memcpy calls in $n requests is not a whole number per request; see $window" >&2
         return 1

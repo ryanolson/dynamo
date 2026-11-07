@@ -4,10 +4,12 @@
 use std::{
     collections::HashSet,
     future::{Future, ready},
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
 
+use dynamo_gdl_adapters::{Boxed, enter};
 use dynamo_kv_router::{
     protocols::{TokensWithHashes, WorkerConfigLike, WorkerWithDpRank},
     scheduling::{AbortCause, KvSchedulerError},
@@ -25,6 +27,7 @@ use dynamo_runtime::{
     },
     protocols::annotated::Annotated,
 };
+use futures::FutureExt;
 use futures::stream::{self, StreamExt};
 use tracing::Instrument;
 
@@ -174,7 +177,8 @@ fn monitor_response_stream(
                         }
                         // A kill that lands while the worker's stream ends is not seen by
                         // the `stopped` arm above, and the stream then ends cleanly: the
-                        // request was cut short, not completed. Checked once, here.
+                        // request was cut short, not completed. Checked once, here. The
+                        // sink's `cx` cannot tell: gdl cancels it at every attempt's end.
                         break !drainable_terminal && !context.is_killed();
                     };
                     let outcome = classify_response_item(&item);
@@ -259,14 +263,14 @@ fn monitor_response_stream(
 fn into_monitored_response(
     response_stream: ManyOut<Annotated<LLMEngineOutput>>,
     guard: RequestGuard,
-) -> ManyOut<Annotated<LLMEngineOutput>> {
+) -> RouteResponse {
     let stream_context = response_stream.context();
     let wrapped_stream = Box::pin(monitor_response_stream(
         response_stream,
         stream_context.clone(),
         guard,
     ));
-    ResponseStream::new(wrapped_stream, stream_context)
+    RouteResponse::Parts(ResponseStream::from_parts(wrapped_stream, stream_context))
 }
 
 enum RoutingPolicy {
@@ -712,7 +716,7 @@ impl RoutingHost {
                     .await?;
                 Ok(PrefillDispatch {
                     metadata,
-                    stream,
+                    stream: stream.into_many_out(),
                     booking: None,
                 })
             }
@@ -724,7 +728,47 @@ impl RoutingHost {
 impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>, Error>
     for RoutingHost
 {
-    /// Generate a request through the selected routing plane.
+    /// Route and dispatch `request`, as [`RoutingHost::route`] describes.
+    async fn generate(
+        &self,
+        request: SingleIn<PreprocessedRequest>,
+    ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+        Ok(self.route(request).await?.into_many_out())
+    }
+}
+
+/// The host as the sink of a gdl local pipeline, over the same body as its Dynamo engine.
+///
+/// The request's Dynamo context carries its stop and kill to the dispatch, as it does for the
+/// engine. The sink's `cx` does not: gdl cancels it whenever its attempt ends, also when the
+/// response ends normally. An eager error enters gdl with the host's error as its source.
+impl gdl::Sink for RoutingHost {
+    type Req = Boxed<PreprocessedRequest>;
+    type Item = Annotated<LLMEngineOutput>;
+
+    fn generate(
+        &self,
+        _cx: gdl::Cx,
+        request: Boxed<PreprocessedRequest>,
+    ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<LLMEngineOutput>>>> + Send {
+        // On the heap, as the host's Dynamo engine has it, for the same one allocation. Held
+        // inline, the route's future is moved through each stage above it, and in a debug
+        // build every poll frame on the way keeps room for it: a routed pipeline then
+        // overflows a tokio worker's 2 MiB stack (`routed_gdl_pipelines_reach_a_kv_routing_host`).
+        // Erased, it also ends the type the compiler walks to prove a routed pipeline `Send`,
+        // which is deeper than the default recursion limit with the route inside it.
+        let route: Pin<Box<dyn Future<Output = Result<RouteResponse, Error>> + Send + '_>> =
+            Box::pin(self.route(*request));
+        route.map(|result| match result {
+            Ok(response) => Ok(response.into_items()),
+            Err(error) => Err(enter(error)),
+        })
+    }
+}
+
+impl RoutingHost {
+    /// Route a request through the selected routing plane and dispatch it: the body of the
+    /// host's Dynamo engine and gdl sink.
     ///
     /// On the KV plane, `query_instance_id` performs an advisory selection:
     ///    - Returns the best matching worker ID without routing the request
@@ -747,10 +791,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
     ///
     /// The router state updates include tracking active sequences and managing
     /// prefill/completion lifecycle for proper KV cache management.
-    async fn generate(
-        &self,
-        request: SingleIn<PreprocessedRequest>,
-    ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+    async fn route(&self, request: SingleIn<PreprocessedRequest>) -> Result<RouteResponse, Error> {
         // One cleanup budget for this request's whole route through the host.
         let budget = CleanupBudget::default();
         if !matches!(&self.policy, RoutingPolicy::Kv(_)) {
@@ -807,11 +848,50 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             };
             let response = Annotated::from_data(output);
             let stream = stream::iter(vec![response]);
-            return Ok(ResponseStream::new(Box::pin(stream), stream_context));
+            return Ok(RouteResponse::Parts(ResponseStream::from_parts(
+                Box::pin(stream),
+                stream_context,
+            )));
         }
 
         let plan = self.plan_kv_route(&request, phase, None, budget).await?;
         self.dispatch_kv_plan(request, plan).await
+    }
+}
+
+/// The host's response, as boxed as it has to be so far. The Dynamo engine and the gdl sink each
+/// take it in the form they need, so neither pays for a box the other needs.
+#[derive(Debug)]
+pub(crate) enum RouteResponse {
+    /// Not boxed yet: the Dynamo engine boxes it as a `ManyOut`, and the gdl sink takes its
+    /// stream out.
+    Parts(ResponseStream<Annotated<LLMEngineOutput>>),
+    /// Already a `ManyOut`, as the route span's wrapper returns it.
+    Boxed(ManyOut<Annotated<LLMEngineOutput>>),
+}
+
+impl RouteResponse {
+    /// The response as a Dynamo engine returns it.
+    pub(crate) fn into_many_out(self) -> ManyOut<Annotated<LLMEngineOutput>> {
+        match self {
+            Self::Parts(response) => Box::pin(response),
+            Self::Boxed(response) => response,
+        }
+    }
+
+    /// The response as gdl items. The context lives as long as the stream, as it does in the
+    /// boxed response.
+    fn into_items(self) -> gdl::Items<Annotated<LLMEngineOutput>> {
+        match self {
+            Self::Parts(response) => {
+                let (stream, context) = response.into_parts();
+                gdl::items(stream.map(move |item| {
+                    let _context = &context;
+                    Ok(item)
+                }))
+            }
+            Self::Boxed(response) => gdl::items(response.map(Ok)),
+        }
     }
 }
 

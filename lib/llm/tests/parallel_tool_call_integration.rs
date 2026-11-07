@@ -84,7 +84,7 @@ fn create_mock_chat_completion_request() -> NvCreateChatCompletionRequest {
 
     let inner = dynamo_protocols::types::CreateChatCompletionRequestArgs::default()
         .model("Qwen/Qwen3-0.6B")
-        .temperature(0.0)
+        .temperature(0.0_f32)
         .max_tokens(3000u32)
         .stream(false)
         .messages(messages)

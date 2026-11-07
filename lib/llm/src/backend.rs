@@ -17,6 +17,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     pin::Pin,
     sync::Arc,
     task::{Context as TaskContext, Poll, ready},
@@ -27,13 +28,12 @@ use anyhow::Result;
 use futures::stream::{Stream, StreamExt};
 
 use crate::model_card::ModelDeploymentCard;
+use crate::operator::{GdlOperator, checked, checked_mut, gdl_error};
+use dynamo_gdl_adapters::{Boxed, CheckedItems, CutShort};
 use dynamo_runtime::dynamo_nvtx_range;
 use dynamo_runtime::{
     error::{DynamoError, ErrorClass},
-    pipeline::{
-        AsyncEngineContext, AsyncEngineContextProvider, ManyOut, Operator, ResponseStream,
-        ServerStreamingEngine, SingleIn, async_trait,
-    },
+    pipeline::{AsyncEngineContext, AsyncEngineContextProvider, ServerStreamingEngine},
     protocols::{annotated::Annotated, maybe_error::MaybeError},
 };
 
@@ -42,10 +42,9 @@ use crate::protocols::{
     common::{
         StopConditions,
         llm_backend::{
-            BackendOutput, DecoderCheckpoint, EmbeddingsEngineOutput, FinishReason,
-            LLMEngineOutput, PreprocessedRequest, TopLogprobs,
+            BackendOutput, DecoderCheckpoint, FinishReason, LLMEngineOutput, PreprocessedRequest,
+            TopLogprobs,
         },
-        preprocessor::PreprocessedEmbeddingRequest,
         timing::RequestTracker,
     },
 };
@@ -69,6 +68,7 @@ pub struct Backend {
 /// Supports n>1 (multiple choices) by maintaining per-choice decoders.
 #[allow(dead_code)]
 struct DecoderState<S> {
+    /// The engine's stream; `()` until the request is sent (see [`DecoderState::reading`]).
     stream: S,
     decoders: HashMap<u32, Decoder>,
     finished_choices: HashSet<u32>,
@@ -92,9 +92,6 @@ struct DecoderState<S> {
     /// When `false`, `jailed_text` is left unset on every chunk rather than snapshotting the
     /// decoder's withheld state for a checkpoint nothing can ever consume.
     migration_possible: bool,
-    /// The context of the request this Backend sent on: a kill of it, seen when the stream
-    /// ends, means the answer was cut short (see [`DecoderState::poll_step`]).
-    context: Arc<dyn AsyncEngineContext>,
 }
 
 impl DecoderState<()> {
@@ -113,7 +110,6 @@ impl DecoderState<()> {
             pending_flush: self.pending_flush,
             stream_ended: self.stream_ended,
             migration_possible: self.migration_possible,
-            context: self.context,
         }
     }
 }
@@ -228,11 +224,7 @@ impl Backend {
 
     /// The decoders for one request, before its stream: the check that the request can be
     /// decoded at all (a tokenizer, and a migration checkpoint that fits the prompt).
-    fn decoder(
-        &self,
-        params: DecoderParams,
-        context: Arc<dyn AsyncEngineContext>,
-    ) -> anyhow::Result<DecoderState<()>> {
+    fn decoder(&self, params: DecoderParams) -> anyhow::Result<DecoderState<()>> {
         let Some(tokenizer) = self.tokenizer.as_ref() else {
             anyhow::bail!("Backend built from blank ModelDeploymentCard, no tokenizer");
         };
@@ -259,38 +251,57 @@ impl Backend {
             pending_flush: Vec::new(),
             stream_ended: false,
             migration_possible: params.migration_possible,
-            context,
         })
     }
 }
 
-#[async_trait]
-impl
-    Operator<
-        SingleIn<PreprocessedRequest>,
-        ManyOut<Annotated<BackendOutput>>,
-        SingleIn<PreprocessedRequest>,
-        ManyOut<Annotated<LLMEngineOutput>>,
-    > for Backend
-{
-    async fn generate(
+/// What Backend's forward half keeps of a request for its backward half: the decoders, and the
+/// request's context, which a stop reaches below.
+///
+/// Not boxed: measured on the gdl pipelines, a box costs one allocation and 1,000 to 1,800
+/// instructions per request, and saves no copy.
+pub struct BackendState {
+    decoder: DecoderState<()>,
+    context: Arc<dyn AsyncEngineContext>,
+}
+
+/// Backend around the stages below it: the forward half checks that the request can be decoded
+/// and builds its decoders, before the request is sent on, and the backward half detokenizes
+/// the response.
+impl gdl::Around for GdlOperator<Backend, PreprocessedRequest> {
+    type UpReq = Boxed<PreprocessedRequest>;
+    type UpItem = Annotated<BackendOutput>;
+    type DownReq = Boxed<PreprocessedRequest>;
+    type DownItem = Annotated<LLMEngineOutput>;
+    type State = BackendState;
+
+    fn forward(
         &self,
-        request: SingleIn<PreprocessedRequest>,
-        next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
-    ) -> Result<ManyOut<Annotated<BackendOutput>>> {
-        // Checked before the request is sent on: a request this Backend cannot decode never
-        // reaches the engine, and an eager error below cannot hide the reason.
-        let state = self.decoder(DecoderParams::from_request(&request), request.context())?;
+        _cx: &gdl::Cx,
+        request: Boxed<PreprocessedRequest>,
+    ) -> impl Future<Output = gdl::Result<(Self::DownReq, Self::State)>> + Send {
+        // Checked before the request is sent on: an eager error below cannot hide a request
+        // this Backend could not decode.
+        let decoder = self
+            .op
+            .decoder(DecoderParams::from_request(&request))
+            .map_err(gdl_error);
+        std::future::ready(decoder.map(|decoder| {
+            let context = request.context();
+            (request, BackendState { decoder, context })
+        }))
+    }
 
-        let next_stream = next.generate(request).await?;
-
-        let context = next_stream.context();
-        let state = state.reading(next_stream);
-
-        Ok(ResponseStream::new(
-            Box::pin(DecoderStream { state: Some(state) }),
-            context,
-        ))
+    fn backward(
+        &self,
+        cx: &gdl::Cx,
+        state: Self::State,
+        input: gdl::Items<Annotated<LLMEngineOutput>>,
+    ) -> gdl::Items<Annotated<BackendOutput>> {
+        let input = CheckedItems::new(input, cx.clone(), state.context);
+        gdl::items(DecoderStream {
+            state: Some(state.decoder.reading(input)),
+        })
     }
 }
 
@@ -300,7 +311,8 @@ impl
 /// A stream that owns its state, in place of `unfold`, `fuse` and `map`: `unfold` moves its
 /// state and the item through a new future on every item, and each combinator moves the item
 /// again, about a third of a stream item's cost (1 KB each). Edited through `&mut`, the item
-/// moves only where it changes type.
+/// moves only where it changes type. The items stay in their gdl `Result`
+/// ([`CheckedItems`]), so they are not taken out of it and wrapped again either.
 struct DecoderStream<S> {
     /// `None` once the stream has ended. That drops the stream below and the decoders when this
     /// stream ends, not when its caller drops it, as `unfold` did.
@@ -309,9 +321,12 @@ struct DecoderStream<S> {
 
 impl<S> Stream for DecoderStream<S>
 where
-    S: Stream<Item = Annotated<LLMEngineOutput>> + AsyncEngineContextProvider + Unpin,
+    S: Stream<Item = gdl::Result<Annotated<LLMEngineOutput>>>
+        + AsyncEngineContextProvider
+        + CutShort
+        + Unpin,
 {
-    type Item = Annotated<BackendOutput>;
+    type Item = gdl::Result<Annotated<BackendOutput>>;
 
     // hot path: per-item-response
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
@@ -319,7 +334,7 @@ where
             return Poll::Ready(None);
         };
         match ready!(state.poll_step(cx)) {
-            Some(output) => Poll::Ready(Some(backend_output(output))),
+            Some(output) => Poll::Ready(Some(output.map(backend_output))),
             None => {
                 self.state = None;
                 Poll::Ready(None)
@@ -330,10 +345,16 @@ where
 
 impl<S> DecoderState<S>
 where
-    S: Stream<Item = Annotated<LLMEngineOutput>> + AsyncEngineContextProvider + Unpin,
+    S: Stream<Item = gdl::Result<Annotated<LLMEngineOutput>>>
+        + AsyncEngineContextProvider
+        + CutShort
+        + Unpin,
 {
     /// The next item, detokenized in place, or `None` when the stream has ended.
-    fn poll_step(&mut self, cx: &mut TaskContext<'_>) -> Poll<Option<Annotated<LLMEngineOutput>>> {
+    fn poll_step(
+        &mut self,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<gdl::Result<Annotated<LLMEngineOutput>>>> {
         // If we've already detected a local stop condition, end the stream
         if self.finished {
             return Poll::Ready(None);
@@ -342,12 +363,12 @@ where
         // `stream` already yielded `None` once; do not poll it again (unspecified
         // behavior for most `Stream` impls). Only drain the flush queue from here on.
         if self.stream_ended {
-            return Poll::Ready(self.pending_flush.pop());
+            return Poll::Ready(self.pending_flush.pop().map(Ok));
         }
 
         let output = loop {
             let output = ready!(self.stream.poll_next_unpin(cx));
-            let choice_already_finished = output.as_ref().is_some_and(|output| {
+            let choice_already_finished = output.as_ref().map(checked).is_some_and(|output| {
                 !output.is_event()
                     && output.data.as_ref().is_some_and(|data| {
                         self.finished_choices
@@ -361,7 +382,7 @@ where
 
         match output {
             Some(mut item) => {
-                let output = &mut item;
+                let output = checked_mut(&mut item);
                 // move to state.process_output
                 // handle any error conditions / unwraps here
 
@@ -431,7 +452,7 @@ where
                         .class(ErrorClass::BackendProtocol)
                         .message("no_stop_trim requires backend token IDs through the matched stop; the backend omitted them (also required when a parser retains the model's stop token text)")
                         .build();
-                    return Poll::Ready(Some(Annotated::from_err(error)));
+                    return Poll::Ready(Some(Ok(Annotated::from_err(error))));
                 }
 
                 // if we have a data field without an event, then we might need to update the data
@@ -664,10 +685,10 @@ where
                 // incomplete hidden-stop-sequence match before the decoders are
                 // dropped, and drain the flushed choices one synthetic chunk at a time.
                 self.stream_ended = true;
-                // Unless the request was killed: then the stream ended because the answer was
-                // cut short, and a flush would mark it finished. Checked once, here, never per
-                // item.
-                if self.context.is_killed() {
+                // Unless the request was killed or passed its deadline: then the stream
+                // ended because the answer was cut short, and a flush would mark it
+                // finished. Checked once, here, never per item.
+                if self.stream.cut_short() {
                     return Poll::Ready(None);
                 }
                 for (idx, decoder) in self.decoders.iter_mut() {
@@ -707,7 +728,7 @@ where
                     };
                     self.pending_flush.push(Annotated::from_data(data));
                 }
-                Poll::Ready(self.pending_flush.pop())
+                Poll::Ready(self.pending_flush.pop().map(Ok))
             }
         }
     }
@@ -745,36 +766,6 @@ fn backend_output(output: Annotated<LLMEngineOutput>) -> Annotated<BackendOutput
         event,
         comment,
         error,
-    }
-}
-
-#[async_trait]
-impl
-    Operator<
-        SingleIn<PreprocessedEmbeddingRequest>,
-        ManyOut<Annotated<EmbeddingsEngineOutput>>,
-        SingleIn<PreprocessedEmbeddingRequest>,
-        ManyOut<Annotated<EmbeddingsEngineOutput>>,
-    > for Backend
-{
-    async fn generate(
-        &self,
-        request: SingleIn<PreprocessedEmbeddingRequest>,
-        next: ServerStreamingEngine<
-            PreprocessedEmbeddingRequest,
-            Annotated<EmbeddingsEngineOutput>,
-        >,
-    ) -> Result<ManyOut<Annotated<EmbeddingsEngineOutput>>> {
-        // For embeddings, we mostly pass through since no detokenization is needed
-        // But we could add validation, logging, or other post-processing here
-        let response_stream = next.generate(request).await?;
-
-        // Could add embedding-specific post-processing here:
-        // - Validation of embedding dimensions
-        // - Normalization if requested
-        // - Usage statistics validation
-
-        Ok(response_stream)
     }
 }
 
@@ -1436,9 +1427,19 @@ mod tests {
         DeltaGeneratorExt, chat_completions::DeltaGenerator, delta_common::DeltaGeneratorOptions,
     };
     use crate::tokenizers::traits;
-    use dynamo_runtime::pipeline::{AsyncEngine, Error, ResponseStream};
+    use dynamo_runtime::pipeline::{
+        AsyncEngine, Error, ManyOut, ResponseStream, SingleIn, async_trait,
+    };
     use futures::StreamExt;
     use std::sync::Arc;
+
+    /// `backend` over `engine` as the frontend's gdl pipeline runs it.
+    fn on_gdl(
+        backend: &Arc<Backend>,
+        engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
+    ) -> ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> {
+        crate::operator::testing::backend(backend.clone(), engine)
+    }
 
     #[test]
     fn decoder_params_share_prompt_and_preserve_request_copy_on_write() {
@@ -1590,12 +1591,12 @@ mod tests {
                     Arc::new(SyntheticSglangStopEngine {
                         outputs: Some(outputs),
                     });
-                let outputs: Vec<_> =
-                    Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
-                        .await
-                        .unwrap()
-                        .collect()
-                        .await;
+                let outputs: Vec<_> = on_gdl(&backend, engine)
+                    .generate(SingleIn::new(request))
+                    .await
+                    .unwrap()
+                    .collect()
+                    .await;
                 let text: String = outputs
                     .iter()
                     .filter_map(|item| item.data.as_ref()?.text.as_deref())
@@ -1781,7 +1782,8 @@ mod tests {
                 engine_decodes_text,
             });
 
-        let mut stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let mut stream = on_gdl(&backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .expect("backend generation succeeds");
         let output = stream
@@ -1893,7 +1895,8 @@ mod tests {
                     ..Default::default()
                 }]),
             });
-        let mut stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let mut stream = on_gdl(&backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .unwrap();
         let output = stream.next().await.unwrap().data.unwrap();
@@ -1964,7 +1967,8 @@ mod tests {
                     },
                 ]),
             });
-        let outputs: Vec<_> = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let outputs: Vec<_> = on_gdl(&backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .unwrap()
             .filter_map(|item| async move { item.data })
@@ -2004,7 +2008,8 @@ mod tests {
         let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
             Arc::new(SyntheticSglangStopEngine::default());
 
-        let stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let stream = on_gdl(&backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .expect("backend generation succeeds");
         let mut outputs = stream.collect::<Vec<_>>().await;
@@ -2118,10 +2123,10 @@ mod tests {
                             ..Default::default()
                         }]),
                     });
-                    let mut stream =
-                        Operator::generate(backend.as_ref(), SingleIn::new(input), engine)
-                            .await
-                            .unwrap();
+                    let mut stream = on_gdl(&backend, engine)
+                        .generate(SingleIn::new(input))
+                        .await
+                        .unwrap();
                     let output = stream.next().await.unwrap();
                     if no_stop_trim == Some(true) && unsupported {
                         let error = output.error.expect("missing IDs must be rejected");
@@ -2209,7 +2214,8 @@ mod tests {
                         },
                     ]),
                 });
-            let mut stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+            let mut stream = on_gdl(&backend, engine)
+                .generate(SingleIn::new(request))
                 .await
                 .unwrap();
             let first = stream.next().await.unwrap().data.unwrap();
@@ -2354,7 +2360,7 @@ mod tests {
     }
 
     /// When the tokenizer's decode() returns Err, Decoder::process_token_ids()
-    /// should propagate the error. In the backend unfold closure, this error
+    /// should propagate the error. In the backend decoder stream, this error
     /// gets caught and converted to FinishReason::Error.
     #[test]
     fn test_decoder_process_token_ids_propagates_decode_error() {
@@ -2385,7 +2391,7 @@ mod tests {
         );
     }
 
-    /// Verify that the error message format matches what the backend unfold
+    /// Verify that the error message format matches what the backend decoder stream
     /// closure would wrap into FinishReason::Error.
     #[test]
     fn test_decoder_error_message_format_for_finish_reason() {
@@ -2406,7 +2412,7 @@ mod tests {
         let result = decoder.process_token_ids(&[42]);
         let err = result.err().expect("should be Err");
 
-        // This is what the backend unfold closure does:
+        // This is what the backend decoder stream does:
         let finish_reason = FinishReason::Error(format!("decode error: {err}"));
         match &finish_reason {
             FinishReason::Error(msg) => {
@@ -2576,7 +2582,8 @@ mod tests {
                 overpolled: overpolled.clone(),
             });
 
-        let stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let stream = on_gdl(&backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .expect("backend generation succeeds");
         let outputs: Vec<_> = stream.collect().await;
@@ -2672,7 +2679,8 @@ mod tests {
                 chunks,
                 dropped: dropped.clone(),
             });
-        let stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let stream = on_gdl(&backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .expect("backend generation succeeds");
         (stream, dropped)
@@ -2783,7 +2791,8 @@ mod tests {
         let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
             Arc::new(ErrorThenBareEofEngine);
 
-        let stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let stream = on_gdl(&backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .expect("backend generation succeeds");
         let outputs: Vec<_> = stream.collect().await;
@@ -2921,7 +2930,8 @@ mod tests {
         let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
             Arc::new(MixedBypassEngine);
 
-        let stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let stream = on_gdl(&backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .expect("backend generation succeeds");
         let outputs: Vec<_> = stream.collect().await;
@@ -3006,7 +3016,8 @@ mod tests {
         let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
             Arc::new(AnnotatedErrorThenBareEofEngine);
 
-        let stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let stream = on_gdl(&backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .expect("backend generation succeeds");
         let outputs: Vec<_> = stream.collect().await;
@@ -3075,7 +3086,8 @@ mod tests {
         let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
             Arc::new(ErrorWithEosEngine);
 
-        let stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let stream = on_gdl(&backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .expect("backend generation succeeds");
         let outputs: Vec<_> = stream.collect().await;
@@ -3142,7 +3154,8 @@ mod tests {
         let backend = Backend::from_tokenizer(Tokenizer::from(tokenizer));
         let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
             Arc::new(SignalAtEndEngine { at_end });
-        Operator::generate(backend.as_ref(), SingleIn::new(jailing_request(1)), engine)
+        on_gdl(&backend, engine)
+            .generate(SingleIn::new(jailing_request(1)))
             .await
             .expect("backend generation succeeds")
             .collect()
@@ -3181,46 +3194,39 @@ mod tests {
         );
     }
 
-    /// An engine that counts its calls and fails each one eagerly.
-    #[derive(Default)]
-    struct CountingFailEngine {
-        calls: std::sync::atomic::AtomicUsize,
+    /// Backend's backward half under `cx`, over [`withholding_chunks`] that end cleanly.
+    async fn backward_under(cx: &gdl::Cx) -> Vec<Annotated<BackendOutput>> {
+        use gdl::Around;
+        let tokenizer: Arc<dyn traits::Tokenizer> = Arc::new(JailingTokenizer);
+        let backend = Backend::from_tokenizer(Tokenizer::from(tokenizer));
+        let op = GdlOperator::<Backend, PreprocessedRequest>::new(backend);
+        let (_sent, state) = op
+            .forward(cx, Box::new(SingleIn::new(jailing_request(1))))
+            .await
+            .expect("Backend accepts the request");
+        let input = gdl::items(futures::stream::iter(
+            withholding_chunks().into_iter().map(Ok),
+        ));
+        op.backward(cx, state, input)
+            .map(|item| item.expect("Backend ends no stream with an `Err`"))
+            .collect()
+            .await
     }
 
-    #[async_trait]
-    impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>, Error>
-        for CountingFailEngine
-    {
-        async fn generate(
-            &self,
-            _request: SingleIn<PreprocessedRequest>,
-        ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Err(anyhow::anyhow!("the engine is unavailable"))
-        }
-    }
-
-    /// A Backend that cannot decode (no tokenizer) fails before it sends the request on: the
-    /// engine is never called, and its eager error cannot hide the reason.
+    /// A request past its deadline when the engine's stream ends cleanly was cut, as after a
+    /// kill. No Dynamo caller sets a deadline, so this drives the node with a `Cx` that has
+    /// one; the control without one shows the same input does finish.
     #[tokio::test]
-    async fn a_backend_that_cannot_decode_fails_before_dispatch() {
-        let backend = Backend::from_mdc(&ModelDeploymentCard::with_name_only("blank"));
-        let engine = Arc::new(CountingFailEngine::default());
-        let next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
-            engine.clone();
-        let error =
-            match Operator::generate(backend.as_ref(), SingleIn::new(jailing_request(1)), next)
-                .await
-            {
-                Ok(_) => panic!("a Backend without a tokenizer must fail"),
-                Err(error) => error,
-            };
-        assert!(error.to_string().contains("no tokenizer"), "{error:#}");
+    async fn backend_writes_no_finish_after_the_deadline() {
+        let control = backward_under(&gdl::Cx::new()).await;
         assert_eq!(
-            engine.calls.load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "the engine must not be called"
+            finish_reasons(&control),
+            vec![FinishReason::Stop],
+            "{control:?}"
         );
+
+        let past = gdl::Cx::new().with_timeout(std::time::Duration::ZERO);
+        let outputs = backward_under(&past).await;
+        assert_eq!(finish_reasons(&outputs), vec![], "{outputs:?}");
     }
 }

@@ -10,17 +10,21 @@
 //! | Row | Pipeline | Terminal |
 //! |---|---|---|
 //! | `engine` | the test LLM engine, called directly | itself |
-//! | `a` | `build_pipeline`: preprocessor, backend | test LLM engine |
-//! | `b` | `PreprocessedRouting::build_pipeline`: preprocessor, migration, backend, encoder router, prefill router | test LLM engine, in place of `RoutingHost` |
-//! | `c` | `PreprocessedRouting::build_preprocessed_pipeline`: migration, encoder router, prefill router | test LLM engine, in place of `RoutingHost` |
+//! | `a-gdl` | `build_pipeline`: preprocessor, backend | test LLM engine |
+//! | `b-gdl` | `PreprocessedRouting::build_pipeline`: preprocessor, migration, backend, encoder router, prefill router | test LLM engine, in place of `RoutingHost`, through `EngineSink` |
+//! | `c-gdl` | `PreprocessedRouting::build_preprocessed_pipeline`: migration, encoder router, prefill router | test LLM engine, in place of `RoutingHost`, through `EngineSink` |
 //! | `embed-engine` | the test embeddings engine, called directly | itself |
-//! | `embed` | `build_embeddings_pipeline`: preprocessor, backend | test embeddings engine, in place of `PushRouter` |
+//! | `embeddings-gdl` | `build_embeddings_pipeline`: preprocessor (an embeddings response needs no backend) | test embeddings engine, in place of `PushRouter` |
+//!
+//! The rows are gdl local pipelines, the only local pipeline the frontend composes. Until the
+//! switch, `a`, `b`, `c` and `embed` measured the same pipelines composed as Dynamo's `link`
+//! chains, and the gdl rows kept their `-gdl` names so their records carry on.
 //!
 //! The second number of a row is stream items: 1 and 16. For the embeddings rows it is
 //! inputs per request instead, because an embeddings stream carries one item for any number of
 //! inputs.
 //!
-//! The terminal stands in for everything behind it: in `b` and `c`, `RoutingHost` (worker
+//! The terminal stands in for everything behind it: in `b-gdl` and `c-gdl`, `RoutingHost` (worker
 //! selection, `PushRouter`, the request plane and the worker). The `engine` rows give the
 //! stand-in's own cost, so a pipeline's cost is its row minus the `engine` row.
 //!
@@ -37,8 +41,7 @@
 //! `block_in_place`. It has one blocking thread, so a window can wait for the blocking work a
 //! request leaves. No tracing subscriber is installed. `main` removes every `DYN_` variable and
 //! `TOKENIZERS_PARALLELISM`, and sets `RAYON_NUM_THREADS=4`, so neither the shell nor the host's
-//! core count changes the counts. A pipeline that an environment variable selects must be
-//! selected in code here.
+//! core count changes the counts.
 //!
 //! Measured on a 20-core aarch64 Linux host, Rust 1.99.0, 200 requests after 50 of warm-up,
 //! for the typical request. Debug and release builds give the same numbers:
@@ -46,17 +49,38 @@
 //! | Row | Allocations, 1 item | Bytes, 1 item | Allocations, 16 items | Bytes, 16 items |
 //! |---|---:|---:|---:|---:|
 //! | `engine` | 7 | 2,752 | 22 | 2,812 |
-//! | `a` | 346 | 100,886 | 859 | 122,374 |
-//! | `b` | 399 | 222,953 | 912 | 244,441 |
-//! | `c` | 71 | 140,579 | 86 | 140,639 |
+//! | `a-gdl` | 329 | 63,735 | 842 | 85,223 |
+//! | `b-gdl` | 344 | 80,394 | 857 | 101,882 |
+//! | `c-gdl` | 39 | 28,204 | 54 | 28,264 |
 //! | `embed-engine` | 8 | 6,548 | 23 | 88,868 |
-//! | `embed` | 199 | 44,438 | 2,283 | 529,886 |
+//! | `embeddings-gdl` | 178 | 41,735 | 2,262 | 527,183 |
 //!
-//! The largest allocation of `b` and `c` is Migration's boxed future, 59,592 bytes per request.
-//! `a` and `embed`, which have no Migration, make none that large.
+//! At the switch the Dynamo `link` chains made more allocations than these rows at both item
+//! counts, the same number more at each, so nothing per item: `a` +17 (346 and 859), `b` +55
+//! (399 and 912), `c` +32 (71 and 86), `embed` +21 (199 and 2,283).
+//!
+//! The rows carry the chat and preprocessed requests boxed (`dynamo_gdl_adapters::Boxed`),
+//! accepted at one allocation per box: `a-gdl` and `b-gdl` +2 (the chat request where it enters
+//! the pipeline, the preprocessed request where the preprocessor builds it; Migration sends its
+//! first attempt in that box), `c-gdl` +1 (the preprocessed request where it enters). Unboxed,
+//! gdl's chain copies a 2 KB request at every node and future it moves through. Boxed, per
+//! request (aarch64, `hotpath.sh` with `HOTPATH_RUNS=3`): `a-gdl` 19 fewer `memcpy` calls and
+//! 7,394 fewer instructions (4.6%), `b-gdl` 45 and 20,276 (10.6%), `c-gdl` 27 and 9,529 (23%),
+//! with nothing per item. Callgrind leaves out the system allocator; a `malloc` and `free` pair
+//! costs about 170 instructions.
+//! `lib/gdl-adapters/tests/allocations.rs` measures the parts in isolation: 2 allocations for
+//! a native gdl operator nested under the request's scope, and 21 against 19 at the boundary
+//! (`PipelineEngine` above, `EngineSink` below); a `link` stage made 14. Every operator in the gdl rows is native, and
+//! Backend and the chat preprocessor are around nodes of the hop below them; the test engine
+//! at the terminal enters through `EngineSink`, where the frontend's `RoutingHost` is a gdl
+//! sink of its own.
+//! Each gdl row asked for fewer bytes than the `link` chain it replaced: the `link` chain boxed a
+//! future per edge, the gdl composition one per stage, and `embeddings-gdl` has no backend stage.
+//! The largest allocation of `b` and `c` was Migration's boxed future, 59,592 bytes per request;
+//! the largest of `b-gdl` was 13,376 bytes and of `c-gdl` 12,256 (debug build, gdl 165b166c).
 //!
 //! Run: `cargo test -p dynamo-llm --test allocations`. For instructions and `memcpy` calls per
-//! request, see `lib/llm/benches/callgrind.sh` which runs this binary under
+//! request, see `lib/llm/benches/callgrind.sh` and `hotpath.sh`, which run this binary under
 //! callgrind as `allocations row <row> <items> <requests>`. Callgrind counts only the measured
 //! requests: the binary asks it for one dump after warm-up and one after the last measured
 //! request (see `lib/runtime/tests/common/callgrind.rs`). Callgrind does not count the system
@@ -105,21 +129,23 @@ const REQUESTS: usize = 200;
 /// Recorded allocations and bytes of the typical request (see [`Measured::typical`]). Debug
 /// and release builds give the same numbers.
 const BASELINE: &[Row] = &[
+    // Every gdl row: +1 for the request id `PipelineEngine` holds while it dispatches, to
+    // refuse a second in-flight request with that id.
     row("engine", 1, 7, 2752),
     row("engine", 16, 22, 2812),
-    row("a", 1, 346, 100886),
-    row("a", 16, 859, 122374),
     // +2 for the boxed chat and preprocessed requests (see the module docs).
-    row("b", 1, 399, 222953),
-    row("b", 16, 912, 244441),
+    row("a-gdl", 1, 329, 63735),
+    row("a-gdl", 16, 842, 85223),
     // +2 for the boxed chat and preprocessed requests (see the module docs).
-    row("c", 1, 71, 140579),
-    row("c", 16, 86, 140639),
+    row("b-gdl", 1, 344, 80394),
+    row("b-gdl", 16, 857, 101882),
     // +1 for the boxed preprocessed request (see the module docs).
+    row("c-gdl", 1, 39, 28204),
+    row("c-gdl", 16, 54, 28264),
     row("embed-engine", 1, 8, 6548),
     row("embed-engine", 16, 23, 88868),
-    row("embed", 1, 199, 44438),
-    row("embed", 16, 2283, 529886),
+    row("embeddings-gdl", 1, 178, 41735),
+    row("embeddings-gdl", 16, 2262, 527183),
 ];
 
 #[global_allocator]
@@ -541,12 +567,7 @@ async fn measure_engine(fixture: &Fixture, items: usize, requests: usize) -> Mea
     .await
 }
 
-async fn measure_a(
-    fixture: &Fixture,
-    name: &'static str,
-    items: usize,
-    requests: usize,
-) -> Measured {
+async fn measure_a(fixture: &Fixture, items: usize, requests: usize) -> Measured {
     let engine: ExecutionContext = fixture.llm_engine(items);
     let pipeline = build_pipeline::<
         NvCreateChatCompletionRequest,
@@ -554,7 +575,7 @@ async fn measure_a(
     >(&fixture.card, engine, fixture.tokenizer.clone())
     .await
     .expect("pipeline a");
-    measure(name, items, requests, || {
+    measure("a-gdl", items, requests, || {
         let pipeline = pipeline.clone();
         let request = chat_request();
         async move { drain(pipeline.generate(Context::new(request)).await.unwrap()).await }
@@ -562,12 +583,7 @@ async fn measure_a(
     .await
 }
 
-async fn measure_b(
-    fixture: &Fixture,
-    name: &'static str,
-    items: usize,
-    requests: usize,
-) -> Measured {
+async fn measure_b(fixture: &Fixture, items: usize, requests: usize) -> Measured {
     let routing = fixture.routing(items);
     let cancel = tokio_util::sync::CancellationToken::new();
     let dynamo_renderer::PromptFormatter::OAI(formatter) =
@@ -589,7 +605,7 @@ async fn measure_b(
             Arc::new(Metrics::new()),
         )
         .expect("pipeline b");
-    measure(name, items, requests, || {
+    measure("b-gdl", items, requests, || {
         let pipeline = pipeline.clone();
         let request = chat_request();
         async move { drain(pipeline.generate(Context::new(request)).await.unwrap()).await }
@@ -597,17 +613,12 @@ async fn measure_b(
     .await
 }
 
-async fn measure_c(
-    fixture: &Fixture,
-    name: &'static str,
-    items: usize,
-    requests: usize,
-) -> Measured {
+async fn measure_c(fixture: &Fixture, items: usize, requests: usize) -> Measured {
     let pipeline = fixture
         .routing(items)
         .build_preprocessed_pipeline(&fixture.card, 0, None, Arc::new(Metrics::new()))
         .expect("pipeline c");
-    measure(name, items, requests, || {
+    measure("c-gdl", items, requests, || {
         let pipeline = pipeline.clone();
         let request = preprocessed_request(fixture);
         async move { drain(pipeline.generate(Context::new(request)).await.unwrap()).await }
@@ -642,19 +653,13 @@ async fn measure_embed_engine(fixture: &Fixture, inputs: usize, requests: usize)
     .await
 }
 
-async fn measure_embed(
-    fixture: &Fixture,
-    name: &'static str,
-    inputs: usize,
-    requests: usize,
-) -> Measured {
+async fn measure_embed(fixture: &Fixture, inputs: usize, requests: usize) -> Measured {
     let mut card = fixture.card.clone();
     card.model_type = ModelType::Embedding;
     let preprocessor =
-        OpenAIPreprocessor::new_for_embeddings(card.clone()).expect("embeddings preprocessor");
-    let pipeline = build_embeddings_pipeline(&card, preprocessor, embeddings_engine())
-        .expect("pipeline embed");
-    measure(name, inputs, requests, || {
+        OpenAIPreprocessor::new_for_embeddings(card).expect("embeddings preprocessor");
+    let pipeline = build_embeddings_pipeline(preprocessor, embeddings_engine());
+    measure("embeddings-gdl", inputs, requests, || {
         let pipeline = pipeline.clone();
         let request = embedding_request(inputs);
         async move { drain(pipeline.generate(Context::new(request)).await.unwrap()).await }
@@ -665,11 +670,11 @@ async fn measure_embed(
 async fn measure_row(fixture: &Fixture, name: &str, items: usize, requests: usize) -> Measured {
     match name {
         "engine" => measure_engine(fixture, items, requests).await,
-        "a" => measure_a(fixture, "a", items, requests).await,
-        "b" => measure_b(fixture, "b", items, requests).await,
-        "c" => measure_c(fixture, "c", items, requests).await,
+        "a-gdl" => measure_a(fixture, items, requests).await,
+        "b-gdl" => measure_b(fixture, items, requests).await,
+        "c-gdl" => measure_c(fixture, items, requests).await,
         "embed-engine" => measure_embed_engine(fixture, items, requests).await,
-        "embed" => measure_embed(fixture, "embed", items, requests).await,
+        "embeddings-gdl" => measure_embed(fixture, items, requests).await,
         other => panic!("unknown row {other}"),
     }
 }
@@ -724,7 +729,7 @@ async fn check_counter() {
 /// row in a child process with tokenizer parallelism set explicitly and an odd rayon thread
 /// count, and compare it with the record.
 fn check_environment() {
-    let (name, items) = ("embed", 16);
+    let (name, items) = ("embeddings-gdl", 16);
     let output = std::process::Command::new(std::env::current_exe().expect("current exe"))
         .args(["row", name, &items.to_string(), "50"])
         .env("TOKENIZERS_PARALLELISM", "true")
@@ -752,16 +757,16 @@ fn check_environment() {
 const ROWS: &[(&str, usize)] = &[
     ("engine", 1),
     ("engine", 16),
-    ("a", 1),
-    ("a", 16),
-    ("b", 1),
-    ("b", 16),
-    ("c", 1),
-    ("c", 16),
+    ("a-gdl", 1),
+    ("a-gdl", 16),
+    ("b-gdl", 1),
+    ("b-gdl", 16),
+    ("c-gdl", 1),
+    ("c-gdl", 16),
     ("embed-engine", 1),
     ("embed-engine", 16),
-    ("embed", 1),
-    ("embed", 16),
+    ("embeddings-gdl", 1),
+    ("embeddings-gdl", 16),
 ];
 
 fn main() {
