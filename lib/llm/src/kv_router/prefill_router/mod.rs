@@ -1763,4 +1763,181 @@ mod tests {
         });
         assert!(extract_bootstrap_info(&params).is_none());
     }
+
+    #[derive(Default)]
+    struct CleanupDecode {
+        requests: Mutex<Vec<(bool, bool)>>,
+    }
+
+    #[async_trait]
+    impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>, Error>
+        for CleanupDecode
+    {
+        async fn generate(
+            &self,
+            request: SingleIn<PreprocessedRequest>,
+        ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+            // A dispatch that waits, as one to a worker does: a kill that cancels the caller
+            // can end the call here, before the leg reaches the worker.
+            tokio::task::yield_now().await;
+            self.requests
+                .lock()
+                .push((request.staged_kv_cleanup, request.context().is_killed()));
+            Ok(ResponseStream::new(
+                Box::pin(stream::empty()),
+                request.context(),
+            ))
+        }
+    }
+
+    /// Routing whose prefill worker is `prefill`, and whose decode engine records each call it
+    /// reaches as `(staged_kv_cleanup, killed)`.
+    async fn prefill_routing(
+        distributed: &dynamo_runtime::DistributedRuntime,
+        namespace: &str,
+        prefill: crate::kv_router::LlmDispatch,
+    ) -> (
+        crate::entrypoint::input::PreprocessedRouting,
+        Arc<CleanupDecode>,
+    ) {
+        use crate::kv_router::{EncoderRouter, RouterLoadSource, RoutingLoadContext};
+
+        let endpoint = distributed
+            .namespace(namespace)
+            .unwrap()
+            .component("workers")
+            .unwrap()
+            .endpoint("prefill");
+        let client = endpoint.client().await.unwrap();
+        endpoint.register_endpoint_instance().await.unwrap();
+        client.wait_for_instances().await.unwrap();
+        let load_context = RoutingLoadContext::start(
+            client.clone(),
+            RouterLoadSource::Prefill,
+            crate::discovery::LoadThresholdHandle::new(Default::default()),
+            &distributed.child_token(),
+            None,
+        )
+        .await
+        .unwrap();
+        let host = Arc::new(
+            RoutingHost::builder(client, RouterMode::RoundRobin)
+                .load_context(load_context)
+                .dispatch(prefill)
+                .build()
+                .await
+                .unwrap(),
+        );
+        let router =
+            PrefillRouter::disabled(Arc::new(ModelManager::new()), RouterMode::RoundRobin, None);
+        router.binding.store(Some(Arc::new(PrefillBinding {
+            target_id: WorkerSetTargetId::Legacy(endpoint.id()),
+            endpoint_id: endpoint.id(),
+            router: host,
+            prefill_router_mode: RouterMode::RoundRobin,
+        })));
+        router.lifecycle.store(
+            PrefillLifecycleState::Active as u8,
+            std::sync::atomic::Ordering::Release,
+        );
+        let decode = Arc::new(CleanupDecode::default());
+        let routing = crate::entrypoint::input::PreprocessedRouting::new(
+            decode.clone(),
+            router,
+            EncoderRouter::disabled(),
+        );
+        (routing, decode)
+    }
+
+    /// A client disconnect while the prefill leg is still dispatching: the HTTP handler drops
+    /// the call. The route runs inside the call, so the drop ends the prefill dispatch too, and
+    /// decode is never reached.
+    #[tokio::test]
+    async fn dropping_the_call_before_the_prefill_handoff_drops_the_prefill_dispatch() {
+        use crate::http::service::metrics::Metrics;
+        use crate::model_card::ModelDeploymentCard;
+        use dynamo_runtime::{DistributedRuntime, Runtime, distributed::DistributedConfig};
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        struct Dropped(Arc<AtomicBool>);
+
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        struct HeldPrefill {
+            entered: tokio::sync::mpsc::UnboundedSender<()>,
+            dropped: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl
+            dynamo_runtime::pipeline::StreamingDispatch<
+                PreprocessedRequest,
+                Annotated<LLMEngineOutput>,
+            > for HeldPrefill
+        {
+            async fn generate(
+                &self,
+                _request: SingleIn<dynamo_runtime::pipeline::AddressedRequest<PreprocessedRequest>>,
+            ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+                let _guard = Dropped(self.dropped.clone());
+                self.entered.send(()).unwrap();
+                std::future::pending().await
+            }
+
+            async fn generate_bidirectional(
+                &self,
+                _: dynamo_runtime::component::Instance,
+                _: String,
+                _: dynamo_runtime::pipeline::ManyIn<PreprocessedRequest>,
+            ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+                unreachable!("prefill dispatch takes a single request")
+            }
+        }
+
+        let runtime = Runtime::from_current().unwrap();
+        let distributed =
+            DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+                .await
+                .unwrap();
+        let card =
+            ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
+                .unwrap();
+        let (entered, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (routing, decode) = prefill_routing(
+            &distributed,
+            "drop-before-handoff",
+            Arc::new(HeldPrefill {
+                entered,
+                dropped: dropped.clone(),
+            }),
+        )
+        .await;
+        let pipeline = routing
+            .build_preprocessed_pipeline(&card, 0, None, Arc::new(Metrics::new()))
+            .unwrap();
+        let request = Context::new(inference_request());
+        let call = tokio::spawn(async move { pipeline.generate(request).await.map(|_| ()) });
+        tokio::time::timeout(Duration::from_secs(5), arrivals.recv())
+            .await
+            .expect("prefill enters dispatch")
+            .unwrap();
+        call.abort();
+        let _ = call.await;
+        let ended = tokio::time::timeout(Duration::from_secs(2), async {
+            while !dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        let decode_calls = decode.requests.lock().len();
+        runtime.shutdown();
+        assert_eq!((ended, decode_calls), (true, 0));
+    }
 }
