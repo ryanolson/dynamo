@@ -196,6 +196,30 @@ the stages.
   item: A +6.8%, B +6.5%, C +606 instructions, embeddings equal; most of the per-item gap is
   `memcpy` (A and B 10 to 11 more calls per item).
 
+- **Against Dynamo with the same fixes:** the reference is ai-dynamo `7c195fd1a7` with the
+  fixes this port carries that help Dynamo on its own (the in-place stages, the boxed fields,
+  Migration's stream, Ingress calling its engine, the behavior fixes), measured with this
+  harness's dynamo rows. aarch64 (Neoverse-V2), Rust 1.99.0, both trees built with the same
+  `RUSTFLAGS`, valgrind 3.28, `callgrind.sh` with 3 runs per row, lowest instructions kept:
+
+  | Row | Instructions per request, 1 item | Per extra item | memcpy per item |
+  |---|---:|---:|---:|
+  | A | 169,772 -> 155,876 (-8.2%) | 19,906 -> 21,138 (+6.2%) | 41.2 -> 51.2 |
+  | B | 214,798 -> 170,405 (-20.7%) | 20,157 -> 21,379 (+6.1%) | 42.2 -> 53.2 |
+  | C | 62,503 -> 30,715 (-50.9%) | 795 -> 1,398 | 5 -> 10 |
+  | embeddings | 99,579 -> 95,474 (-4.1%) | 81,684 -> 81,500 | 90.8 -> 90.8 |
+
+  Where the extra copies per item are, on A (B is the same, plus 2 in Backend reading through
+  `CheckedItems` and 1 fewer in Migration): 4 where the engine's stream enters gdl through
+  `EngineSink` (`map(Ok)` and its `Fuse`), 2 at gdl's `Fuse` between Backend and the
+  preprocessor, 2 taking items out of their `Result` at the `PipelineEngine` exit, 1 in gdl's
+  `Bounded`, and 1 in the roles edit after the parsers. Taking the item out at the exit in one
+  `map`, with the endings out of line, left every count unchanged.
+
+  End to end, with the frontend (pipeline B) on 2 cores and mocker workers, 512-token prompts,
+  5 runs per case: at 2,048 output tokens and concurrency 512, where the frontend is the
+  bottleneck, gdl gives 5.9% fewer output tokens per second and uses 6.9% more frontend CPU per
+  token; at 16 output tokens it gives 5 to 7% more, as the per-request saving wins.
 - **Not covered:** the window starts where the HTTP handler calls the engine. HTTP parsing, the
   handler's request metrics and SSE encoding are outside it, and the reasoning and tool-call
   parsers are not on these rows.
