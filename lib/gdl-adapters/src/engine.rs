@@ -3,13 +3,16 @@
 
 //! A gdl pipeline as a Dynamo engine.
 
+use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 
 use dynamo_runtime::engine::{AsyncEngine, AsyncEngineContext, Data, ResponseStream};
-use dynamo_runtime::pipeline::{AsyncEngineContextProvider, ManyOut, SingleIn, async_trait};
+use dynamo_runtime::pipeline::{
+    AsyncEngineContextProvider, ManyOut, PipelineError, SingleIn, async_trait,
+};
 use dynamo_runtime::protocols::annotated::Annotated;
 use futures::Stream;
 use gdl::Items;
@@ -39,6 +42,8 @@ pub struct PipelineEngine<N, Req, T, R = SingleIn<Req>> {
     next: N,
     /// Whether a kill of the request cancels the `Cx` (see [`CxBridge`]).
     cancel_on_kill: bool,
+    /// The ids of the requests still in their dispatch (see [`InFlightIds`]).
+    in_flight: InFlightIds,
     types: PhantomData<fn(Req, R) -> T>,
 }
 
@@ -49,6 +54,7 @@ impl<N, Req, T, R> PipelineEngine<N, Req, T, R> {
         Self {
             next,
             cancel_on_kill: true,
+            in_flight: InFlightIds::default(),
             types: PhantomData,
         }
     }
@@ -62,6 +68,7 @@ impl<N, Req, T, R> PipelineEngine<N, Req, T, R> {
         Self {
             next,
             cancel_on_kill: false,
+            in_flight: InFlightIds::default(),
             types: PhantomData,
         }
     }
@@ -84,13 +91,54 @@ where
             CxBridge::cx_for_dynamo_stages(request.controller())
         };
         let root = cx.clone();
-        match self.next.generate(cx, R::carry(request)).await {
+        let claim = self.in_flight.claim(context.id())?;
+        let dispatched = self.next.generate(cx, R::carry(request)).await;
+        drop(claim);
+        match dispatched {
             Ok(items) => Ok(ResponseStream::new(
                 Box::pin(AnnotatedItems::new(items, root, Arc::clone(&context))),
                 context,
             )),
             Err(error) => Err(exit(error)),
         }
+    }
+}
+
+/// The ids of the requests a [`PipelineEngine`] is still dispatching. A second request with
+/// one of them is refused with [`PipelineError::DuplicateRequestId`], as Dynamo's pipeline
+/// source refused it: its response map routed a response back by request id. An id is held
+/// until the dispatch returns, not for the whole stream.
+#[derive(Default)]
+struct InFlightIds(Mutex<HashSet<Arc<str>>>);
+
+impl InFlightIds {
+    fn claim(&self, id: &str) -> Result<InFlightClaim<'_>, PipelineError> {
+        let mut ids = self.lock();
+        if ids.contains(id) {
+            return Err(PipelineError::DuplicateRequestId(id.to_string()));
+        }
+        // One allocation, shared by the set and the claim that removes it.
+        let id: Arc<str> = Arc::from(id);
+        ids.insert(Arc::clone(&id));
+        Ok(InFlightClaim { owner: self, id })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashSet<Arc<str>>> {
+        // A poisoned lock means another thread panicked holding it; the set is still
+        // consistent, because every update is a single insert or remove.
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Frees its id when dropped: when the dispatch returns or fails, or when the call is dropped.
+struct InFlightClaim<'a> {
+    owner: &'a InFlightIds,
+    id: Arc<str>,
+}
+
+impl Drop for InFlightClaim<'_> {
+    fn drop(&mut self) {
+        self.owner.lock().remove(&self.id);
     }
 }
 
