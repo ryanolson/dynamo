@@ -91,7 +91,7 @@ impl Worker {
         }));
         Self {
             ingress,
-            address: start_response_peer(),
+            address: start_response_peer().address,
             arrivals,
             call_gate,
             stream_gate,
