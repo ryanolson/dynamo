@@ -15,11 +15,12 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use dynamo_gdl_adapters::{AnnotatedItems, Boxed, CheckedItems, EngineSink, PipelineEngine};
 use dynamo_llm::backend::Backend;
+use dynamo_llm::entrypoint::input::build_pipeline;
 use dynamo_llm::model_card::ModelDeploymentCard;
 use dynamo_llm::operator::GdlOperator;
 use dynamo_llm::preprocessor::prompt::prompt_formatter_from_mdc;
@@ -38,6 +39,8 @@ use dynamo_runtime::pipeline::{
 use dynamo_runtime::protocols::annotated::Annotated;
 use futures::{Stream, StreamExt, stream};
 use gdl::{Cx, Items};
+use tokio::sync::Notify;
+use tokio::time::Instant;
 
 type Pre = PreprocessedRequest;
 type Out = ManyOut<Annotated<LLMEngineOutput>>;
@@ -50,9 +53,19 @@ const SAMPLE_MODEL: &str = concat!(
     "/../llm/tests/data/sample-models/TinyLlama_v1.1"
 );
 
-/// Long enough for the worker's ready tokens to pass before the deadline or cancel, and short
-/// enough to keep the suite fast.
-const MID_STREAM: Duration = Duration::from_millis(100);
+/// The deadlines a root deadline case tries in turn. The deadline starts at the root, before
+/// preprocessing, and gdl reads it on the system's monotonic clock, which a test cannot pause.
+/// So a case first checks that the worker held its stream open before the deadline passed, and
+/// tries the next, longer deadline when it did not: a slow dispatch makes the case slower, never
+/// wrong.
+const DEADLINES: [Duration; 3] = [
+    Duration::from_millis(100),
+    Duration::from_secs(1),
+    Duration::from_secs(10),
+];
+
+/// How long a stream that should stay open must yield nothing, once the worker holds it.
+const QUIET: Duration = Duration::from_millis(200);
 
 fn card() -> ModelDeploymentCard {
     ModelDeploymentCard::load_from_disk(SAMPLE_MODEL, None).unwrap()
@@ -75,14 +88,36 @@ fn answer() -> [Annotated<LLMEngineOutput>; 2] {
     .map(Annotated::from_data)
 }
 
+/// When a worker started to hold its stream open: after the caller read its whole answer,
+/// since the worker's stream is polled past its last item only after that item was passed on.
+#[derive(Default)]
+struct Held {
+    at: Mutex<Option<Instant>>,
+    signal: Notify,
+}
+
+impl Held {
+    fn mark(&self) {
+        *self.at.lock().unwrap() = Some(Instant::now());
+        self.signal.notify_one();
+    }
+
+    fn at(&self) -> Option<Instant> {
+        *self.at.lock().unwrap()
+    }
+}
+
 /// What the root does to the request's `Cx` before the pipeline sees it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 enum RootEdit {
     None,
-    /// A deadline that passes mid-stream.
-    Deadline,
-    /// A cancel of the root `Cx` mid-stream.
-    Cancel,
+    /// A deadline `timeout` from the dispatch; the root records when it passes in `at`.
+    Deadline {
+        timeout: Duration,
+        at: Arc<Mutex<Option<Instant>>>,
+    },
+    /// A cancel of the root `Cx` once the worker holds its stream open.
+    CancelWhenHeld(Arc<Held>),
 }
 
 /// The pipeline's root: a gdl `Next` in front of the `Source`, where an edge that sets a
@@ -100,13 +135,17 @@ where
     Item: Send + 'static,
 {
     fn generate(&self, cx: Cx, req: Req) -> impl Future<Output = gdl::Result<Items<Item>>> + Send {
-        let cx = match self.edit {
+        let cx = match &self.edit {
             RootEdit::None => cx,
-            RootEdit::Deadline => cx.with_timeout(MID_STREAM),
-            RootEdit::Cancel => {
-                let cancel = cx.clone();
+            RootEdit::Deadline { timeout, at } => {
+                let cx = cx.with_timeout(*timeout);
+                *at.lock().unwrap() = cx.deadline().map(|deadline| deadline.instant());
+                cx
+            }
+            RootEdit::CancelWhenHeld(held) => {
+                let (cancel, held) = (cx.clone(), Arc::clone(held));
                 tokio::spawn(async move {
-                    tokio::time::sleep(MID_STREAM).await;
+                    held.signal.notified().await;
                     cancel.cancel();
                 });
                 cx
@@ -159,31 +198,47 @@ where
     )
 }
 
-/// A Dynamo worker that sends [`answer`], kills `kill` when given, and then holds its stream
-/// open: a worker still generating when the request ends around it.
-struct Holding {
+/// A Dynamo worker that sends [`answer`], kills `kill` when given, and then either ends or
+/// holds its stream open (`hold`): a worker still generating when the request ends around it.
+struct DynamoWorker {
     kill: Option<Arc<dyn AsyncEngineContext>>,
+    hold: bool,
+    held: Arc<Held>,
+}
+
+impl DynamoWorker {
+    fn holding(kill: Option<Arc<dyn AsyncEngineContext>>) -> (Arc<Self>, Arc<Held>) {
+        let held = Arc::new(Held::default());
+        let worker = Arc::new(Self {
+            kill,
+            hold: true,
+            held: Arc::clone(&held),
+        });
+        (worker, held)
+    }
 }
 
 #[async_trait]
-impl AsyncEngine<SingleIn<Pre>, Out, Error> for Holding {
+impl AsyncEngine<SingleIn<Pre>, Out, Error> for DynamoWorker {
     async fn generate(&self, request: SingleIn<Pre>) -> Result<Out, Error> {
-        let kill = self.kill.clone();
+        let (kill, hold, held) = (self.kill.clone(), self.hold, Arc::clone(&self.held));
         let tail = stream::once(async move {
             if let Some(context) = kill {
                 context.kill();
             }
+            if hold {
+                held.mark();
+                std::future::pending::<()>().await;
+            }
         })
         .filter_map(|()| async { None });
-        let items = stream::iter(answer()).chain(tail).chain(stream::pending());
+        let items = stream::iter(answer()).chain(tail);
         Ok(ResponseStream::new(Box::pin(items), request.context()))
     }
 }
 
-fn holding(
-    kill: Option<Arc<dyn AsyncEngineContext>>,
-) -> EngineSink<Holding, Pre, LLMEngineOutput, Boxed<Pre>> {
-    EngineSink::new(Arc::new(Holding { kill }))
+fn sink(worker: Arc<DynamoWorker>) -> EngineSink<DynamoWorker, Pre, LLMEngineOutput, Boxed<Pre>> {
+    EngineSink::new(worker)
 }
 
 /// How a gdl worker ends its stream after [`answer`].
@@ -264,15 +319,19 @@ fn describe(item: &Annotated<ChatOut>) -> String {
     if text { "text" } else { "empty" }.to_string()
 }
 
-/// Every item of the response, described. The response must end within 10 s.
-async fn response(pipeline: Pipeline, request: SingleIn<Chat>) -> Vec<String> {
-    let stream = pipeline.generate(request).await.unwrap();
+/// Every item of `stream`, described. The stream must end within 10 s.
+async fn collect(stream: ManyOut<Annotated<ChatOut>>) -> Vec<String> {
     tokio::time::timeout(
         Duration::from_secs(10),
         stream.map(|item| describe(&item)).collect(),
     )
     .await
     .expect("the response ends")
+}
+
+/// Every item of the response, described.
+async fn response(pipeline: Pipeline, request: SingleIn<Chat>) -> Vec<String> {
+    collect(pipeline.generate(request).await.unwrap()).await
 }
 
 fn kill_of(request: &SingleIn<Chat>) -> Option<Arc<dyn AsyncEngineContext>> {
@@ -291,11 +350,137 @@ async fn a_clean_end_closes_with_a_usage_chunk() {
     assert_eq!(items, ["text", "finish Length", "usage"]);
 }
 
+/// The response's items, described, and whether the stream ended. Once the worker holds its
+/// stream open, a stream that yields nothing for [`QUIET`] counts as open.
+async fn read_open(mut stream: ManyOut<Annotated<ChatOut>>, held: &Held) -> (Vec<String>, bool) {
+    let until = Instant::now() + Duration::from_secs(10);
+    let mut items = Vec::new();
+    loop {
+        match tokio::time::timeout(QUIET, stream.next()).await {
+            Ok(Some(item)) => items.push(describe(&item)),
+            Ok(None) => return (items, true),
+            Err(_) if held.at().is_some() => return (items, false),
+            Err(_) => assert!(Instant::now() < until, "the response moves within 10 s"),
+        }
+    }
+}
+
+/// This file composes pipeline A from `build_pipeline`'s parts, to add its seams. This runs
+/// the cases a Dynamo worker gives through both, so a change to the production composition
+/// shows here: for example a root that lets a kill cancel the `Cx`, which ends a killed
+/// worker's open stream where today it stays open.
+#[tokio::test]
+async fn the_copy_answers_as_build_pipeline_does() {
+    struct Case {
+        kill: bool,
+        hold: bool,
+        items: &'static [&'static str],
+        ended: bool,
+    }
+    let cases = [
+        Case {
+            kill: false,
+            hold: false,
+            items: &["text", "finish Length", "usage"],
+            ended: true,
+        },
+        Case {
+            kill: true,
+            hold: false,
+            items: &["text", "finish Length"],
+            ended: true,
+        },
+        Case {
+            kill: true,
+            hold: true,
+            items: &["text", "finish Length"],
+            ended: false,
+        },
+    ];
+    for Case {
+        kill,
+        hold,
+        items,
+        ended,
+    } in cases
+    {
+        for production in [true, false] {
+            let request = chat();
+            let held = Arc::new(Held::default());
+            let worker = Arc::new(DynamoWorker {
+                kill: kill.then(|| request.context()),
+                hold,
+                held: Arc::clone(&held),
+            });
+            let pipeline = if production {
+                let card = card();
+                let tokenizer = card.tokenizer().unwrap();
+                build_pipeline::<Chat, ChatOut>(&card, worker, tokenizer)
+                    .await
+                    .unwrap()
+            } else {
+                pipeline_a(sink(worker), RootEdit::None)
+            };
+            let stream = pipeline.generate(request).await.unwrap();
+            assert_eq!(
+                read_open(stream, &held).await,
+                (items.iter().map(|item| item.to_string()).collect(), ended),
+                "kill {kill}, hold {hold}, production {production}"
+            );
+        }
+    }
+}
+
 // An ending of the request's root `Cx`.
+
+/// The response to a request under a root deadline that passes while the worker holds its
+/// stream open, after its answer: see [`DEADLINES`]. `pause` blocks the dispatch of the first
+/// try at its first wait, as a descheduled thread would.
+async fn under_a_root_deadline(kill: bool, pause: Option<Duration>) -> Vec<String> {
+    for (attempt, timeout) in DEADLINES.into_iter().enumerate() {
+        let request = chat();
+        let (worker, held) = DynamoWorker::holding(kill.then(|| request.context()));
+        let at = Arc::new(Mutex::new(None));
+        let edit = RootEdit::Deadline {
+            timeout,
+            at: Arc::clone(&at),
+        };
+        let pipeline = pipeline_a(sink(worker), edit);
+        let mut dispatch = pipeline.generate(request);
+        let mut pause = pause.filter(|_| attempt == 0);
+        let dispatched = std::future::poll_fn(|task| {
+            let poll = dispatch.as_mut().poll(task);
+            if poll.is_pending()
+                && let Some(pause) = pause.take()
+            {
+                std::thread::sleep(pause);
+            }
+            poll
+        })
+        .await;
+        let items = match dispatched {
+            Ok(stream) => Some(collect(stream).await),
+            Err(_) => None,
+        };
+        let deadline = at.lock().unwrap().expect("the root set a deadline");
+        if held.at().is_some_and(|held| held < deadline) {
+            return items.expect("a deadline that passes after the answer does not fail the call");
+        }
+    }
+    panic!("the worker never held its stream before the deadline passed");
+}
 
 #[tokio::test]
 async fn a_root_deadline_mid_stream_ends_with_a_deadline_error_item() {
-    let items = response(pipeline_a(holding(None), RootEdit::Deadline), chat()).await;
+    let items = under_a_root_deadline(false, None).await;
+    assert_eq!(items, ["text", "finish Length", "error DeadlineExceeded"]);
+}
+
+/// The review's case: the dispatch is descheduled past the first deadline. The first try fails
+/// eagerly, and the next one, with a longer deadline, gives the case its answer.
+#[tokio::test]
+async fn a_root_deadline_case_survives_a_slow_dispatch() {
+    let items = under_a_root_deadline(false, Some(DEADLINES[0] * 2)).await;
     assert_eq!(items, ["text", "finish Length", "error DeadlineExceeded"]);
 }
 
@@ -303,7 +488,9 @@ async fn a_root_deadline_mid_stream_ends_with_a_deadline_error_item() {
 /// request short, so neither case writes the usage chunk.
 #[tokio::test]
 async fn a_root_cancel_mid_stream_ends_with_no_item() {
-    let items = response(pipeline_a(holding(None), RootEdit::Cancel), chat()).await;
+    let (worker, held) = DynamoWorker::holding(None);
+    let pipeline = pipeline_a(sink(worker), RootEdit::CancelWhenHeld(held));
+    let items = response(pipeline, chat()).await;
     assert_eq!(items, ["text", "finish Length"]);
 }
 
@@ -338,9 +525,7 @@ async fn a_worker_node_error_ends_with_an_internal_error_item() {
 
 #[tokio::test]
 async fn a_kill_with_a_root_deadline_still_ends_with_the_deadline_error_item() {
-    let request = chat();
-    let worker = holding(kill_of(&request));
-    let items = response(pipeline_a(worker, RootEdit::Deadline), request).await;
+    let items = under_a_root_deadline(true, None).await;
     assert_eq!(items, ["text", "finish Length", "error DeadlineExceeded"]);
 }
 
@@ -478,29 +663,4 @@ async fn a_kill_with_a_cancel_yields_no_item() {
             "{state:?}"
         );
     }
-}
-
-#[tokio::test]
-#[ignore = "edge-endings item 3: the deadline fixture assumes dispatch takes less than 100 ms"]
-async fn a_dispatch_pause_preserves_the_deadline_fixtures_mid_stream_order() {
-    let pipeline = pipeline_a(holding(None), RootEdit::Deadline);
-    let mut dispatch = Box::pin(pipeline.generate(chat()));
-    let mut paused = false;
-    let result = std::future::poll_fn(|task| {
-        let poll = dispatch.as_mut().poll(task);
-        if !paused && poll.is_pending() {
-            paused = true;
-            // Model a deschedule after the deadline is armed, without changing the worker.
-            std::thread::sleep(MID_STREAM * 2);
-        }
-        poll
-    })
-    .await;
-    assert!(
-        paused,
-        "the fixture dispatch must reach its tokenizer await"
-    );
-    let stream = result.expect("the deadline fixture must reach its streaming assertion");
-    let items: Vec<_> = stream.map(|item| describe(&item)).collect().await;
-    assert_eq!(items, ["text", "finish Length", "error DeadlineExceeded"]);
 }
