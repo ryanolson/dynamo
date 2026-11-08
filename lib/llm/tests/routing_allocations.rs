@@ -82,12 +82,13 @@ static GLOBAL: Counting = Counting;
 /// `gdl` includes the box `PipelineEngine` puts the request in, as the frontend's gdl pipelines
 /// carry it (`dynamo_gdl_adapters::Boxed`): one allocation, accepted for the copies it saves.
 /// `gdl` also includes the request id `PipelineEngine` holds while it dispatches, to refuse a
-/// second in-flight request with that id: one allocation.
+/// second in-flight request with that id: one allocation. The response leaves in one box, with
+/// no `ResponseStream` around it: one allocation fewer.
 const RECORDS: &[(&str, usize, u64)] = &[
     ("engine", 1, 26),
     ("engine", 16, 41),
-    ("gdl", 1, 42),
-    ("gdl", 16, 57),
+    ("gdl", 1, 41),
+    ("gdl", 16, 56),
 ];
 
 const WARMUP: usize = 20;

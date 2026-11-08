@@ -49,15 +49,15 @@
 //! | Row | Allocations, 1 item | Bytes, 1 item | Allocations, 16 items | Bytes, 16 items |
 //! |---|---:|---:|---:|---:|
 //! | `engine` | 7 | 2,752 | 22 | 2,812 |
-//! | `a-gdl` | 329 | 63,759 | 842 | 85,247 |
-//! | `b-gdl` | 344 | 80,410 | 857 | 101,898 |
-//! | `c-gdl` | 39 | 28,220 | 54 | 28,280 |
+//! | `a-gdl` | 328 | 63,727 | 841 | 85,215 |
+//! | `b-gdl` | 343 | 80,378 | 856 | 101,866 |
+//! | `c-gdl` | 38 | 28,188 | 53 | 28,248 |
 //! | `embed-engine` | 8 | 6,548 | 23 | 88,868 |
-//! | `embeddings-gdl` | 178 | 41,751 | 2,262 | 527,199 |
+//! | `embeddings-gdl` | 177 | 41,719 | 2,261 | 527,167 |
 //!
 //! At the switch the Dynamo `link` chains made more allocations than these rows at both item
-//! counts, the same number more at each, so nothing per item: `a` +17 (346 and 859), `b` +55
-//! (399 and 912), `c` +32 (71 and 86), `embed` +21 (199 and 2,283).
+//! counts, the same number more at each, so nothing per item: `a` +18 (346 and 859), `b` +56
+//! (399 and 912), `c` +33 (71 and 86), `embed` +22 (199 and 2,283).
 //!
 //! The rows carry the chat and preprocessed requests boxed (`dynamo_gdl_adapters::Boxed`),
 //! accepted at one allocation per box: `a-gdl` and `b-gdl` +2 (the chat request where it enters
@@ -130,24 +130,23 @@ const REQUESTS: usize = 200;
 /// and release builds give the same numbers.
 const BASELINE: &[Row] = &[
     // Every gdl row: +1 for the request id `PipelineEngine` holds while it dispatches, to
-    // refuse a second in-flight request with that id.
-    // Every gdl row: 16 to 24 bytes more per request, at any item count, since gdl's ended
-    // form: each node and attempt boundary keeps its stream's ending in its own struct.
+    // refuse a second in-flight request with that id, and -1 for the response, which leaves
+    // in one box with no `ResponseStream` around it.
     row("engine", 1, 7, 2752),
     row("engine", 16, 22, 2812),
     // +2 for the boxed chat and preprocessed requests (see the module docs).
-    row("a-gdl", 1, 329, 63759),
-    row("a-gdl", 16, 842, 85247),
+    row("a-gdl", 1, 328, 63727),
+    row("a-gdl", 16, 841, 85215),
     // +2 for the boxed chat and preprocessed requests (see the module docs).
-    row("b-gdl", 1, 344, 80410),
-    row("b-gdl", 16, 857, 101898),
+    row("b-gdl", 1, 343, 80378),
+    row("b-gdl", 16, 856, 101866),
     // +1 for the boxed preprocessed request (see the module docs).
-    row("c-gdl", 1, 39, 28220),
-    row("c-gdl", 16, 54, 28280),
+    row("c-gdl", 1, 38, 28188),
+    row("c-gdl", 16, 53, 28248),
     row("embed-engine", 1, 8, 6548),
     row("embed-engine", 16, 23, 88868),
-    row("embeddings-gdl", 1, 178, 41751),
-    row("embeddings-gdl", 16, 2262, 527199),
+    row("embeddings-gdl", 1, 177, 41719),
+    row("embeddings-gdl", 16, 2261, 527167),
 ];
 
 #[global_allocator]

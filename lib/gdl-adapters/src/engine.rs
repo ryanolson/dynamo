@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 
-use dynamo_runtime::engine::{AsyncEngine, AsyncEngineContext, Data, ResponseStream};
+use dynamo_runtime::engine::{AsyncEngine, AsyncEngineContext, AsyncEngineStream, Data};
 use dynamo_runtime::pipeline::{
     AsyncEngineContextProvider, ManyOut, PipelineError, SingleIn, async_trait,
 };
@@ -97,10 +97,9 @@ where
         let dispatched = self.next.generate(cx, R::carry(request)).await;
         drop(claim);
         match dispatched {
-            Ok(items) => Ok(ResponseStream::new(
-                Box::pin(EndedItems::new(items, root, Arc::clone(&context))),
-                context,
-            )),
+            // `EndedItems` gives the request's context itself, so it is the response stream:
+            // a `ResponseStream` around it would put one more call in front of every item.
+            Ok(items) => Ok(Box::pin(EndedItems::new(items, root, context))),
             Err(error) => Err(exit(error)),
         }
     }
@@ -225,6 +224,9 @@ impl<T: Data> Stream for EndedItems<T> {
         polled
     }
 }
+
+/// A Dynamo response stream: it gives the request's context.
+impl<T: Data> AsyncEngineStream<Annotated<T>> for EndedItems<T> {}
 
 /// A reader of this stream has had the input's ending as a last item, if it had one: the
 /// stream ends cleanly.
