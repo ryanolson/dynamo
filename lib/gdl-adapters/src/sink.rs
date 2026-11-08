@@ -15,7 +15,7 @@ use gdl::{Cx, Items};
 use crate::error::enter;
 use crate::request::Carried;
 
-/// A Dynamo engine as a gdl [`Sink`](gdl::Sink): Python engines, the KV
+/// A Dynamo engine as a gdl [`Sink`](gdl::Sink), in either stream form: Python engines, the KV
 /// router's `RoutingHost`, the mocker, or any other
 /// `AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>>`.
 ///
@@ -66,6 +66,27 @@ where
     async fn generate(&self, _cx: Cx, req: R) -> gdl::Result<Items<Annotated<T>>> {
         match self.engine.generate(req.into_request()).await {
             Ok(stream) => Ok(items(stream)),
+            Err(error) => Err(enter(error)),
+        }
+    }
+}
+
+/// The ended form: the engine's stream as it is, in a box that gives it a clean ending
+/// ([`gdl::ended::clean`]). An `Annotated` item carries any error the engine has, so the stream
+/// has no ending of its own, and no item is mapped on its way in.
+impl<E, Req, T, R> gdl::Sink<gdl::EndedForm> for EngineSink<E, Req, T, R>
+where
+    E: AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, anyhow::Error> + ?Sized + 'static,
+    Req: Data,
+    T: Data,
+    R: Carried<Req>,
+{
+    type Req = R;
+    type Item = Annotated<T>;
+
+    async fn generate(&self, _cx: Cx, req: R) -> gdl::Result<gdl::Ended<Annotated<T>>> {
+        match self.engine.generate(req.into_request()).await {
+            Ok(stream) => Ok(gdl::ended::clean(stream)),
             Err(error) => Err(enter(error)),
         }
     }

@@ -58,7 +58,7 @@ impl Sink for RetainError {
     type Item = Annotated<Resp>;
 
     async fn generate(&self, cx: Cx, req: Self::Req) -> gdl::Result<Items<Self::Item>> {
-        let result = self.sink.generate(cx, req).await;
+        let result = Sink::<gdl::ResultForm>::generate(&self.sink, cx, req).await;
         if let Err(error) = &result {
             self.retained.lock().unwrap().push(error.clone());
         }

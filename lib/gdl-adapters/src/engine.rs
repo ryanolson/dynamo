@@ -38,16 +38,19 @@ use crate::request::Carried;
 /// A gdl `Err` item ends the stream: it leaves as a last error item, or with
 /// no item when it is a cancel of a request that was killed, since a killed
 /// Dynamo stream just ends.
-pub struct PipelineEngine<N, Req, T, R = SingleIn<Req>> {
+///
+/// `M` is the pipeline's stream form ([`gdl::Form`]). In the ended form the response leaves
+/// through [`EndedItems`], which asks the pipeline why it ended once, at its end.
+pub struct PipelineEngine<N, Req, T, R = SingleIn<Req>, M = gdl::ResultForm> {
     next: N,
     /// Whether a kill of the request cancels the `Cx` (see [`CxBridge`]).
     cancel_on_kill: bool,
     /// The ids of the requests still in their dispatch (see [`InFlightIds`]).
     in_flight: InFlightIds,
-    types: PhantomData<fn(Req, R) -> T>,
+    types: PhantomData<fn(Req, R, M) -> T>,
 }
 
-impl<N, Req, T, R> PipelineEngine<N, Req, T, R> {
+impl<N, Req, T, R, M> PipelineEngine<N, Req, T, R, M> {
     /// Wrap a gdl pipeline of gdl-native nodes: a kill of the request cancels
     /// it ([`CxBridge::cx`]).
     pub fn new(next: N) -> Self {
@@ -76,7 +79,7 @@ impl<N, Req, T, R> PipelineEngine<N, Req, T, R> {
 
 #[async_trait]
 impl<N, Req, T, R> AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, anyhow::Error>
-    for PipelineEngine<N, Req, T, R>
+    for PipelineEngine<N, Req, T, R, gdl::ResultForm>
 where
     N: gdl::Next<R, Annotated<T>>,
     Req: Data,
@@ -97,6 +100,36 @@ where
         match dispatched {
             Ok(items) => Ok(ResponseStream::new(
                 Box::pin(AnnotatedItems::new(items, root, Arc::clone(&context))),
+                context,
+            )),
+            Err(error) => Err(exit(error)),
+        }
+    }
+}
+
+#[async_trait]
+impl<N, Req, T, R> AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, anyhow::Error>
+    for PipelineEngine<N, Req, T, R, gdl::EndedForm>
+where
+    N: gdl::Next<R, Annotated<T>, gdl::EndedForm>,
+    Req: Data,
+    T: Data,
+    R: Carried<Req>,
+{
+    async fn generate(&self, request: SingleIn<Req>) -> anyhow::Result<ManyOut<Annotated<T>>> {
+        let context = request.context();
+        let cx = if self.cancel_on_kill {
+            CxBridge::cx(request.controller())
+        } else {
+            CxBridge::cx_for_dynamo_stages(request.controller())
+        };
+        let root = cx.clone();
+        let claim = self.in_flight.claim(context.id())?;
+        let dispatched = self.next.generate(cx, R::carry(request)).await;
+        drop(claim);
+        match dispatched {
+            Ok(items) => Ok(ResponseStream::new(
+                Box::pin(EndedItems::new(items, root, Arc::clone(&context))),
                 context,
             )),
             Err(error) => Err(exit(error)),
@@ -209,6 +242,96 @@ impl<T: Data> Stream for AnnotatedItems<T> {
             }
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+/// gdl items in the ended form read as a Dynamo stream of `Annotated<T>`: each item passes
+/// through as it is, and at its end the stream asks its input once why it ended. An ending
+/// leaves by the rule [`PipelineEngine`] gives: a last error item, or no item when it is a
+/// cancel of a request that was killed ([`last_item`], which [`AnnotatedItems`] and
+/// [`CheckedItems`] share).
+///
+/// It is the exit of a [`PipelineEngine`] in the ended form, and the input of a native node: it
+/// gives the request's Dynamo context and [`CutShort`], with no conversion per item. A node
+/// that reads its input through it has handled the input's ending, so as an ended stream it
+/// ends cleanly.
+pub struct EndedItems<T> {
+    items: Option<gdl::Ended<Annotated<T>>>,
+    root: gdl::Cx,
+    context: Arc<dyn AsyncEngineContext>,
+}
+
+impl<T> EndedItems<T> {
+    /// Read `items`. `root` is the `Cx` the request was sent with and
+    /// `context` its Dynamo context: a cancel of either one is a kill.
+    pub fn new(
+        items: gdl::Ended<Annotated<T>>,
+        root: gdl::Cx,
+        context: Arc<dyn AsyncEngineContext>,
+    ) -> Self {
+        Self {
+            items: Some(items),
+            root,
+            context,
+        }
+    }
+
+    /// The input ended: ask it why, once, and drop it. Out of line, as it runs once per stream.
+    #[cold]
+    #[inline(never)]
+    fn end(&mut self) -> Option<Annotated<T>> {
+        let mut items = self.items.take()?;
+        let ending = items.as_mut().ending();
+        drop(items);
+        last_item(ending?, &self.root, self.context.as_ref())
+    }
+}
+
+impl<T> std::fmt::Debug for EndedItems<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EndedItems")
+            .field("ended", &self.items.is_none())
+            .field("root", &self.root)
+            .field("context", &self.context.id())
+            .finish()
+    }
+}
+
+/// The request's Dynamo context, as a Dynamo response stream gives it.
+impl<T: Data> AsyncEngineContextProvider for EndedItems<T> {
+    fn context(&self) -> Arc<dyn AsyncEngineContext> {
+        Arc::clone(&self.context)
+    }
+}
+
+impl<T: Data> Stream for EndedItems<T> {
+    type Item = Annotated<T>;
+
+    fn poll_next(mut self: Pin<&mut Self>, task: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        let Some(items) = self.items.as_mut() else {
+            return Poll::Ready(None);
+        };
+        // The end is matched without the item, and nothing is called while an item is held,
+        // so the compiler can build each item where the caller reads it.
+        let poll = items.as_mut().poll_next(task);
+        if let Poll::Ready(None) = poll {
+            return Poll::Ready(self.end());
+        }
+        poll
+    }
+}
+
+/// A reader of this stream has had the input's ending as a last item, if it had one: the
+/// stream ends cleanly.
+impl<T: Data> gdl::EndedStream for EndedItems<T> {
+    fn ending(self: Pin<&mut Self>) -> Option<gdl::Error> {
+        None
+    }
+}
+
+impl<T> CutShort for EndedItems<T> {
+    fn cut_short(&self) -> bool {
+        cut_short(&self.root, self.context.as_ref())
     }
 }
 

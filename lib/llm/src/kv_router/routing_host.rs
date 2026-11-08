@@ -766,6 +766,27 @@ impl gdl::Sink for RoutingHost {
     }
 }
 
+/// The host as an ended-form sink: as the `Result`-form sink, and its response stream passes
+/// on as it is, with a clean ending (an `Annotated` item carries any error the route has).
+impl gdl::Sink<gdl::EndedForm> for RoutingHost {
+    type Req = Boxed<PreprocessedRequest>;
+    type Item = Annotated<LLMEngineOutput>;
+
+    fn generate(
+        &self,
+        _cx: gdl::Cx,
+        request: Boxed<PreprocessedRequest>,
+    ) -> impl Future<Output = gdl::Result<gdl::Ended<Annotated<LLMEngineOutput>>>> + Send {
+        // On the heap, for the reasons the `Result`-form sink gives.
+        let route: Pin<Box<dyn Future<Output = Result<RouteResponse, Error>> + Send + '_>> =
+            Box::pin(self.route(*request));
+        route.map(|result| match result {
+            Ok(response) => Ok(response.into_ended()),
+            Err(error) => Err(enter(error)),
+        })
+    }
+}
+
 impl RoutingHost {
     /// Route a request through the selected routing plane and dispatch it: the body of the
     /// host's Dynamo engine and gdl sink.
@@ -891,6 +912,15 @@ impl RouteResponse {
                 }))
             }
             Self::Boxed(response) => gdl::items(response.map(Ok)),
+        }
+    }
+
+    /// The response as an ended gdl stream, in its one box, with its context: the stream ends
+    /// cleanly, as an `Annotated` item carries any error.
+    fn into_ended(self) -> gdl::Ended<Annotated<LLMEngineOutput>> {
+        match self {
+            Self::Parts(response) => gdl::ended::clean(response),
+            Self::Boxed(response) => gdl::ended::clean(response),
         }
     }
 }

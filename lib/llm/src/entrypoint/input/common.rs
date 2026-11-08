@@ -94,8 +94,38 @@ impl gdl::Sink for RoutingTerminal {
         request: Boxed<PreprocessedRequest>,
     ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<LLMEngineOutput>>>> + Send {
         match self {
-            Self::Host(host) => Either::Left(gdl::Sink::generate(host.as_ref(), cx, request)),
-            Self::Engine(sink) => Either::Right(gdl::Sink::generate(sink, cx, request)),
+            Self::Host(host) => Either::Left(gdl::Sink::<gdl::ResultForm>::generate(
+                host.as_ref(),
+                cx,
+                request,
+            )),
+            Self::Engine(sink) => {
+                Either::Right(gdl::Sink::<gdl::ResultForm>::generate(sink, cx, request))
+            }
+        }
+    }
+}
+
+/// The terminal as an ended-form sink: `RoutingHost`'s own, or the test's engine through
+/// `EngineSink`.
+impl gdl::Sink<gdl::EndedForm> for RoutingTerminal {
+    type Req = Boxed<PreprocessedRequest>;
+    type Item = Annotated<LLMEngineOutput>;
+
+    fn generate(
+        &self,
+        cx: gdl::Cx,
+        request: Boxed<PreprocessedRequest>,
+    ) -> impl Future<Output = gdl::Result<gdl::Ended<Annotated<LLMEngineOutput>>>> + Send {
+        match self {
+            Self::Host(host) => Either::Left(gdl::Sink::<gdl::EndedForm>::generate(
+                host.as_ref(),
+                cx,
+                request,
+            )),
+            Self::Engine(sink) => {
+                Either::Right(gdl::Sink::<gdl::EndedForm>::generate(sink, cx, request))
+            }
         }
     }
 }

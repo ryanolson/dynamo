@@ -55,7 +55,7 @@ mod request;
 mod sink;
 
 pub use bridge::{CxBridge, REQUEST_ID};
-pub use engine::{AnnotatedItems, CheckedItems, CutShort, PipelineEngine, cut_short};
+pub use engine::{AnnotatedItems, CheckedItems, CutShort, EndedItems, PipelineEngine, cut_short};
 pub use error::enter;
 pub use request::{Boxed, Carried, SpareBox};
 pub use sink::EngineSink;

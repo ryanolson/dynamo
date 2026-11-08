@@ -289,7 +289,7 @@ impl gdl::Sink for Recorder {
         req: Boxed<PreprocessedRequest>,
     ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<LLMEngineOutput>>>> + Send {
         self.seen.lock().unwrap().push(cx.clone());
-        gdl::Sink::generate(&*self.sink, cx, req)
+        gdl::Sink::<gdl::ResultForm>::generate(&*self.sink, cx, req)
     }
 }
 

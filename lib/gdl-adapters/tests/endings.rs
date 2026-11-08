@@ -18,7 +18,9 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use dynamo_gdl_adapters::{AnnotatedItems, Boxed, CheckedItems, EngineSink, PipelineEngine};
+use dynamo_gdl_adapters::{
+    AnnotatedItems, Boxed, CheckedItems, EndedItems, EngineSink, PipelineEngine,
+};
 use dynamo_llm::backend::Backend;
 use dynamo_llm::entrypoint::input::build_pipeline;
 use dynamo_llm::model_card::ModelDeploymentCard;
@@ -559,6 +561,37 @@ fn ended(end: gdl::Error) -> Items<Annotated<u32>> {
     gdl::items(stream::iter([Ok(Annotated::from_data(1u32)), Err(end)]))
 }
 
+/// One item, then `None`, with `end` as its ending: [`ended`] in the ended form.
+struct EndsWith {
+    item: Option<Annotated<u32>>,
+    end: Option<gdl::Error>,
+}
+
+impl Stream for EndsWith {
+    type Item = Annotated<u32>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Annotated<u32>>> {
+        std::task::Poll::Ready(self.item.take())
+    }
+}
+
+impl gdl::EndedStream for EndsWith {
+    fn ending(mut self: std::pin::Pin<&mut Self>) -> Option<gdl::Error> {
+        assert!(self.item.is_none(), "asked only after `None`");
+        self.end.take()
+    }
+}
+
+fn ended_form(end: gdl::Error) -> gdl::Ended<Annotated<u32>> {
+    gdl::ended(EndsWith {
+        item: Some(Annotated::from_data(1)),
+        end: Some(end),
+    })
+}
+
 /// The request's state when its stream ends.
 #[derive(Clone, Copy, Debug)]
 struct State {
@@ -603,8 +636,9 @@ async fn read<S: Stream + Unpin>(stream: S, each: impl Fn(S::Item) -> String) ->
     stream.map(each).collect().await
 }
 
-/// What `AnnotatedItems` and `CheckedItems` yield for one item and then `end`, in `state`.
-/// Both apply one rule, so the test also checks they agree.
+/// What `AnnotatedItems` and `CheckedItems` yield for one item and then `end`, in `state`, and
+/// `EndedItems` for one item and then `end` as its ending. All apply one rule, so the test also
+/// checks they agree.
 async fn rule(end: fn() -> gdl::Error, state: State) -> Vec<String> {
     let (root, context) = parts(state);
     let annotated = read(
@@ -624,6 +658,12 @@ async fn rule(end: fn() -> gdl::Error, state: State) -> Vec<String> {
         annotated, checked,
         "the exit and a node's input apply one rule"
     );
+    let (root, context) = parts(state);
+    let ended = read(EndedItems::new(ended_form(end()), root, context), |item| {
+        describe_u32(&item)
+    })
+    .await;
+    assert_eq!(annotated, ended, "the ended form applies the same rule");
     annotated
 }
 

@@ -368,7 +368,7 @@ async fn a_stop_and_a_cancel_from_gdl_reach_a_dynamo_engine() {
 
     let cx = Cx::new();
     let mut items = pipeline
-        .call(cx.clone(), CxBridge::context(&cx, 1))
+        .call::<_, _, gdl::ResultForm>(cx.clone(), CxBridge::context(&cx, 1))
         .await
         .unwrap();
     assert_eq!(items.next().await.unwrap().unwrap().data, Some(0));
@@ -379,7 +379,7 @@ async fn a_stop_and_a_cancel_from_gdl_reach_a_dynamo_engine() {
 
     let cx = Cx::new();
     let mut items = pipeline
-        .call(cx.clone(), CxBridge::context(&cx, 1))
+        .call::<_, _, gdl::ResultForm>(cx.clone(), CxBridge::context(&cx, 1))
         .await
         .unwrap();
     assert_eq!(items.next().await.unwrap().unwrap().data, Some(0));
@@ -426,7 +426,7 @@ async fn a_call_under_a_cleanup_cx_reaches_its_sink_after_a_kill() {
     let context = request.context();
     context.kill();
     let refused = pipeline
-        .call(CxBridge::cx(context.as_ref()), make_request(1))
+        .call::<_, _, gdl::ResultForm>(CxBridge::cx(context.as_ref()), make_request(1))
         .await;
     assert_eq!(
         refused.err().map(|error| error.kind()),
@@ -436,7 +436,12 @@ async fn a_call_under_a_cleanup_cx_reaches_its_sink_after_a_kill() {
     let cx = CxBridge::cx_for_cleanup(context.as_ref());
     assert_eq!(cx.meta().get(REQUEST_ID).map(String::as_str), Some("req-1"));
     assert!(!cx.is_stopping());
-    let items: Vec<_> = pipeline.call(cx, request).await.unwrap().collect().await;
+    let items: Vec<_> = pipeline
+        .call::<_, _, gdl::ResultForm>(cx, request)
+        .await
+        .unwrap()
+        .collect()
+        .await;
     assert_eq!(items.len(), 2);
     let seen = engine.seen();
     assert_eq!(seen.len(), 1);
