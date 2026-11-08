@@ -55,9 +55,31 @@ the stages.
   | `b` | 55.2 -> 43.2 | 23,270 -> 20,943 |
   | `b-gdl` | 70.2 -> 59.2 | 25,492 -> 23,636 |
 
-  Wrapping an item as `Ok(item)` for gdl costs no `memcpy` (`Result<Annotated<T>, gdl::Error>`
-  and `Annotated<T>` have the same layout), but taking it out of a `Result` does: about 3 calls
-  per item at the `PipelineEngine` boundary.
+  The pipelines run in gdl's ended form, so no item is wrapped in a `Result` or taken out of
+  one. In gdl's `Result` form, wrapping an item as `Ok(item)` cost no `memcpy`
+  (`Result<Annotated<T>, gdl::Error>` and `Annotated<T>` have the same layout), but taking it out
+  of a `Result` did: about 3 calls per item at the `PipelineEngine` boundary.
+
+  A stream that reads its input and returns the input's poll matches the end without the item,
+  and consumes that poll before it calls anything:
+
+  ```rust
+  let polled = items.as_mut().poll_next(task);
+  match polled {
+      Poll::Ready(Some(_)) | Poll::Pending => {}
+      Poll::Ready(None) => {
+          drop(polled);
+          return Poll::Ready(self.end());
+      }
+  }
+  polled
+  ```
+
+  Matching the end with `if let Poll::Ready(None) = poll { return Poll::Ready(self.end()); }`
+  and returning `poll` after it copies every item into the caller's slot: one `memcpy` of 632
+  bytes per item at each reader. Measured on `EndedItems` (`lib/gdl-adapters/src/engine.rs`) at
+  the exit and at Backend's, the preprocessor's and Migration's inputs, and reproduced in a
+  standalone crate with a 632-byte item behind a `dyn` stream.
 
   The same pattern is still on per-item paths that no row measures: the reasoning parser
   (`parse_reasoning_content_from_stream_inner` and `strip_leading_reasoning_start_from_stream`,
@@ -98,8 +120,9 @@ the stages.
   1,008 and `Annotated<NvCreateChatCompletionStreamResponse>` 768. gdl's own boundaries copy no
   item; the copies are the stages' own transforms, and both forms pay them.
 
-- **After the in-place stages, the boxed fields and gdl items in their `Result`** (aarch64, `hotpath.sh --base` with
-  `HOTPATH_RUNS=3`, 2026-11-03; memcpy calls and instructions per extra item):
+- **After the in-place stages and the boxed fields, in gdl's `Result` form** (aarch64,
+  `hotpath.sh --base` with `HOTPATH_RUNS=3`, 2026-11-03; memcpy calls and instructions per extra
+  item):
 
   | Row | memcpy, before | memcpy, after | instructions, before | instructions, after |
   |---|---:|---:|---:|---:|
@@ -111,18 +134,12 @@ the stages.
   | `c-gdl` | 22.0 | 10.0 | 4,263 | 1,532 |
 
   The copies left on `a` are Backend's decoder stream (5 per item), the preprocessor's transform
-  (5), the in-place edits (2), and string copies inside the tokenizer's decode. The gdl rows pay
-  about 5 (`c-gdl`) to 11 (`b-gdl`) more: taking items out of gdl's `Result` where a reader needs
-  Dynamo items (the `PipelineEngine` boundary, and the preprocessor reading Backend), the box
-  `EngineSink` puts around a Dynamo engine's stream, and gdl's own `Bounded` layer (2). Backend
-  and Migration read gdl items in their `Result` (`CheckedItems`), so they take no item out.
-
-  The preprocessor does not: measured with its response transform reading Backend's gdl items
-  in their `Result`, `a-gdl` and `b-gdl` each paid one more memcpy per item than through
-  `AnnotatedItems`, as the transform takes each item out of the `Result` to convert it, and the
-  same read with the item's fields taken in place paid two more per item on `a` and `b`. Reading
-  in place pays where a stage edits an item and passes it on, not where it converts it to a new
-  type.
+  (5), the in-place edits (2), and string copies inside the tokenizer's decode. The gdl rows then
+  paid about 5 (`c-gdl`) to 11 (`b-gdl`) more: taking items out of gdl's `Result` where a reader
+  needed Dynamo items (the `PipelineEngine` boundary, and the preprocessor reading Backend), the
+  box `EngineSink` put around a Dynamo engine's stream, and gdl's own `Bounded` layer (2). Reading
+  items in their `Result` saved the copy only where a stage edited an item and passed it on, not
+  where it converted it to a new type. The ended form, below, removed all of these copies.
 
 - **Per request, a future copied with its gap:** when a coroutine's `Unresumed` layout puts a
   large gap before a field that is filled by `memcpy`, LLVM copies the gap with the field. The
@@ -196,8 +213,8 @@ the stages.
   item: A +6.8%, B +6.5%, C +606 instructions, embeddings equal; most of the per-item gap is
   `memcpy` (A and B 10 to 11 more calls per item).
 
-- **Against Dynamo with the same fixes:** the reference is ai-dynamo `7c195fd1a7` with the
-  fixes this port carries that help Dynamo on its own (the in-place stages, the boxed fields,
+- **Against Dynamo with the same fixes, in gdl's `Result` form:** the reference is ai-dynamo
+  `7c195fd1a7` with the fixes this port carries that help Dynamo on its own (the in-place stages, the boxed fields,
   Migration's stream, Ingress calling its engine, the behavior fixes), measured with this
   harness's dynamo rows. aarch64 (Neoverse-V2), Rust 1.99.0, both trees built with the same
   `RUSTFLAGS`, valgrind 3.28, `callgrind.sh` with 3 runs per row, lowest instructions kept:
@@ -209,44 +226,78 @@ the stages.
   | C | 62,503 -> 30,715 (-50.9%) | 795 -> 1,398 | 5 -> 10 |
   | embeddings | 99,579 -> 95,474 (-4.1%) | 81,684 -> 81,500 | 90.8 -> 90.8 |
 
-  Where the extra copies per item are, on A (B is the same, plus 2 in Backend reading through
-  `CheckedItems` and 1 fewer in Migration): 4 where the engine's stream enters gdl through
-  `EngineSink` (`map(Ok)` and its `Fuse`), 2 at gdl's `Fuse` between Backend and the
+  Where the extra copies per item were, on A (B the same, plus 2 in Backend reading through its
+  `Result`-form input wrapper, since removed, and 1 fewer in Migration): 4 where the engine's
+  stream entered gdl through `EngineSink` (`map(Ok)` and its `Fuse`), 2 at gdl's `Fuse` between Backend and the
   preprocessor, 2 taking items out of their `Result` at the `PipelineEngine` exit, 1 in gdl's
   `Bounded`, and 1 in the roles edit after the parsers. Taking the item out at the exit in one
   `map`, with the endings out of line, left every count unchanged.
 
   End to end, with the frontend (pipeline B) on 2 cores and mocker workers, 512-token prompts,
   5 runs per case: at 2,048 output tokens and concurrency 512, where the frontend is the
-  bottleneck, gdl gives 5.9% fewer output tokens per second and uses 6.9% more frontend CPU per
-  token; at 16 output tokens it gives 5 to 7% more, as the per-request saving wins.
+  bottleneck, the `Result` form gave 5.9% fewer output tokens per second and used 6.9% more
+  frontend CPU per token; at 16 output tokens it gave 5 to 7% more, as the per-request saving
+  won.
+- **In gdl's ended form:** items cross each node as they are, and a stream's ending is asked
+  once, at its end (`EndedItems` at the exit and at each native node's input). Against the same
+  reference (its later tree `fcf74a821e`, which differs only in a test), both arms rebuilt on the
+  aarch64 bench host with Rust 1.99.0 and the same `RUSTFLAGS`, valgrind 3.28. Per extra item,
+  the median of 6 per-run slopes (C: of 3); per request at 1 item, the median:
+
+  | Row | Instructions per request, 1 item | Per extra item | memcpy per item |
+  |---|---:|---:|---:|
+  | A | 169,800 -> 154,656 (-8.9%) | 19,894 -> 20,096 (+202, +1.0%) | 41.2 -> 41.2 |
+  | B | 214,813 -> 169,051 (-21.3%) | 20,108 -> 20,228 (+121, +0.6%) | 42.2 -> 42.2 |
+  | C | 62,503 -> 30,263 (-51.6%) | 795 -> 882 (+87) | 5 -> 5 |
+
+  The copies per item equal the reference's. Per run, A's and B's slopes spread over about 100 to
+  190 instructions, most of it in the allocator. Counted per instruction (callgrind
+  `--dump-instr=yes`, each instruction charged to the symbol whose address range holds it), A's
+  remaining instructions per item are gdl's: its node boundary (`EndedFuse`, 29 at each of 2)
+  and its attempt boundary (`EndedBounded`, 39). The adapters add a net 15: the exit (22) and the
+  box around a Dynamo engine's stream (7), less the `ResponseStream` the exit no longer needs
+  (-14). The stages' own code is within 3 of the reference's. Self costs summed from a dump's
+  `fn=` lines, without `--dump-instr`, overstated these by two to three times.
+
+  End to end, the same setup as above, 5 interleaved runs per arm at every output length (16,
+  256, 2,048) and concurrency (1, 64, 512), `gdl` at `b4a87784c0` against the reference: at
+  2,048 output tokens and concurrency 512 the port gives 1.9% fewer output tokens per second and
+  uses 1.1% more frontend CPU per token (9.82 -> 9.93 µs), both inside the reference's range; at
+  16 output tokens it gives 1 to 8% more at every concurrency. One point fell outside the
+  reference's range, 2,048 output tokens at concurrency 64 (4.2% fewer tokens per second, 5.0%
+  more CPU per token). Five more runs per arm of that point alone, with `perf stat` on the
+  frontend, put it inside: 0.9% fewer tokens per second and 0.3% more CPU per token, cycles and
+  instructions per token both +0.6%, IPC unchanged (1.250 and 1.248), context switches 2% fewer.
+  The reference itself moved between those two sessions, from 9.82 to 10.10 µs per token at that
+  point, so compare arms run in one session only.
 - **Base for aarch64:** the table a change to this path compares against on the aarch64 bench
-  host (Neoverse-V2), with gdl from `NVIDIA-dev/dynamo-gdl` at `3686ff4d`. Rust 1.99.0,
-  `RUSTFLAGS="-C target-cpu=neoverse-n1 -C force-frame-pointers=yes --cfg tokio_unstable --cfg
-  rustix_use_libc"`, valgrind 3.28, `hotpath.sh` with `HOTPATH_RUNS=3`. Save the block as a file
-  and pass it to `hotpath.sh --base`:
+  host (Neoverse-V2), with gdl from `NVIDIA-dev/dynamo-gdl` at `43629be7`, the ended form. Rust
+  1.99.0, `RUSTFLAGS="-C target-cpu=neoverse-n1 -C force-frame-pointers=yes --cfg tokio_unstable
+  --cfg rustix_use_libc"`, valgrind 3.28, `hotpath.sh` with `HOTPATH_RUNS=3`, which keeps the
+  lowest instructions of 3 runs. Save the block as a file and pass it to `hotpath.sh --base`:
 
   ```text
-  # hotpath format=3 arch=aarch64 gdl=3686ff4d927d commit=6e9970c2e937
+  # hotpath format=3 arch=aarch64 gdl=43629be7275e commit=b4a87784c01c
   pipeline     form    allocs allocs/item     instr instr/item memcpy memcpy/item allocs@16   instr@16 memcpy@16  range
-  engine       -            7        1.00      9530        617     24        4.00        22      18787        84  7..7,22..22
-  A            gdl        329       34.20    155923      21065    336       51.20       842     471893      1104  329..329,842..842
-  B            gdl        344       34.20    170455      21408    376       53.20       857     491573      1174  344..344,857..857
-  C            gdl         39        1.00     30712       1398     76       10.00        54      51682       226  39..39,54..54
-  embed-engine -            8        1.00      6141        960      7        3.00        23      20544        52  8..8,23..23
-  embeddings   gdl        178      139.00     95380      76675    125       90.80      2263    1245508      1487  178..178,2262..2263
-  ingress      dynamo      49        3.00     49215       2846    139        7.00        94      91904       244  49..49,94..94
+  engine       -            7        1.00      9501        621     24        4.00        22      18819        84  7..7,22..22
+  A            gdl        328       34.20    154579      20050    324       41.20       841     455325       942  328..328,841..841
+  B            gdl        343       34.20    168972      20140    363       42.20       856     471078       996  343..343,856..856
+  C            gdl         38        1.00     30258        882     72        5.00        53      43488       147  38..38,53..53
+  embed-engine -            8        1.00      6130        962      7        3.00        23      20564        52  8..8,23..23
+  embeddings   gdl        177      139.00     95313      80427    125       90.80      2262    1301716      1487  177..177,2261..2262
+  ingress      dynamo      49        3.00     49209       2846    139        7.00        94      91902       244  49..49,94..94
   ```
 
-  Against gdl `83319c8f`, the same tree otherwise: allocations and `memcpy` equal on every row,
-  and instructions per item within 75 (A −73, B +29, C 0). The `embeddings` row moves by several
-  percent per item from run to run: 76,675 in this table, 81,763 on a later run of the same
-  binary, and 81,210 on one run with gdl `83319c8f`. Its 16 inputs are tokenized on rayon's
-  pool, and the instructions of rayon's work-stealing loop depend on thread timing; the whole
-  difference between those two runs is in that loop. Read that row's per-item column with that
-  spread in mind.
+  Against the `Result` form's base on the same host (gdl `3686ff4d`): per item, `memcpy` 51.2 ->
+  41.2 on A, 53.2 -> 42.2 on B and 10 -> 5 on C, and instructions -1,015 on A, -1,268 on B and
+  -516 on C; per request, one allocation fewer on every gdl row. The `embeddings` row moves by
+  several percent per item from run to run: its 16 inputs are tokenized on rayon's pool, and the
+  instructions of rayon's work-stealing loop depend on thread timing. Read that row's per-item
+  column with that spread in mind.
 - **Not covered:** the window starts where the HTTP handler calls the engine. HTTP parsing, the
   handler's request metrics and SSE encoding are outside it, and the reasoning and tool-call
   parsers are not on these rows.
-- **Second view:** this entry has instruction counts only. A sampling profile (`perf`) of the same
-  rows confirms or drops it once timing runs are allowed again.
+- **Second view:** a sampling profile (`perf record`, cycles) of the frontend at 2,048 output
+  tokens and concurrency 64 has the same top symbols, in the same order, for the port and the
+  reference: `memcpy` about 7%, then the tokenizer, `malloc` and `free`, and `serde_json`. No gdl
+  boundary reaches 1.5% of the samples, and cycles per token follow instructions per token.
