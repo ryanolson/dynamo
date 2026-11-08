@@ -5,7 +5,7 @@
 
 use std::{future::Future, sync::Arc};
 
-use dynamo_gdl_adapters::AnnotatedItems;
+use dynamo_gdl_adapters::EndedItems;
 use dynamo_runtime::{
     error::{DynamoError, ErrorClass},
     pipeline::{AsyncEngineContext, AsyncEngineContextProvider},
@@ -110,11 +110,11 @@ impl PrefillTask {
     /// finishes (`BeforeLast`), or before any decode output (`BeforeFirst`).
     pub(super) async fn forward_decode(
         self,
-        decode: impl Future<Output = anyhow::Result<AnnotatedItems<LLMEngineOutput>>>,
+        decode: impl Future<Output = anyhow::Result<EndedItems<LLMEngineOutput>>>,
         request_context: Arc<dyn AsyncEngineContext>,
         output: PrefillNeed,
         prefill_context: Arc<dyn AsyncEngineContext>,
-    ) -> anyhow::Result<gdl::Items<Annotated<LLMEngineOutput>>> {
+    ) -> anyhow::Result<gdl::Ended<Annotated<LLMEngineOutput>>> {
         let emit = output != PrefillNeed::None;
         let mut completion = Box::pin(self.wait());
         tokio::pin!(decode);
@@ -124,10 +124,10 @@ impl PrefillTask {
                 let prefill = result.inspect_err(|_| request_context.stop_generating())?;
                 let response = decode.await?;
                 if !emit {
-                    return Ok(gdl::items(response.map(Ok)));
+                    return Ok(gdl::ended(response));
                 }
                 let stream = stream::iter(output_item(prefill)).chain(response);
-                return Ok(gdl::items(stream.map(Ok)));
+                return Ok(gdl::ended::clean(stream));
             }
             result = &mut decode => match result {
                 Ok(response) => response,
@@ -248,7 +248,7 @@ impl PrefillTask {
                 }
             }
         };
-        Ok(gdl::items(stream.map(Ok)))
+        Ok(gdl::ended::clean(stream))
     }
 }
 
@@ -297,11 +297,7 @@ mod tests {
             let decode = async move {
                 let decode = decode.await?;
                 let context = decode.context();
-                Ok(AnnotatedItems::new(
-                    gdl::items(decode.map(Ok)),
-                    root,
-                    context,
-                ))
+                Ok(EndedItems::new(gdl::ended::clean(decode), root, context))
             };
             let response = self
                 .forward_decode(decode, request_context.clone(), output, prefill_context)

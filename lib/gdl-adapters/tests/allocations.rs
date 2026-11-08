@@ -14,14 +14,14 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use dynamo_gdl_adapters::{AnnotatedItems, CxBridge, EngineSink, PipelineEngine};
+use dynamo_gdl_adapters::{CxBridge, EndedItems, EngineSink, PipelineEngine};
 use dynamo_runtime::engine::{AsyncEngine, ResponseStream};
 use dynamo_runtime::pipeline::{
     AsyncEngineContextProvider, Context, Error, ManyOut, SingleIn, async_trait,
 };
 use dynamo_runtime::protocols::annotated::Annotated;
 use futures::{StreamExt, stream};
-use gdl::{Cx, Hop, Items, OperatorStage, SinkStage, Source};
+use gdl::{Cx, Hop, OperatorStage, SinkStage, Source};
 
 struct Counting;
 
@@ -83,10 +83,10 @@ impl AsyncEngine<SingleIn<u32>, Out, Error> for Repeat {
 
 /// The identity as a native gdl operator, shaped as Backend's and the
 /// preprocessor's are: it keeps the request's Dynamo context, reads its
-/// downstream through `AnnotatedItems`, and boxes its response once.
+/// downstream through `EndedItems`, and boxes its response once.
 struct NativeIdentity;
 
-impl gdl::Operator for NativeIdentity {
+impl gdl::Operator<gdl::EndedForm> for NativeIdentity {
     type UpReq = SingleIn<u32>;
     type UpItem = Annotated<u32>;
     type DownReq = SingleIn<u32>;
@@ -97,25 +97,23 @@ impl gdl::Operator for NativeIdentity {
         cx: Cx,
         request: SingleIn<u32>,
         next: N,
-    ) -> gdl::Result<Items<Annotated<u32>>>
+    ) -> gdl::Result<gdl::Ended<Annotated<u32>>>
     where
-        N: gdl::Next<SingleIn<u32>, Annotated<u32>>,
+        N: gdl::Next<SingleIn<u32>, Annotated<u32>, gdl::EndedForm>,
     {
         let context = request.context();
         let root = cx.clone();
         let items = next.generate(cx, request).await?;
-        Ok(gdl::items(
-            AnnotatedItems::new(items, root, context).map(Ok),
-        ))
+        Ok(gdl::ended(EndedItems::new(items, root, context)))
     }
 }
 
 /// `stages` native gdl operators above an adapted engine.
 fn native(stages: usize, engine: Engine) -> Engine {
-    fn wrap<N: gdl::Next<SingleIn<u32>, Annotated<u32>>>(next: N) -> Engine {
+    fn wrap<N: gdl::Next<SingleIn<u32>, Annotated<u32>, gdl::EndedForm>>(next: N) -> Engine {
         Arc::new(PipelineEngine::<_, u32, u32>::new(next))
     }
-    fn stage<H: gdl::Next<SingleIn<u32>, Annotated<u32>>>(
+    fn stage<H: gdl::Next<SingleIn<u32>, Annotated<u32>, gdl::EndedForm>>(
         hop: H,
     ) -> Hop<(), OperatorStage<NativeIdentity, H>, ()> {
         Hop::new((), OperatorStage::new(Arc::new(NativeIdentity), hop), ())

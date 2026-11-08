@@ -253,7 +253,7 @@ async fn each_attempt_is_a_child_of_the_requests_cx() {
         .call(root.clone(), Box::new(request))
         .await
         .unwrap();
-    assert_eq!(tokens(&[items.next().await.unwrap().unwrap()]), [vec![10]]);
+    assert_eq!(tokens(&[items.next().await.unwrap()]), [vec![10]]);
 
     let seen = seen.lock().unwrap().clone();
     assert_eq!(
@@ -279,7 +279,7 @@ struct Recorder {
     seen: Arc<Mutex<Vec<gdl::Cx>>>,
 }
 
-impl gdl::Sink for Recorder {
+impl gdl::Sink<gdl::EndedForm> for Recorder {
     type Req = Boxed<PreprocessedRequest>;
     type Item = Annotated<LLMEngineOutput>;
 
@@ -287,9 +287,9 @@ impl gdl::Sink for Recorder {
         &self,
         cx: gdl::Cx,
         req: Boxed<PreprocessedRequest>,
-    ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<LLMEngineOutput>>>> + Send {
+    ) -> impl Future<Output = gdl::Result<gdl::Ended<Annotated<LLMEngineOutput>>>> + Send {
         self.seen.lock().unwrap().push(cx.clone());
-        gdl::Sink::<gdl::ResultForm>::generate(&*self.sink, cx, req)
+        gdl::Sink::generate(&*self.sink, cx, req)
     }
 }
 

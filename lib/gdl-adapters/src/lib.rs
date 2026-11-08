@@ -5,19 +5,20 @@
 //! local pipeline the frontend composes.
 //!
 //! These adapters let a Dynamo `AsyncEngine` run as the sink of a gdl local
-//! pipeline, and a gdl pipeline run as a Dynamo `AsyncEngine`:
+//! pipeline, and a gdl pipeline run as a Dynamo `AsyncEngine`. The pipelines
+//! are in gdl's ended form ([`gdl::EndedForm`]): items cross each node as
+//! they are, and a stream's ending is asked once, at its end.
 //!
 //! - [`CxBridge`]: a gdl `Cx` from a Dynamo request context, and back.
 //! - [`EngineSink`]: a Dynamo engine as a gdl `Sink`.
 //! - [`PipelineEngine`]: a gdl `Next` as a Dynamo `AsyncEngine`.
 //! - [`Carried`] and [`Boxed`]: how a gdl pipeline carries a Dynamo request,
 //!   as `SingleIn<T>` itself or, for a large request, boxed.
-//! - [`AnnotatedItems`], [`CheckedItems`] and [`enter`]: what a native gdl
-//!   operator over Dynamo items uses to read its downstream and to raise an
-//!   eager error, so it behaves at its edges as the adapters do.
-//!   `dynamo_llm::operator` builds Backend, the preprocessor, Migration and the
-//!   routers this way; the stages that edit items in place read through
-//!   `CheckedItems`, which leaves each item in its gdl `Result`.
+//! - [`EndedItems`] and [`enter`]: what a native gdl operator over Dynamo
+//!   items uses to read its downstream and to raise an eager error, so it
+//!   behaves at its edges as the adapters do. `EndedItems` is also the
+//!   pipeline's exit. `dynamo_llm::operator` builds Backend, the preprocessor,
+//!   Migration and the routers this way.
 //! - [`cut_short`] and [`CutShort`]: whether a node's input that ended cleanly
 //!   was cut short by a kill or a passed deadline, for a node that writes
 //!   closing output when its input ends.
@@ -38,7 +39,7 @@
 //! derives a fresh `Cx` from the context it receives, and nothing is stored
 //! in the context's registry, because
 //! Migration rebuilds the context of every attempt. Items stay `Annotated<T>`,
-//! so a Dynamo error item does not end a stream, while a gdl `Err` does.
+//! so a Dynamo error item does not end a stream, while a gdl ending does.
 //!
 //! gdl enters Dynamo only here and in `dynamo-llm`'s gdl compositions and
 //! native operators, and both take the `gdl` crate alone: gdl's runtime and
@@ -55,7 +56,7 @@ mod request;
 mod sink;
 
 pub use bridge::{CxBridge, REQUEST_ID};
-pub use engine::{AnnotatedItems, CheckedItems, CutShort, EndedItems, PipelineEngine, cut_short};
+pub use engine::{CutShort, EndedItems, PipelineEngine, cut_short};
 pub use error::enter;
 pub use request::{Boxed, Carried, SpareBox};
 pub use sink::EngineSink;

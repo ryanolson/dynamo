@@ -49,11 +49,11 @@
 //! | Row | Allocations, 1 item | Bytes, 1 item | Allocations, 16 items | Bytes, 16 items |
 //! |---|---:|---:|---:|---:|
 //! | `engine` | 7 | 2,752 | 22 | 2,812 |
-//! | `a-gdl` | 329 | 63,735 | 842 | 85,223 |
-//! | `b-gdl` | 344 | 80,394 | 857 | 101,882 |
-//! | `c-gdl` | 39 | 28,204 | 54 | 28,264 |
+//! | `a-gdl` | 329 | 63,759 | 842 | 85,247 |
+//! | `b-gdl` | 344 | 80,410 | 857 | 101,898 |
+//! | `c-gdl` | 39 | 28,220 | 54 | 28,280 |
 //! | `embed-engine` | 8 | 6,548 | 23 | 88,868 |
-//! | `embeddings-gdl` | 178 | 41,735 | 2,262 | 527,183 |
+//! | `embeddings-gdl` | 178 | 41,751 | 2,262 | 527,199 |
 //!
 //! At the switch the Dynamo `link` chains made more allocations than these rows at both item
 //! counts, the same number more at each, so nothing per item: `a` +17 (346 and 859), `b` +55
@@ -131,21 +131,23 @@ const REQUESTS: usize = 200;
 const BASELINE: &[Row] = &[
     // Every gdl row: +1 for the request id `PipelineEngine` holds while it dispatches, to
     // refuse a second in-flight request with that id.
+    // Every gdl row: 16 to 24 bytes more per request, at any item count, since gdl's ended
+    // form: each node and attempt boundary keeps its stream's ending in its own struct.
     row("engine", 1, 7, 2752),
     row("engine", 16, 22, 2812),
     // +2 for the boxed chat and preprocessed requests (see the module docs).
-    row("a-gdl", 1, 329, 63735),
-    row("a-gdl", 16, 842, 85223),
+    row("a-gdl", 1, 329, 63759),
+    row("a-gdl", 16, 842, 85247),
     // +2 for the boxed chat and preprocessed requests (see the module docs).
-    row("b-gdl", 1, 344, 80394),
-    row("b-gdl", 16, 857, 101882),
+    row("b-gdl", 1, 344, 80410),
+    row("b-gdl", 16, 857, 101898),
     // +1 for the boxed preprocessed request (see the module docs).
-    row("c-gdl", 1, 39, 28204),
-    row("c-gdl", 16, 54, 28264),
+    row("c-gdl", 1, 39, 28220),
+    row("c-gdl", 16, 54, 28280),
     row("embed-engine", 1, 8, 6548),
     row("embed-engine", 16, 23, 88868),
-    row("embeddings-gdl", 1, 178, 41735),
-    row("embeddings-gdl", 16, 2262, 527183),
+    row("embeddings-gdl", 1, 178, 41751),
+    row("embeddings-gdl", 16, 2262, 527199),
 ];
 
 #[global_allocator]

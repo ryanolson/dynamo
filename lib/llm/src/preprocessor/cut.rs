@@ -280,6 +280,7 @@ mod tests {
         Req: dynamo_runtime::engine::Data,
         Resp: dynamo_runtime::engine::Data,
         PreprocessorNode<Req>: gdl::Around<
+                gdl::EndedForm,
                 UpReq = dynamo_gdl_adapters::Boxed<Req>,
                 UpItem = Annotated<Resp>,
                 DownReq = dynamo_gdl_adapters::Boxed<PreprocessedRequest>,
@@ -307,6 +308,7 @@ mod tests {
     where
         Req: dynamo_runtime::engine::Data,
         PreprocessorNode<Req>: gdl::Around<
+                gdl::EndedForm,
                 UpReq = dynamo_gdl_adapters::Boxed<Req>,
                 UpItem = Annotated<Resp>,
                 DownReq = dynamo_gdl_adapters::Boxed<PreprocessedRequest>,
@@ -322,15 +324,8 @@ mod tests {
             .forward(cx, Box::new(Context::new(request)))
             .await
             .unwrap_or_else(|_| panic!("the preprocessor accepts the request"));
-        let input = gdl::items(stream::iter(
-            outputs
-                .into_iter()
-                .map(|output| Ok(Annotated::from_data(output))),
-        ));
-        node.backward(cx, state, input)
-            .map(|item| item.unwrap_or_else(|_| panic!("the node ends no stream with an `Err`")))
-            .collect()
-            .await
+        let input = gdl::ended::clean(stream::iter(outputs.into_iter().map(Annotated::from_data)));
+        node.backward(cx, state, input).collect().await
     }
 
     fn past_deadline() -> gdl::Cx {
@@ -572,14 +567,10 @@ mod tests {
             at_end(signalled.as_ref());
             std::task::Poll::Ready(None)
         });
-        let input = stream::iter(
-            finished_answer()
-                .into_iter()
-                .map(|o| Ok(Annotated::from_data(o))),
-        )
-        .chain(end);
-        let input = dynamo_gdl_adapters::AnnotatedItems::new(
-            gdl::items(input),
+        let input =
+            stream::iter(finished_answer().into_iter().map(Annotated::from_data)).chain(end);
+        let input = dynamo_gdl_adapters::EndedItems::new(
+            gdl::ended::clean(input),
             gdl::Cx::new(),
             controller.clone(),
         );

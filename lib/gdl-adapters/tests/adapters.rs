@@ -16,7 +16,7 @@ use dynamo_runtime::pipeline::{
 };
 use dynamo_runtime::protocols::annotated::Annotated;
 use futures::{StreamExt, stream};
-use gdl::{Cx, Hop, Items, Source};
+use gdl::{Cx, Ended, EndedStream, Hop, Source};
 
 type Out = ManyOut<Annotated<u32>>;
 type DynEngine = dyn AsyncEngine<SingleIn<u32>, Out, Error>;
@@ -37,7 +37,7 @@ fn sink_hop(engine: Engine) -> SinkHop {
 }
 
 /// A gdl pipeline as a Dynamo engine.
-fn engine_of<N: gdl::Next<SingleIn<u32>, Annotated<u32>>>(next: N) -> Engine {
+fn engine_of<N: gdl::Next<SingleIn<u32>, Annotated<u32>, gdl::EndedForm>>(next: N) -> Engine {
     Arc::new(PipelineEngine::<_, u32, u32>::new(next))
 }
 
@@ -122,7 +122,7 @@ struct StopAwareSink {
     seen: Mutex<Vec<Cx>>,
 }
 
-impl gdl::Sink for StopAwareSink {
+impl gdl::Sink<gdl::EndedForm> for StopAwareSink {
     type Req = SingleIn<u32>;
     type Item = Annotated<u32>;
 
@@ -130,22 +130,22 @@ impl gdl::Sink for StopAwareSink {
         &self,
         cx: Cx,
         _req: SingleIn<u32>,
-    ) -> impl Future<Output = gdl::Result<Items<Annotated<u32>>>> + Send {
+    ) -> impl Future<Output = gdl::Result<Ended<Annotated<u32>>>> + Send {
         self.seen.lock().unwrap().push(cx.clone());
         let items = stream::unfold(0u8, move |state| {
             let cx = cx.clone();
             async move {
                 match state {
-                    0 => Some((Ok(Annotated::from_data(0)), 1)),
+                    0 => Some((Annotated::from_data(0), 1)),
                     1 => {
                         cx.stopping().await;
-                        (!cx.is_cancelled()).then(|| (Ok(Annotated::from_data(1)), 2))
+                        (!cx.is_cancelled()).then(|| (Annotated::from_data(1), 2))
                     }
                     _ => None,
                 }
             }
         });
-        async move { Ok(gdl::items(items)) }
+        async move { Ok(gdl::ended::clean(items)) }
     }
 }
 
@@ -179,7 +179,7 @@ struct Relay {
     first_only: bool,
 }
 
-impl gdl::Operator for Relay {
+impl gdl::Operator<gdl::EndedForm> for Relay {
     type UpReq = SingleIn<u32>;
     type UpItem = Annotated<u32>;
     type DownReq = SingleIn<u32>;
@@ -190,18 +190,19 @@ impl gdl::Operator for Relay {
         cx: Cx,
         request: SingleIn<u32>,
         next: N,
-    ) -> impl Future<Output = gdl::Result<Items<Annotated<u32>>>> + Send
+    ) -> impl Future<Output = gdl::Result<Ended<Annotated<u32>>>> + Send
     where
-        N: gdl::Next<SingleIn<u32>, Annotated<u32>>,
+        N: gdl::Next<SingleIn<u32>, Annotated<u32>, gdl::EndedForm>,
     {
         let first_only = self.first_only;
         async move {
             let items = next.generate(cx, request.map(|n| n + 1)).await?;
-            let items = items.map(|item| item.map(|item| item.map_data(|n| Ok(n * 10))));
+            let items =
+                gdl::ended::map(items, |item: Annotated<u32>| item.map_data(|n| Ok(n * 10)));
             Ok(if first_only {
-                gdl::items(items.take(1))
+                gdl::ended::clean(items.take(1))
             } else {
-                gdl::items(items)
+                items
             })
         }
     }
@@ -368,25 +369,26 @@ async fn a_stop_and_a_cancel_from_gdl_reach_a_dynamo_engine() {
 
     let cx = Cx::new();
     let mut items = pipeline
-        .call::<_, _, gdl::ResultForm>(cx.clone(), CxBridge::context(&cx, 1))
+        .call(cx.clone(), CxBridge::context(&cx, 1))
         .await
         .unwrap();
-    assert_eq!(items.next().await.unwrap().unwrap().data, Some(0));
+    assert_eq!(items.next().await.unwrap().data, Some(0));
     cx.request_stop();
-    assert_eq!(items.next().await.unwrap().unwrap().data, Some(1));
+    assert_eq!(items.next().await.unwrap().data, Some(1));
     assert!(items.next().await.is_none());
     assert!(!engine.seen.lock().unwrap()[0].is_killed());
 
     let cx = Cx::new();
     let mut items = pipeline
-        .call::<_, _, gdl::ResultForm>(cx.clone(), CxBridge::context(&cx, 1))
+        .call(cx.clone(), CxBridge::context(&cx, 1))
         .await
         .unwrap();
-    assert_eq!(items.next().await.unwrap().unwrap().data, Some(0));
+    assert_eq!(items.next().await.unwrap().data, Some(0));
     let context = engine.seen.lock().unwrap()[1].clone();
     cx.cancel();
     eventually("the kill", || context.is_killed()).await;
-    let ended = items.next().await.unwrap().unwrap_err();
+    assert!(items.next().await.is_none());
+    let ended = items.as_mut().ending().expect("ended by the cancel");
     assert_eq!(ended.kind(), gdl::ErrorKind::Cancelled);
 }
 
@@ -426,7 +428,7 @@ async fn a_call_under_a_cleanup_cx_reaches_its_sink_after_a_kill() {
     let context = request.context();
     context.kill();
     let refused = pipeline
-        .call::<_, _, gdl::ResultForm>(CxBridge::cx(context.as_ref()), make_request(1))
+        .call(CxBridge::cx(context.as_ref()), make_request(1))
         .await;
     assert_eq!(
         refused.err().map(|error| error.kind()),
@@ -436,12 +438,7 @@ async fn a_call_under_a_cleanup_cx_reaches_its_sink_after_a_kill() {
     let cx = CxBridge::cx_for_cleanup(context.as_ref());
     assert_eq!(cx.meta().get(REQUEST_ID).map(String::as_str), Some("req-1"));
     assert!(!cx.is_stopping());
-    let items: Vec<_> = pipeline
-        .call::<_, _, gdl::ResultForm>(cx, request)
-        .await
-        .unwrap()
-        .collect()
-        .await;
+    let items: Vec<_> = pipeline.call(cx, request).await.unwrap().collect().await;
     assert_eq!(items.len(), 2);
     let seen = engine.seen();
     assert_eq!(seen.len(), 1);
@@ -488,18 +485,44 @@ async fn a_stop_after_a_kill_still_ends_the_stream_quietly() {
     assert!(item.is_none(), "a killed stream emitted {item:?}");
 }
 
-/// gdl items of `0..n` as data, then `last`, for the readers below.
-fn gdl_items(n: u32, last: Option<gdl::Error>) -> Items<Annotated<u32>> {
-    let items = (0..n).map(|i| Ok(Annotated::from_data(i)));
-    gdl::items(stream::iter(items.chain(last.map(Err))))
+/// Items `0..n` as data, then `None` with `ending`, for the reader below.
+struct EndsWith {
+    next: u32,
+    n: u32,
+    ending: Option<gdl::Error>,
 }
 
-/// `CheckedItems` keeps each item in its `Result` and applies gdl's `Err` rule as
-/// `AnnotatedItems` does: an `Err` ends the stream as a last `Ok` error item, so every item
-/// it yields is `Ok`, and the stream stays ended.
+impl futures::Stream for EndsWith {
+    type Item = Annotated<u32>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Annotated<u32>>> {
+        let next = self.next;
+        if next == self.n {
+            return std::task::Poll::Ready(None);
+        }
+        self.next += 1;
+        std::task::Poll::Ready(Some(Annotated::from_data(next)))
+    }
+}
+
+impl EndedStream for EndsWith {
+    fn ending(mut self: std::pin::Pin<&mut Self>) -> Option<gdl::Error> {
+        self.ending.take()
+    }
+}
+
+fn ended_items(n: u32, ending: Option<gdl::Error>) -> Ended<Annotated<u32>> {
+    gdl::ended(EndsWith { next: 0, n, ending })
+}
+
+/// `EndedItems` passes each item as it is, and at the end gives the input's ending as a last
+/// error item; the stream then stays ended, and its own ending is clean.
 #[tokio::test]
-async fn checked_items_yield_ok_items_and_end_an_err_with_an_error_item() {
-    use dynamo_gdl_adapters::{AnnotatedItems, CheckedItems};
+async fn ended_items_end_an_ending_with_an_error_item() {
+    use dynamo_gdl_adapters::EndedItems;
     let context = make_request(0).context();
     let failure = || {
         Some(gdl::Error::new(
@@ -508,48 +531,35 @@ async fn checked_items_yield_ok_items_and_end_an_err_with_an_error_item() {
         ))
     };
 
-    let checked: Vec<_> = CheckedItems::new(gdl_items(2, failure()), Cx::new(), context.clone())
+    let read: Vec<_> = EndedItems::new(ended_items(2, failure()), Cx::new(), context.clone())
         .collect()
         .await;
-    assert_eq!(checked.len(), 3);
-    assert!(checked.iter().all(Result::is_ok), "{checked:?}");
-    let checked: Vec<Annotated<u32>> = checked.into_iter().map(Result::unwrap).collect();
-    assert_eq!(data(&checked), [Some(0), Some(1), None]);
-    assert!(checked[2].error.is_some(), "the Err became an error item");
+    assert_eq!(data(&read), [Some(0), Some(1), None]);
+    assert!(read[2].error.is_some(), "the ending became an error item");
 
-    let annotated: Vec<_> =
-        AnnotatedItems::new(gdl_items(2, failure()), Cx::new(), context.clone())
-            .collect()
-            .await;
-    assert_eq!(
-        serde_json::to_value(&annotated).unwrap(),
-        serde_json::to_value(&checked).unwrap(),
-        "AnnotatedItems reads the same items, out of their `Result`"
-    );
-
-    let mut checked = CheckedItems::new(gdl_items(0, failure()), Cx::new(), context);
-    assert!(checked.next().await.is_some_and(|item| item.is_ok()));
-    assert!(checked.next().await.is_none());
+    let mut read = EndedItems::new(ended_items(0, failure()), Cx::new(), context);
+    assert!(read.next().await.is_some_and(|item| item.error.is_some()));
+    assert!(read.next().await.is_none());
+    assert!(read.next().await.is_none(), "an ended stream stays ended");
     assert!(
-        checked.next().await.is_none(),
-        "an ended stream stays ended"
+        std::pin::Pin::new(&mut read).ending().is_none(),
+        "the ending was handled"
     );
 }
 
-/// A cancel of a killed request ends `CheckedItems` with no item, as a killed Dynamo stream
-/// just ends.
+/// A cancel of a killed request ends `EndedItems` with no item, as a killed Dynamo stream just
+/// ends.
 #[tokio::test]
-async fn checked_items_end_a_killed_requests_cancel_with_no_item() {
-    use dynamo_gdl_adapters::CheckedItems;
+async fn ended_items_end_a_killed_requests_cancel_with_no_item() {
+    use dynamo_gdl_adapters::EndedItems;
     let context = make_request(0).context();
     context.kill();
-    let checked: Vec<_> = CheckedItems::new(
-        gdl_items(1, Some(gdl::Error::cancelled())),
+    let read: Vec<_> = EndedItems::new(
+        ended_items(1, Some(gdl::Error::cancelled())),
         Cx::new(),
         context,
     )
     .collect()
     .await;
-    assert_eq!(checked.len(), 1, "{checked:?}");
-    assert_eq!(checked[0].as_ref().unwrap().data, Some(0));
+    assert_eq!(data(&read), [Some(0)]);
 }

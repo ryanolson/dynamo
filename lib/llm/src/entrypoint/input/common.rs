@@ -84,30 +84,6 @@ type TerminalSink = EngineSink<
 
 /// The terminal as the sink of a gdl local pipeline: `RoutingHost`'s own sink, or the test's
 /// engine through `EngineSink`.
-impl gdl::Sink for RoutingTerminal {
-    type Req = Boxed<PreprocessedRequest>;
-    type Item = Annotated<LLMEngineOutput>;
-
-    fn generate(
-        &self,
-        cx: gdl::Cx,
-        request: Boxed<PreprocessedRequest>,
-    ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<LLMEngineOutput>>>> + Send {
-        match self {
-            Self::Host(host) => Either::Left(gdl::Sink::<gdl::ResultForm>::generate(
-                host.as_ref(),
-                cx,
-                request,
-            )),
-            Self::Engine(sink) => {
-                Either::Right(gdl::Sink::<gdl::ResultForm>::generate(sink, cx, request))
-            }
-        }
-    }
-}
-
-/// The terminal as an ended-form sink: `RoutingHost`'s own, or the test's engine through
-/// `EngineSink`.
 impl gdl::Sink<gdl::EndedForm> for RoutingTerminal {
     type Req = Boxed<PreprocessedRequest>;
     type Item = Annotated<LLMEngineOutput>;
@@ -118,14 +94,8 @@ impl gdl::Sink<gdl::EndedForm> for RoutingTerminal {
         request: Boxed<PreprocessedRequest>,
     ) -> impl Future<Output = gdl::Result<gdl::Ended<Annotated<LLMEngineOutput>>>> + Send {
         match self {
-            Self::Host(host) => Either::Left(gdl::Sink::<gdl::EndedForm>::generate(
-                host.as_ref(),
-                cx,
-                request,
-            )),
-            Self::Engine(sink) => {
-                Either::Right(gdl::Sink::<gdl::EndedForm>::generate(sink, cx, request))
-            }
+            Self::Host(host) => Either::Left(gdl::Sink::generate(host.as_ref(), cx, request)),
+            Self::Engine(sink) => Either::Right(gdl::Sink::generate(sink, cx, request)),
         }
     }
 }
@@ -472,6 +442,7 @@ where
     Req: Data,
     Resp: Data,
     PreprocessorNode<Req>: gdl::Around<
+            gdl::EndedForm,
             UpReq = Boxed<Req>,
             UpItem = Annotated<Resp>,
             DownReq = Boxed<PreprocessedRequest>,
@@ -597,6 +568,7 @@ impl PreprocessedRouting {
         Req: Data,
         Resp: Data,
         PreprocessorNode<Req>: gdl::Around<
+                gdl::EndedForm,
                 UpReq = Boxed<Req>,
                 UpItem = Annotated<Resp>,
                 DownReq = Boxed<PreprocessedRequest>,
@@ -621,11 +593,12 @@ impl PreprocessedRouting {
         preprocessor: Arc<OpenAIPreprocessor>,
         migration: Arc<Migration>,
         token_backend: Arc<Backend>,
-    ) -> gdl::Source<impl gdl::Next<Boxed<Req>, Annotated<Resp>>>
+    ) -> gdl::Source<impl gdl::Next<Boxed<Req>, Annotated<Resp>, gdl::EndedForm>>
     where
         Req: Data,
         Resp: Data,
         PreprocessorNode<Req>: gdl::Around<
+                gdl::EndedForm,
                 UpReq = Boxed<Req>,
                 UpItem = Annotated<Resp>,
                 DownReq = Boxed<PreprocessedRequest>,
@@ -656,7 +629,8 @@ impl PreprocessedRouting {
     /// hop that calls the encoder router.
     fn gdl_routers(
         &self,
-    ) -> impl gdl::Inner<Boxed<PreprocessedRequest>, Item = Annotated<LLMEngineOutput>> {
+    ) -> impl gdl::Inner<Boxed<PreprocessedRequest>, gdl::EndedForm, Item = Annotated<LLMEngineOutput>>
+    {
         use gdl::{Hop, OperatorStage, SinkStage};
         type Pre = PreprocessedRequest;
 
@@ -695,7 +669,9 @@ impl PreprocessedRouting {
     fn gdl_preprocessed_pipeline(
         &self,
         migration: Arc<Migration>,
-    ) -> gdl::Source<impl gdl::Next<Boxed<PreprocessedRequest>, Annotated<LLMEngineOutput>>> {
+    ) -> gdl::Source<
+        impl gdl::Next<Boxed<PreprocessedRequest>, Annotated<LLMEngineOutput>, gdl::EndedForm>,
+    > {
         gdl::Source::new(native::<_, LLMEngineOutput, _>(
             migration,
             gdl::Hop::new((), self.gdl_routers(), ()),
@@ -705,15 +681,15 @@ impl PreprocessedRouting {
 
 /// A hop to `I` with `GdlOperator<O, K>` as its one around node.
 type AroundHop<O, K, I> = gdl::Hop<
-    (gdl::ForwardHalf<GdlOperator<O, K>>, ()),
+    (gdl::ForwardHalf<GdlOperator<O, K>, gdl::EndedForm>, ()),
     I,
-    (gdl::BackwardHalf<GdlOperator<O, K>>, ()),
+    (gdl::BackwardHalf<GdlOperator<O, K>, gdl::EndedForm>, ()),
 >;
 
 /// `op` as an around node of the hop to `inner`, keyed by `K` (see [`GdlOperator`]).
 fn around<O, K, I>(op: Arc<O>, inner: I) -> AroundHop<O, K, I>
 where
-    GdlOperator<O, K>: gdl::Around,
+    GdlOperator<O, K>: gdl::Around<gdl::EndedForm>,
 {
     let (forward, backward) = gdl::around(Arc::new(GdlOperator::new(op)));
     gdl::Hop::new((forward, ()), inner, (backward, ()))
@@ -750,57 +726,61 @@ mod tests {
         let sizes = [
             (
                 "chat preprocessor in",
-                size_of::<<Chat as gdl::Around>::UpReq>(),
+                size_of::<<Chat as gdl::Around<gdl::EndedForm>>::UpReq>(),
             ),
             (
                 "chat preprocessor out",
-                size_of::<<Chat as gdl::Around>::DownReq>(),
+                size_of::<<Chat as gdl::Around<gdl::EndedForm>>::DownReq>(),
             ),
             (
                 "completion preprocessor in",
-                size_of::<<Completion as gdl::Around>::UpReq>(),
+                size_of::<<Completion as gdl::Around<gdl::EndedForm>>::UpReq>(),
             ),
             (
                 "completion preprocessor out",
-                size_of::<<Completion as gdl::Around>::DownReq>(),
+                size_of::<<Completion as gdl::Around<gdl::EndedForm>>::DownReq>(),
             ),
             (
                 "backend in",
-                size_of::<<Op<Backend, Pre> as gdl::Around>::UpReq>(),
+                size_of::<<Op<Backend, Pre> as gdl::Around<gdl::EndedForm>>::UpReq>(),
             ),
             (
                 "backend out",
-                size_of::<<Op<Backend, Pre> as gdl::Around>::DownReq>(),
+                size_of::<<Op<Backend, Pre> as gdl::Around<gdl::EndedForm>>::DownReq>(),
             ),
             (
                 "migration in",
-                size_of::<<Op<Migration, BackendOutput> as gdl::Operator>::UpReq>(),
+                size_of::<<Op<Migration, BackendOutput> as gdl::Operator<gdl::EndedForm>>::UpReq>(),
             ),
             (
                 "migration out",
-                size_of::<<Op<Migration, LLMEngineOutput> as gdl::Operator>::DownReq>(),
+                size_of::<<Op<Migration, LLMEngineOutput> as gdl::Operator<gdl::EndedForm>>::DownReq>(
+                ),
             ),
             (
                 "encoder router in",
-                size_of::<<Op<EncoderRouter, Pre> as gdl::Operator>::UpReq>(),
+                size_of::<<Op<EncoderRouter, Pre> as gdl::Operator<gdl::EndedForm>>::UpReq>(),
             ),
             (
                 "encoder router out",
-                size_of::<<Op<EncoderRouter, Pre> as gdl::Operator>::DownReq>(),
+                size_of::<<Op<EncoderRouter, Pre> as gdl::Operator<gdl::EndedForm>>::DownReq>(),
             ),
             (
                 "prefill router in",
-                size_of::<<Op<PrefillRouter, Pre> as gdl::Operator>::UpReq>(),
+                size_of::<<Op<PrefillRouter, Pre> as gdl::Operator<gdl::EndedForm>>::UpReq>(),
             ),
             (
                 "prefill router out",
-                size_of::<<Op<PrefillRouter, Pre> as gdl::Operator>::DownReq>(),
+                size_of::<<Op<PrefillRouter, Pre> as gdl::Operator<gdl::EndedForm>>::DownReq>(),
             ),
             (
                 "routing terminal",
-                size_of::<<RoutingTerminal as gdl::Sink>::Req>(),
+                size_of::<<RoutingTerminal as gdl::Sink<gdl::EndedForm>>::Req>(),
             ),
-            ("routing host", size_of::<<RoutingHost as gdl::Sink>::Req>()),
+            (
+                "routing host",
+                size_of::<<RoutingHost as gdl::Sink<gdl::EndedForm>>::Req>(),
+            ),
         ];
         let large: Vec<_> = sizes
             .iter()

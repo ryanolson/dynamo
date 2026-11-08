@@ -375,7 +375,7 @@ impl EncoderRouter {
 /// takes the preprocessed request boxed.
 type EncodeDownstream<N> = GdlDownstream<N, Boxed<PreprocessedRequest>, PreprocessedRequest>;
 
-impl gdl::Operator for GdlOperator<EncoderRouter, PreprocessedRequest> {
+impl gdl::Operator<gdl::EndedForm> for GdlOperator<EncoderRouter, PreprocessedRequest> {
     type UpReq = Boxed<PreprocessedRequest>;
     type UpItem = Annotated<LLMEngineOutput>;
     type DownReq = Boxed<PreprocessedRequest>;
@@ -386,9 +386,9 @@ impl gdl::Operator for GdlOperator<EncoderRouter, PreprocessedRequest> {
         cx: gdl::Cx,
         request: Boxed<PreprocessedRequest>,
         next: N,
-    ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<LLMEngineOutput>>>> + Send
+    ) -> impl Future<Output = gdl::Result<gdl::Ended<Annotated<LLMEngineOutput>>>> + Send
     where
-        N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<LLMEngineOutput>>,
+        N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<LLMEngineOutput>, gdl::EndedForm>,
     {
         let router = Arc::clone(&self.op);
         async move {
@@ -419,9 +419,9 @@ impl EncoderRouter {
         &self,
         request: SingleIn<PreprocessedRequest>,
         next: EncodeDownstream<N>,
-    ) -> Result<gdl::Items<Annotated<LLMEngineOutput>>>
+    ) -> Result<gdl::Ended<Annotated<LLMEngineOutput>>>
     where
-        N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<LLMEngineOutput>>,
+        N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<LLMEngineOutput>, gdl::EndedForm>,
     {
         let (mut request, context) = request.into_parts();
         if self.lifecycle_state() != EncoderLifecycleState::Active || !Self::should_encode(&request)
@@ -454,7 +454,7 @@ impl EncoderRouter {
                 return next
                     .send_cleanup(context.map(|_| request))
                     .await
-                    .map(|stream| gdl::items(stream.map(Ok)));
+                    .map(gdl::ended);
             }
             Err(error) => {
                 tracing::error!(

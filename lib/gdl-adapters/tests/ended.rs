@@ -35,9 +35,9 @@ where
 {
     let source = Source::new(Hop::new((), SinkStage::new(Arc::new(sink)), ()));
     if cancel_on_kill {
-        Arc::new(PipelineEngine::<_, u32, u32, SingleIn<u32>, EndedForm>::new(source))
+        Arc::new(PipelineEngine::<_, u32, u32>::new(source))
     } else {
-        Arc::new(PipelineEngine::<_, u32, u32, SingleIn<u32>, EndedForm>::for_dynamo_stages(source))
+        Arc::new(PipelineEngine::<_, u32, u32>::for_dynamo_stages(source))
     }
 }
 

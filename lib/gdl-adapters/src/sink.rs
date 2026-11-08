@@ -9,20 +9,19 @@ use std::sync::Arc;
 use dynamo_runtime::engine::{AsyncEngine, Data};
 use dynamo_runtime::pipeline::{ManyOut, SingleIn};
 use dynamo_runtime::protocols::annotated::Annotated;
-use futures::StreamExt;
-use gdl::{Cx, Items};
+use gdl::Cx;
 
 use crate::error::enter;
 use crate::request::Carried;
 
-/// A Dynamo engine as a gdl [`Sink`](gdl::Sink), in either stream form: Python engines, the KV
+/// A Dynamo engine as a gdl [`Sink`](gdl::Sink) in the ended form: Python engines, the KV
 /// router's `RoutingHost`, the mocker, or any other
 /// `AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>>`.
 ///
 /// The request arrives in its carrier `R` (see [`Carried`]) and reaches the
 /// engine as `SingleIn<Req>`.
 ///
-/// Items stay `Annotated<T>`, so an error item is an `Ok` item to gdl and does
+/// Items stay `Annotated<T>`, so an error item is an item to gdl and does
 /// not end the stream. An eager error enters gdl with the original
 /// `anyhow::Error` as its source.
 ///
@@ -53,25 +52,7 @@ impl<E: ?Sized, Req, T, R> Clone for EngineSink<E, Req, T, R> {
     }
 }
 
-impl<E, Req, T, R> gdl::Sink for EngineSink<E, Req, T, R>
-where
-    E: AsyncEngine<SingleIn<Req>, ManyOut<Annotated<T>>, anyhow::Error> + ?Sized + 'static,
-    Req: Data,
-    T: Data,
-    R: Carried<Req>,
-{
-    type Req = R;
-    type Item = Annotated<T>;
-
-    async fn generate(&self, _cx: Cx, req: R) -> gdl::Result<Items<Annotated<T>>> {
-        match self.engine.generate(req.into_request()).await {
-            Ok(stream) => Ok(items(stream)),
-            Err(error) => Err(enter(error)),
-        }
-    }
-}
-
-/// The ended form: the engine's stream as it is, in a box that gives it a clean ending
+/// The engine's stream enters as it is, in a box that gives it a clean ending
 /// ([`gdl::ended::clean`]). An `Annotated` item carries any error the engine has, so the stream
 /// has no ending of its own, and no item is mapped on its way in.
 impl<E, Req, T, R> gdl::Sink<gdl::EndedForm> for EngineSink<E, Req, T, R>
@@ -90,10 +71,4 @@ where
             Err(error) => Err(enter(error)),
         }
     }
-}
-
-/// A Dynamo response stream as gdl items. The stream's context is dropped
-/// here; the adapter that leaves gdl puts the request's back.
-pub(crate) fn items<T: Data>(stream: ManyOut<T>) -> Items<T> {
-    gdl::items(stream.map(Ok))
 }

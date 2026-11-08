@@ -76,13 +76,16 @@ fn sink_stage<Req: Data, T: Data, R: Carried<Req>>(
     SinkStage::new(Arc::new(EngineSink::new(engine)))
 }
 
-type AroundHop<O, Req, I> =
-    Hop<(ForwardHalf<GdlOperator<O, Req>>, ()), I, (BackwardHalf<GdlOperator<O, Req>>, ())>;
+type AroundHop<O, Req, I> = Hop<
+    (ForwardHalf<GdlOperator<O, Req>, gdl::EndedForm>, ()),
+    I,
+    (BackwardHalf<GdlOperator<O, Req>, gdl::EndedForm>, ()),
+>;
 
 /// An around node of the hop to `inner`.
 fn around<O, Req, I>(op: Arc<O>, inner: I) -> AroundHop<O, Req, I>
 where
-    GdlOperator<O, Req>: gdl::Around,
+    GdlOperator<O, Req>: gdl::Around<gdl::EndedForm>,
 {
     let (forward, backward) = gdl::around(Arc::new(GdlOperator::new(op)));
     Hop::new((forward, ()), inner, (backward, ()))
@@ -101,7 +104,7 @@ fn native<O, Req, H>(op: Arc<O>, next: H) -> Hop<(), OperatorStage<GdlOperator<O
 /// stages include Dynamo operators and engines.
 fn pipeline<N, Req, T, R>(next: N) -> Engine<Req, T>
 where
-    N: gdl::Next<R, Annotated<T>>,
+    N: gdl::Next<R, Annotated<T>, gdl::EndedForm>,
     Req: Data,
     T: Data,
     R: Carried<Req>,
@@ -594,6 +597,7 @@ fn preprocessor_gdl<Req: Data, Resp: Data>(
 ) -> Engine<Req, Resp>
 where
     PreprocessorNode<Req>: gdl::Around<
+            gdl::EndedForm,
             UpReq = Boxed<Req>,
             UpItem = Annotated<Resp>,
             DownReq = Boxed<PreprocessedRequest>,

@@ -28,8 +28,8 @@ use anyhow::Result;
 use futures::stream::{Stream, StreamExt};
 
 use crate::model_card::ModelDeploymentCard;
-use crate::operator::{GdlOperator, checked, checked_mut, gdl_error};
-use dynamo_gdl_adapters::{Boxed, CheckedItems, CutShort};
+use crate::operator::{GdlOperator, gdl_error};
+use dynamo_gdl_adapters::{Boxed, CutShort, EndedItems};
 use dynamo_runtime::dynamo_nvtx_range;
 use dynamo_runtime::{
     error::{DynamoError, ErrorClass},
@@ -268,7 +268,7 @@ pub struct BackendState {
 /// Backend around the stages below it: the forward half checks that the request can be decoded
 /// and builds its decoders, before the request is sent on, and the backward half detokenizes
 /// the response.
-impl gdl::Around for GdlOperator<Backend, PreprocessedRequest> {
+impl gdl::Around<gdl::EndedForm> for GdlOperator<Backend, PreprocessedRequest> {
     type UpReq = Boxed<PreprocessedRequest>;
     type UpItem = Annotated<BackendOutput>;
     type DownReq = Boxed<PreprocessedRequest>;
@@ -296,10 +296,10 @@ impl gdl::Around for GdlOperator<Backend, PreprocessedRequest> {
         &self,
         cx: &gdl::Cx,
         state: Self::State,
-        input: gdl::Items<Annotated<LLMEngineOutput>>,
-    ) -> gdl::Items<Annotated<BackendOutput>> {
-        let input = CheckedItems::new(input, cx.clone(), state.context);
-        gdl::items(DecoderStream {
+        input: gdl::Ended<Annotated<LLMEngineOutput>>,
+    ) -> gdl::Ended<Annotated<BackendOutput>> {
+        let input = EndedItems::new(input, cx.clone(), state.context);
+        gdl::ended(DecoderStream {
             state: Some(state.decoder.reading(input)),
         })
     }
@@ -311,8 +311,8 @@ impl gdl::Around for GdlOperator<Backend, PreprocessedRequest> {
 /// A stream that owns its state, in place of `unfold`, `fuse` and `map`: `unfold` moves its
 /// state and the item through a new future on every item, and each combinator moves the item
 /// again, about a third of a stream item's cost (1 KB each). Edited through `&mut`, the item
-/// moves only where it changes type. The items stay in their gdl `Result`
-/// ([`CheckedItems`]), so they are not taken out of it and wrapped again either.
+/// moves only where it changes type. In gdl's ended form the items carry no `Result`, so none
+/// is taken out of one and wrapped again either.
 struct DecoderStream<S> {
     /// `None` once the stream has ended. That drops the stream below and the decoders when this
     /// stream ends, not when its caller drops it, as `unfold` did.
@@ -321,12 +321,9 @@ struct DecoderStream<S> {
 
 impl<S> Stream for DecoderStream<S>
 where
-    S: Stream<Item = gdl::Result<Annotated<LLMEngineOutput>>>
-        + AsyncEngineContextProvider
-        + CutShort
-        + Unpin,
+    S: Stream<Item = Annotated<LLMEngineOutput>> + AsyncEngineContextProvider + CutShort + Unpin,
 {
-    type Item = gdl::Result<Annotated<BackendOutput>>;
+    type Item = Annotated<BackendOutput>;
 
     // hot path: per-item-response
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
@@ -334,7 +331,7 @@ where
             return Poll::Ready(None);
         };
         match ready!(state.poll_step(cx)) {
-            Some(output) => Poll::Ready(Some(output.map(backend_output))),
+            Some(output) => Poll::Ready(Some(backend_output(output))),
             None => {
                 self.state = None;
                 Poll::Ready(None)
@@ -343,18 +340,23 @@ where
     }
 }
 
+/// Backend reads its input through [`EndedItems`], which gives an ending of the stages below as
+/// a last item, so Backend's own stream ends cleanly.
+impl<S> gdl::EndedStream for DecoderStream<S>
+where
+    S: Stream<Item = Annotated<LLMEngineOutput>> + AsyncEngineContextProvider + CutShort + Unpin,
+{
+    fn ending(self: Pin<&mut Self>) -> Option<gdl::Error> {
+        None
+    }
+}
+
 impl<S> DecoderState<S>
 where
-    S: Stream<Item = gdl::Result<Annotated<LLMEngineOutput>>>
-        + AsyncEngineContextProvider
-        + CutShort
-        + Unpin,
+    S: Stream<Item = Annotated<LLMEngineOutput>> + AsyncEngineContextProvider + CutShort + Unpin,
 {
     /// The next item, detokenized in place, or `None` when the stream has ended.
-    fn poll_step(
-        &mut self,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<Option<gdl::Result<Annotated<LLMEngineOutput>>>> {
+    fn poll_step(&mut self, cx: &mut TaskContext<'_>) -> Poll<Option<Annotated<LLMEngineOutput>>> {
         // If we've already detected a local stop condition, end the stream
         if self.finished {
             return Poll::Ready(None);
@@ -363,12 +365,12 @@ where
         // `stream` already yielded `None` once; do not poll it again (unspecified
         // behavior for most `Stream` impls). Only drain the flush queue from here on.
         if self.stream_ended {
-            return Poll::Ready(self.pending_flush.pop().map(Ok));
+            return Poll::Ready(self.pending_flush.pop());
         }
 
         let output = loop {
             let output = ready!(self.stream.poll_next_unpin(cx));
-            let choice_already_finished = output.as_ref().map(checked).is_some_and(|output| {
+            let choice_already_finished = output.as_ref().is_some_and(|output| {
                 !output.is_event()
                     && output.data.as_ref().is_some_and(|data| {
                         self.finished_choices
@@ -382,7 +384,7 @@ where
 
         match output {
             Some(mut item) => {
-                let output = checked_mut(&mut item);
+                let output = &mut item;
                 // move to state.process_output
                 // handle any error conditions / unwraps here
 
@@ -452,7 +454,7 @@ where
                         .class(ErrorClass::BackendProtocol)
                         .message("no_stop_trim requires backend token IDs through the matched stop; the backend omitted them (also required when a parser retains the model's stop token text)")
                         .build();
-                    return Poll::Ready(Some(Ok(Annotated::from_err(error))));
+                    return Poll::Ready(Some(Annotated::from_err(error)));
                 }
 
                 // if we have a data field without an event, then we might need to update the data
@@ -728,7 +730,7 @@ where
                     };
                     self.pending_flush.push(Annotated::from_data(data));
                 }
-                Poll::Ready(self.pending_flush.pop().map(Ok))
+                Poll::Ready(self.pending_flush.pop())
             }
         }
     }
@@ -3196,19 +3198,16 @@ mod tests {
 
     /// Backend's backward half under `cx`, over [`withholding_chunks`] that end cleanly.
     async fn backward_under(cx: &gdl::Cx) -> Vec<Annotated<BackendOutput>> {
-        use gdl::Around;
+        use gdl::{Around, EndedForm};
         let tokenizer: Arc<dyn traits::Tokenizer> = Arc::new(JailingTokenizer);
         let backend = Backend::from_tokenizer(Tokenizer::from(tokenizer));
         let op = GdlOperator::<Backend, PreprocessedRequest>::new(backend);
-        let (_sent, state) = op
-            .forward(cx, Box::new(SingleIn::new(jailing_request(1))))
-            .await
-            .expect("Backend accepts the request");
-        let input = gdl::items(futures::stream::iter(
-            withholding_chunks().into_iter().map(Ok),
-        ));
-        op.backward(cx, state, input)
-            .map(|item| item.expect("Backend ends no stream with an `Err`"))
+        let (_sent, state) =
+            Around::<EndedForm>::forward(&op, cx, Box::new(SingleIn::new(jailing_request(1))))
+                .await
+                .expect("Backend accepts the request");
+        let input = gdl::ended::clean(futures::stream::iter(withholding_chunks()));
+        Around::<EndedForm>::backward(&op, cx, state, input)
             .collect()
             .await
     }

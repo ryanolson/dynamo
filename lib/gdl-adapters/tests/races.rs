@@ -297,10 +297,7 @@ async fn a_forwarded_stop_does_not_revive_a_killed_workers_buffered_output() {
     let cx = Cx::new();
     let request = CxBridge::context(&cx, 0);
     let context = request.context();
-    let mut items = pipeline
-        .call::<_, _, gdl::ResultForm>(cx, request)
-        .await
-        .unwrap();
+    let mut items = pipeline.call(cx, request).await.unwrap();
     context.kill();
     assert!(
         items.next().await.is_none(),
@@ -310,10 +307,7 @@ async fn a_forwarded_stop_does_not_revive_a_killed_workers_buffered_output() {
     let cx = Cx::new();
     let request = CxBridge::context(&cx, 0);
     let context = request.context();
-    let mut items = pipeline
-        .call::<_, _, gdl::ResultForm>(cx.clone(), request)
-        .await
-        .unwrap();
+    let mut items = pipeline.call(cx.clone(), request).await.unwrap();
     let (finished, on_finish) = oneshot::channel();
     context.link_child(Arc::new(KillDuringStop {
         target: Arc::downgrade(&context),

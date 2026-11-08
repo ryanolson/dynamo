@@ -81,7 +81,7 @@ use crate::protocols::common::preprocessor::{
 };
 use crate::protocols::common::timing::RequestTracker;
 use crate::tokenizers::Encoding;
-use dynamo_gdl_adapters::{AnnotatedItems, Boxed, CutShort};
+use dynamo_gdl_adapters::{Boxed, CutShort, EndedItems};
 
 use dynamo_parsers::tool_calling::ToolDefinition;
 use dynamo_parsers::{
@@ -8511,7 +8511,7 @@ pub struct ChatNodeState {
 
 /// The request comes and goes boxed ([`Boxed`]): the forward half moves the chat request into its
 /// state and sends the preprocessed request on in a box of its own.
-impl gdl::Around for PreprocessorNode<NvCreateChatCompletionRequest> {
+impl gdl::Around<gdl::EndedForm> for PreprocessorNode<NvCreateChatCompletionRequest> {
     type UpReq = Boxed<NvCreateChatCompletionRequest>;
     type UpItem = Annotated<NvCreateChatCompletionStreamResponse>;
     type DownReq = Boxed<PreprocessedRequest>;
@@ -8551,9 +8551,9 @@ impl gdl::Around for PreprocessorNode<NvCreateChatCompletionRequest> {
         &self,
         cx: &gdl::Cx,
         state: Box<ChatNodeState>,
-        input: gdl::Items<Annotated<BackendOutput>>,
-    ) -> gdl::Items<Annotated<NvCreateChatCompletionStreamResponse>> {
-        let input = AnnotatedItems::new(input, cx.clone(), state.context.clone());
+        input: gdl::Ended<Annotated<BackendOutput>>,
+    ) -> gdl::Ended<Annotated<NvCreateChatCompletionStreamResponse>> {
+        let input = EndedItems::new(input, cx.clone(), state.context.clone());
         let stream = self.op.chat_backward(
             &state.request,
             state.state,
@@ -8562,7 +8562,9 @@ impl gdl::Around for PreprocessorNode<NvCreateChatCompletionRequest> {
             state.context,
             || self.below.clone(),
         );
-        gdl::items(stream.map(Ok))
+        // The input gives an ending of the stages below as a last item, so this stream ends
+        // cleanly.
+        gdl::ended::clean(stream)
     }
 }
 
@@ -8955,7 +8957,7 @@ pub struct CompletionNodeState {
 }
 
 /// The request comes and goes boxed, as the chat node's does.
-impl gdl::Around for PreprocessorNode<NvCreateCompletionRequest> {
+impl gdl::Around<gdl::EndedForm> for PreprocessorNode<NvCreateCompletionRequest> {
     type UpReq = Boxed<NvCreateCompletionRequest>;
     type UpItem = Annotated<NvCreateCompletionResponse>;
     type DownReq = Boxed<PreprocessedRequest>;
@@ -8990,11 +8992,11 @@ impl gdl::Around for PreprocessorNode<NvCreateCompletionRequest> {
         &self,
         cx: &gdl::Cx,
         state: CompletionNodeState,
-        input: gdl::Items<Annotated<BackendOutput>>,
-    ) -> gdl::Items<Annotated<NvCreateCompletionResponse>> {
-        let input = AnnotatedItems::new(input, cx.clone(), state.context.clone());
+        input: gdl::Ended<Annotated<BackendOutput>>,
+    ) -> gdl::Ended<Annotated<NvCreateCompletionResponse>> {
+        let input = EndedItems::new(input, cx.clone(), state.context.clone());
         let stream = OpenAIPreprocessor::completion_backward(state.state, input, state.context);
-        gdl::items(stream.map(Ok))
+        gdl::ended::clean(stream)
     }
 }
 
@@ -9189,7 +9191,7 @@ pub(crate) struct CompletionState {
 type EmbeddingDownstream<N> =
     GdlDownstream<N, SingleIn<PreprocessedEmbeddingRequest>, PreprocessedEmbeddingRequest>;
 
-impl gdl::Operator for GdlOperator<OpenAIPreprocessor, NvCreateEmbeddingRequest> {
+impl gdl::Operator<gdl::EndedForm> for GdlOperator<OpenAIPreprocessor, NvCreateEmbeddingRequest> {
     type UpReq = SingleIn<NvCreateEmbeddingRequest>;
     type UpItem = Annotated<NvCreateEmbeddingResponse>;
     type DownReq = SingleIn<PreprocessedEmbeddingRequest>;
@@ -9200,9 +9202,13 @@ impl gdl::Operator for GdlOperator<OpenAIPreprocessor, NvCreateEmbeddingRequest>
         cx: gdl::Cx,
         request: SingleIn<NvCreateEmbeddingRequest>,
         next: N,
-    ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<NvCreateEmbeddingResponse>>>> + Send
+    ) -> impl Future<Output = gdl::Result<gdl::Ended<Annotated<NvCreateEmbeddingResponse>>>> + Send
     where
-        N: gdl::Next<SingleIn<PreprocessedEmbeddingRequest>, Annotated<EmbeddingsEngineOutput>>,
+        N: gdl::Next<
+                SingleIn<PreprocessedEmbeddingRequest>,
+                Annotated<EmbeddingsEngineOutput>,
+                gdl::EndedForm,
+            >,
     {
         self.op
             .generate_embedding(request, GdlDownstream::new(cx, next))
@@ -9217,16 +9223,22 @@ impl OpenAIPreprocessor {
         &self,
         request: SingleIn<NvCreateEmbeddingRequest>,
         next: EmbeddingDownstream<N>,
-    ) -> Result<gdl::Items<Annotated<NvCreateEmbeddingResponse>>, Error>
+    ) -> Result<gdl::Ended<Annotated<NvCreateEmbeddingResponse>>, Error>
     where
-        N: gdl::Next<SingleIn<PreprocessedEmbeddingRequest>, Annotated<EmbeddingsEngineOutput>>,
+        N: gdl::Next<
+                SingleIn<PreprocessedEmbeddingRequest>,
+                Annotated<EmbeddingsEngineOutput>,
+                gdl::EndedForm,
+            >,
     {
         let (request, context) = request.into_parts();
         let (response_stream, annotations) =
             self.embedding_forward(&request, context, &next).await?;
-        Ok(gdl::items(
-            Self::embedding_backward(request, annotations, response_stream).map(Ok),
-        ))
+        Ok(gdl::ended::clean(Self::embedding_backward(
+            request,
+            annotations,
+            response_stream,
+        )))
     }
 
     /// Everything the embeddings preprocessor does before it sends the request on, and the
@@ -9244,14 +9256,18 @@ impl OpenAIPreprocessor {
     ) -> impl Future<
         Output = Result<
             (
-                AnnotatedItems<EmbeddingsEngineOutput>,
+                EndedItems<EmbeddingsEngineOutput>,
                 Vec<Annotated<NvCreateEmbeddingResponse>>,
             ),
             Error,
         >,
     >
     where
-        N: gdl::Next<SingleIn<PreprocessedEmbeddingRequest>, Annotated<EmbeddingsEngineOutput>>,
+        N: gdl::Next<
+                SingleIn<PreprocessedEmbeddingRequest>,
+                Annotated<EmbeddingsEngineOutput>,
+                gdl::EndedForm,
+            >,
     {
         async move {
             // Preprocess the embedding request

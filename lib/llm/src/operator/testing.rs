@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use dynamo_gdl_adapters::{AnnotatedItems, Boxed, Carried, EngineSink, PipelineEngine};
+use dynamo_gdl_adapters::{Boxed, Carried, EndedItems, EngineSink, PipelineEngine};
 use dynamo_runtime::engine::{AsyncEngine, AsyncEngineContext, Data, ResponseStream};
 use dynamo_runtime::error::DynamoError;
 use dynamo_runtime::pipeline::{Error, ManyOut, SingleIn};
@@ -63,15 +63,15 @@ pub(crate) fn native<O, K, H>(
 
 /// A hop to `I` with `GdlOperator<O, K>` as its one around node.
 pub(crate) type AroundHop<O, K, I> = gdl::Hop<
-    (gdl::ForwardHalf<GdlOperator<O, K>>, ()),
+    (gdl::ForwardHalf<GdlOperator<O, K>, gdl::EndedForm>, ()),
     I,
-    (gdl::BackwardHalf<GdlOperator<O, K>>, ()),
+    (gdl::BackwardHalf<GdlOperator<O, K>, gdl::EndedForm>, ()),
 >;
 
 /// A hop to `inner` with `op`, keyed by `K`, as its one around node.
 pub(crate) fn around<O, K, I>(op: Arc<O>, inner: I) -> AroundHop<O, K, I>
 where
-    GdlOperator<O, K>: gdl::Around,
+    GdlOperator<O, K>: gdl::Around<gdl::EndedForm>,
 {
     let (forward, backward) = gdl::around(Arc::new(GdlOperator::new(op)));
     gdl::Hop::new((forward, ()), inner, (backward, ()))
@@ -82,7 +82,7 @@ where
 /// `Cx`.
 pub(crate) fn engine<N, Req, T>(next: N) -> Arc<DynEngine<Req, T>>
 where
-    N: gdl::Next<Boxed<Req>, Annotated<T>>,
+    N: gdl::Next<Boxed<Req>, Annotated<T>, gdl::EndedForm>,
     Req: Data,
     T: Data,
 {
@@ -97,6 +97,7 @@ pub(crate) fn operator<O, K, Req, T, DT>(
 ) -> Arc<DynEngine<Req, T>>
 where
     GdlOperator<O, K>: gdl::Operator<
+            gdl::EndedForm,
             UpReq = Boxed<Req>,
             UpItem = Annotated<T>,
             DownReq = Boxed<Req>,
@@ -116,7 +117,7 @@ where
 /// the embeddings pipeline): a kill reaches the engine through the request's context only.
 pub(crate) fn engine_for_dynamo_stages<N, Req, T, R>(next: N) -> Arc<DynEngine<Req, T>>
 where
-    N: gdl::Next<R, Annotated<T>>,
+    N: gdl::Next<R, Annotated<T>, gdl::EndedForm>,
     Req: Data,
     T: Data,
     R: Carried<Req>,
@@ -146,6 +147,7 @@ where
     Req: Data,
     Resp: Data,
     PreprocessorNode<Req>: gdl::Around<
+            gdl::EndedForm,
             UpReq = Boxed<Req>,
             UpItem = Annotated<Resp>,
             DownReq = Boxed<PreprocessedRequest>,
@@ -192,12 +194,12 @@ pub(crate) fn downstream<Req: Data, T: Data>(
 /// `PipelineEngine` reads it with. `root` is the `Cx` the body ran under and `context` the
 /// request's.
 pub(crate) fn read<T: Data>(
-    items: gdl::Items<Annotated<T>>,
+    items: gdl::Ended<Annotated<T>>,
     root: gdl::Cx,
     context: Arc<dyn AsyncEngineContext>,
 ) -> ManyOut<Annotated<T>> {
     ResponseStream::new(
-        Box::pin(AnnotatedItems::new(items, root, context.clone())),
+        Box::pin(EndedItems::new(items, root, context.clone())),
         context,
     )
 }

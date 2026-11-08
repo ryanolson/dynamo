@@ -742,32 +742,9 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
 /// The request's Dynamo context carries its stop and kill to the dispatch, as it does for the
 /// engine. The sink's `cx` does not: gdl cancels it whenever its attempt ends, also when the
 /// response ends normally. An eager error enters gdl with the host's error as its source.
-impl gdl::Sink for RoutingHost {
-    type Req = Boxed<PreprocessedRequest>;
-    type Item = Annotated<LLMEngineOutput>;
-
-    fn generate(
-        &self,
-        _cx: gdl::Cx,
-        request: Boxed<PreprocessedRequest>,
-    ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<LLMEngineOutput>>>> + Send {
-        // On the heap, as the host's Dynamo engine has it, for the same one allocation. Held
-        // inline, the route's future is moved through each stage above it, and in a debug
-        // build every poll frame on the way keeps room for it: a routed pipeline then
-        // overflows a tokio worker's 2 MiB stack (`routed_gdl_pipelines_reach_a_kv_routing_host`).
-        // Erased, it also ends the type the compiler walks to prove a routed pipeline `Send`,
-        // which is deeper than the default recursion limit with the route inside it.
-        let route: Pin<Box<dyn Future<Output = Result<RouteResponse, Error>> + Send + '_>> =
-            Box::pin(self.route(*request));
-        route.map(|result| match result {
-            Ok(response) => Ok(response.into_items()),
-            Err(error) => Err(enter(error)),
-        })
-    }
-}
-
-/// The host as an ended-form sink: as the `Result`-form sink, and its response stream passes
-/// on as it is, with a clean ending (an `Annotated` item carries any error the route has).
+///
+/// The response stream passes on as it is, with a clean ending: an `Annotated` item carries any
+/// error the route has.
 impl gdl::Sink<gdl::EndedForm> for RoutingHost {
     type Req = Boxed<PreprocessedRequest>;
     type Item = Annotated<LLMEngineOutput>;
@@ -777,7 +754,12 @@ impl gdl::Sink<gdl::EndedForm> for RoutingHost {
         _cx: gdl::Cx,
         request: Boxed<PreprocessedRequest>,
     ) -> impl Future<Output = gdl::Result<gdl::Ended<Annotated<LLMEngineOutput>>>> + Send {
-        // On the heap, for the reasons the `Result`-form sink gives.
+        // On the heap, as the host's Dynamo engine has it, for the same one allocation. Held
+        // inline, the route's future is moved through each stage above it, and in a debug
+        // build every poll frame on the way keeps room for it: a routed pipeline then
+        // overflows a tokio worker's 2 MiB stack (`routed_gdl_pipelines_reach_a_kv_routing_host`).
+        // Erased, it also ends the type the compiler walks to prove a routed pipeline `Send`,
+        // which is deeper than the default recursion limit with the route inside it.
         let route: Pin<Box<dyn Future<Output = Result<RouteResponse, Error>> + Send + '_>> =
             Box::pin(self.route(*request));
         route.map(|result| match result {
@@ -884,8 +866,8 @@ impl RoutingHost {
 /// take it in the form they need, so neither pays for a box the other needs.
 #[derive(Debug)]
 pub(crate) enum RouteResponse {
-    /// Not boxed yet: the Dynamo engine boxes it as a `ManyOut`, and the gdl sink takes its
-    /// stream out.
+    /// Not boxed yet: the Dynamo engine boxes it as a `ManyOut`, and the gdl sink boxes it as
+    /// an ended stream.
     Parts(ResponseStream<Annotated<LLMEngineOutput>>),
     /// Already a `ManyOut`, as the route span's wrapper returns it.
     Boxed(ManyOut<Annotated<LLMEngineOutput>>),
@@ -897,21 +879,6 @@ impl RouteResponse {
         match self {
             Self::Parts(response) => Box::pin(response),
             Self::Boxed(response) => response,
-        }
-    }
-
-    /// The response as gdl items. The context lives as long as the stream, as it does in the
-    /// boxed response.
-    fn into_items(self) -> gdl::Items<Annotated<LLMEngineOutput>> {
-        match self {
-            Self::Parts(response) => {
-                let (stream, context) = response.into_parts();
-                gdl::items(stream.map(move |item| {
-                    let _context = &context;
-                    Ok(item)
-                }))
-            }
-            Self::Boxed(response) => gdl::items(response.map(Ok)),
         }
     }
 

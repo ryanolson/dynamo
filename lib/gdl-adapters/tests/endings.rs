@@ -18,9 +18,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use dynamo_gdl_adapters::{
-    AnnotatedItems, Boxed, CheckedItems, EndedItems, EngineSink, PipelineEngine,
-};
+use dynamo_gdl_adapters::{Boxed, EndedItems, EngineSink, PipelineEngine};
 use dynamo_llm::backend::Backend;
 use dynamo_llm::entrypoint::input::build_pipeline;
 use dynamo_llm::model_card::ModelDeploymentCard;
@@ -40,7 +38,7 @@ use dynamo_runtime::pipeline::{
 };
 use dynamo_runtime::protocols::annotated::Annotated;
 use futures::{Stream, StreamExt, stream};
-use gdl::{Cx, Items};
+use gdl::{Cx, Ended, EndedForm, EndedStream};
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
@@ -130,13 +128,13 @@ struct Root<N> {
     edit: RootEdit,
 }
 
-impl<N, Req, Item> gdl::Next<Req, Item> for Root<N>
+impl<N, Req, Item> gdl::Next<Req, Item, EndedForm> for Root<N>
 where
-    N: gdl::Next<Req, Item>,
+    N: gdl::Next<Req, Item, EndedForm>,
     Req: Send + 'static,
     Item: Send + 'static,
 {
-    fn generate(&self, cx: Cx, req: Req) -> impl Future<Output = gdl::Result<Items<Item>>> + Send {
+    fn generate(&self, cx: Cx, req: Req) -> impl Future<Output = gdl::Result<Ended<Item>>> + Send {
         let cx = match &self.edit {
             RootEdit::None => cx,
             RootEdit::Deadline { timeout, at } => {
@@ -160,7 +158,7 @@ where
 /// Pipeline A as `build_pipeline` composes it, over `sink`, under `root`.
 fn pipeline_a<S>(sink: S, edit: RootEdit) -> Pipeline
 where
-    S: gdl::Sink<Req = Boxed<Pre>, Item = Annotated<LLMEngineOutput>>,
+    S: gdl::Sink<EndedForm, Req = Boxed<Pre>, Item = Annotated<LLMEngineOutput>>,
 {
     use gdl::{Hop, SinkStage};
 
@@ -260,27 +258,58 @@ struct GdlWorker {
     kill: Option<Arc<dyn AsyncEngineContext>>,
 }
 
-impl gdl::Sink for GdlWorker {
+impl gdl::Sink<EndedForm> for GdlWorker {
     type Req = Boxed<Pre>;
     type Item = Annotated<LLMEngineOutput>;
 
-    async fn generate(&self, cx: Cx, _req: Boxed<Pre>) -> gdl::Result<Items<Self::Item>> {
-        let (end, kill) = (self.end, self.kill.clone());
-        let tail = stream::once(async move {
-            if let Some(context) = kill {
+    async fn generate(&self, cx: Cx, _req: Boxed<Pre>) -> gdl::Result<Ended<Self::Item>> {
+        Ok(gdl::ended(WorkerStream {
+            answer: answer().into_iter().collect(),
+            end: Some(self.end),
+            kill: self.kill.clone(),
+            cx,
+            ending: None,
+        }))
+    }
+}
+
+/// [`GdlWorker`]'s stream: the answer, then its end as [`GdlEnd`] says. A node error is the
+/// stream's ending.
+struct WorkerStream {
+    answer: std::collections::VecDeque<Annotated<LLMEngineOutput>>,
+    end: Option<GdlEnd>,
+    kill: Option<Arc<dyn AsyncEngineContext>>,
+    cx: Cx,
+    ending: Option<gdl::Error>,
+}
+
+impl Stream for WorkerStream {
+    type Item = Annotated<LLMEngineOutput>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if let Some(item) = self.answer.pop_front() {
+            return std::task::Poll::Ready(Some(item));
+        }
+        if let Some(end) = self.end.take() {
+            if let Some(context) = self.kill.take() {
                 context.kill();
             }
             match end {
-                GdlEnd::Clean => None,
-                GdlEnd::CancelOwnScope => {
-                    cx.cancel();
-                    None
-                }
-                GdlEnd::NodeError => Some(Err(gdl::Error::node("worker failed"))),
+                GdlEnd::Clean => {}
+                GdlEnd::CancelOwnScope => self.cx.cancel(),
+                GdlEnd::NodeError => self.ending = Some(gdl::Error::node("worker failed")),
             }
-        })
-        .filter_map(|end| async { end });
-        Ok(gdl::items(stream::iter(answer().map(Ok)).chain(tail)))
+        }
+        std::task::Poll::Ready(None)
+    }
+}
+
+impl EndedStream for WorkerStream {
+    fn ending(mut self: std::pin::Pin<&mut Self>) -> Option<gdl::Error> {
+        self.ending.take()
     }
 }
 
@@ -553,15 +582,10 @@ async fn a_kill_with_a_worker_that_cancels_its_own_scope_ends_with_no_item() {
     assert_eq!(items, ["text", "finish Length"]);
 }
 
-// `last_item`'s rule, read directly at a node's input (`CheckedItems`, and `AnnotatedItems` as a
-// node reads it) and at the exit (`AnnotatedItems`, as `PipelineEngine` reads its root).
+// `last_item`'s rule, read directly through `EndedItems`: a node's input, and the exit as
+// `PipelineEngine` reads its root.
 
-/// One item, then `end`.
-fn ended(end: gdl::Error) -> Items<Annotated<u32>> {
-    gdl::items(stream::iter([Ok(Annotated::from_data(1u32)), Err(end)]))
-}
-
-/// One item, then `None`, with `end` as its ending: [`ended`] in the ended form.
+/// One item, then `None`, with `end` as its ending.
 struct EndsWith {
     item: Option<Annotated<u32>>,
     end: Option<gdl::Error>,
@@ -585,7 +609,7 @@ impl gdl::EndedStream for EndsWith {
     }
 }
 
-fn ended_form(end: gdl::Error) -> gdl::Ended<Annotated<u32>> {
+fn ended(end: gdl::Error) -> gdl::Ended<Annotated<u32>> {
     gdl::ended(EndsWith {
         item: Some(Annotated::from_data(1)),
         end: Some(end),
@@ -636,35 +660,13 @@ async fn read<S: Stream + Unpin>(stream: S, each: impl Fn(S::Item) -> String) ->
     stream.map(each).collect().await
 }
 
-/// What `AnnotatedItems` and `CheckedItems` yield for one item and then `end`, in `state`, and
-/// `EndedItems` for one item and then `end` as its ending. All apply one rule, so the test also
-/// checks they agree.
+/// What `EndedItems` yields for one item and then `end` as its ending, in `state`.
 async fn rule(end: fn() -> gdl::Error, state: State) -> Vec<String> {
     let (root, context) = parts(state);
-    let annotated = read(
-        AnnotatedItems::new(ended(end()), root.clone(), context.clone()),
-        |item| describe_u32(&item),
-    )
-    .await;
-    let checked = read(
-        CheckedItems::new(ended(end()), root, context),
-        |item| match item {
-            Ok(item) => describe_u32(&item),
-            Err(error) => format!("Err {:?}", error.kind()),
-        },
-    )
-    .await;
-    assert_eq!(
-        annotated, checked,
-        "the exit and a node's input apply one rule"
-    );
-    let (root, context) = parts(state);
-    let ended = read(EndedItems::new(ended_form(end()), root, context), |item| {
+    read(EndedItems::new(ended(end()), root, context), |item| {
         describe_u32(&item)
     })
-    .await;
-    assert_eq!(annotated, ended, "the ended form applies the same rule");
-    annotated
+    .await
 }
 
 #[tokio::test]

@@ -27,7 +27,7 @@ use dynamo_runtime::CancellationToken;
 use dynamo_runtime::engine::AsyncEngine;
 use dynamo_runtime::pipeline::{Context, ManyOut, SingleIn, async_trait};
 use dynamo_runtime::protocols::annotated::Annotated;
-use gdl::{Cx, Hop, Items, Sink, SinkStage, Source};
+use gdl::{Cx, Ended, EndedForm, Hop, Sink, SinkStage, Source};
 
 type Req = NvCreateChatCompletionRequest;
 type Resp = NvCreateChatCompletionStreamResponse;
@@ -53,12 +53,12 @@ struct RetainError {
     retained: Arc<Mutex<Vec<gdl::Error>>>,
 }
 
-impl Sink for RetainError {
+impl Sink<EndedForm> for RetainError {
     type Req = SingleIn<Req>;
     type Item = Annotated<Resp>;
 
-    async fn generate(&self, cx: Cx, req: Self::Req) -> gdl::Result<Items<Self::Item>> {
-        let result = Sink::<gdl::ResultForm>::generate(&self.sink, cx, req).await;
+    async fn generate(&self, cx: Cx, req: Self::Req) -> gdl::Result<Ended<Self::Item>> {
+        let result = self.sink.generate(cx, req).await;
         if let Err(error) = &result {
             self.retained.lock().unwrap().push(error.clone());
         }

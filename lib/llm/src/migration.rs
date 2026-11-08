@@ -10,13 +10,13 @@ use std::task::{Poll, ready};
 use std::time::Instant;
 
 use anyhow::{Error, Result};
-use dynamo_gdl_adapters::{Boxed, Carried, CheckedItems};
+use dynamo_gdl_adapters::{Boxed, Carried, EndedItems};
 use futures::{FutureExt, Stream, stream::StreamExt};
 
 use crate::{
     http::service::metrics::Metrics,
     model_card::ModelDeploymentCard,
-    operator::{GdlDownstream, GdlOperator, checked_mut, into_checked, native},
+    operator::{GdlDownstream, GdlOperator, native},
     protocols::{
         TokenIdType,
         common::{
@@ -289,7 +289,7 @@ impl Migration {
 /// preprocessed request boxed.
 type MigrationDownstream<N> = GdlDownstream<N, Boxed<PreprocessedRequest>, PreprocessedRequest>;
 
-impl<Resp> gdl::Operator for GdlOperator<Migration, Resp>
+impl<Resp> gdl::Operator<gdl::EndedForm> for GdlOperator<Migration, Resp>
 where
     Resp: Data + HasTokenIds,
 {
@@ -303,9 +303,9 @@ where
         cx: gdl::Cx,
         request: Boxed<PreprocessedRequest>,
         next: N,
-    ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<Resp>>>> + Send
+    ) -> impl Future<Output = gdl::Result<gdl::Ended<Annotated<Resp>>>> + Send
     where
-        N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<Resp>>,
+        N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<Resp>, gdl::EndedForm>,
     {
         // Each attempt is a new request, built from the one kept here: the first goes on in
         // this request's box. Each attempt is a call of `next` under `cx`, so gdl runs it in a
@@ -324,10 +324,10 @@ impl Migration {
         &self,
         request: SingleIn<PreprocessedRequest>,
         next: MigrationDownstream<N>,
-    ) -> Result<gdl::Items<Annotated<Resp>>>
+    ) -> Result<gdl::Ended<Annotated<Resp>>>
     where
         Resp: Data + HasTokenIds,
-        N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<Resp>> + 'static,
+        N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<Resp>, gdl::EndedForm> + 'static,
     {
         // NOTE: Keep the migration operator in the request path at limit zero. The limit controls
         // replacement attempts; RetryManager continues to own the initial attempt uniformly.
@@ -349,7 +349,7 @@ impl Migration {
             session_affinity,
         )
         .await?;
-        Ok(gdl::items(Migrated::Streaming(retry_manager)))
+        Ok(gdl::ended(Migrated::Streaming(retry_manager)))
     }
 }
 
@@ -386,18 +386,30 @@ type MigrationFuture<Resp, N> =
 // future is boxed.
 impl<Resp, N> Unpin for Migrated<Resp, N> where Resp: Data + HasTokenIds {}
 
+/// Migration reads each attempt through [`EndedItems`], which gives an attempt's ending as a
+/// last item that Migration may migrate on, so its own stream ends cleanly.
+impl<Resp, N> gdl::EndedStream for Migrated<Resp, N>
+where
+    Resp: Data + HasTokenIds,
+    N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<Resp>, gdl::EndedForm> + 'static,
+{
+    fn ending(self: Pin<&mut Self>) -> Option<gdl::Error> {
+        None
+    }
+}
+
 impl<Resp, N> Stream for Migrated<Resp, N>
 where
     Resp: Data + HasTokenIds,
-    N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<Resp>> + 'static,
+    N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<Resp>, gdl::EndedForm> + 'static,
 {
-    type Item = gdl::Result<Annotated<Resp>>;
+    type Item = Annotated<Resp>;
 
     // hot path: per-item-response
     fn poll_next(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> Poll<Option<gdl::Result<Annotated<Resp>>>> {
+    ) -> Poll<Option<Annotated<Resp>>> {
         let this = &mut *self;
         loop {
             match this {
@@ -414,7 +426,7 @@ where
                                 return poll;
                             }
                             Poll::Ready(Some(response)) => {
-                                if manager.accept(checked_mut(response)) {
+                                if manager.accept(response) {
                                     return poll;
                                 }
                             }
@@ -422,7 +434,6 @@ where
                         let Poll::Ready(Some(response)) = poll else {
                             unreachable!("only a failure to migrate on gets here");
                         };
-                        let response = into_checked(response);
                         let Migrated::Streaming(mut manager) =
                             std::mem::replace(this, Migrated::Ended)
                         else {
@@ -454,7 +465,7 @@ where
                         Some(_) => Migrated::Streaming(manager),
                         None => Migrated::Ended,
                     };
-                    return Poll::Ready(next.map(Ok));
+                    return Poll::Ready(next);
                 }
                 Migrated::Ended => return Poll::Ready(None),
             }
@@ -485,7 +496,7 @@ where
     request: PreprocessedRequest,
     session_affinity: Option<SessionAffinityId>,
     next_generate: MigrationDownstream<N>,
-    next_stream: Option<CheckedItems<Resp>>,
+    next_stream: Option<EndedItems<Resp>>,
     attempts: AttemptBudget,
     max_seq_len: Option<u32>,
     model_name: Arc<String>,
@@ -586,7 +597,7 @@ where
 impl<Resp, N> RetryManager<Resp, N>
 where
     Resp: Data + HasTokenIds,
-    N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<Resp>>,
+    N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<Resp>, gdl::EndedForm>,
 {
     #[allow(clippy::too_many_arguments)]
     pub async fn build(
@@ -683,10 +694,10 @@ where
                 }
             };
             let mut response = response_stream.next().await?;
-            if self.accept(checked_mut(&mut response)) {
-                return Some(into_checked(response));
+            if self.accept(&mut response) {
+                return Some(response);
             }
-            if let Some(response) = self.migrate_on(into_checked(response)).await {
+            if let Some(response) = self.migrate_on(response).await {
                 return Some(response);
             }
         }
@@ -874,7 +885,7 @@ where
             {
                 release.release().await;
             }
-            let response_stream = self.next_generate.send_items(request).await;
+            let response_stream = self.next_generate.send(request).await;
             match response_stream {
                 Ok(next_stream) => {
                     // A dispatch cancelled before its response prologue returns `Ok` empty,

@@ -408,7 +408,7 @@ impl Drop for PrefillRouter {
 /// takes the preprocessed request boxed.
 type RouteDownstream<N> = GdlDownstream<N, Boxed<PreprocessedRequest>, PreprocessedRequest>;
 
-impl gdl::Operator for GdlOperator<PrefillRouter, PreprocessedRequest> {
+impl gdl::Operator<gdl::EndedForm> for GdlOperator<PrefillRouter, PreprocessedRequest> {
     type UpReq = Boxed<PreprocessedRequest>;
     type UpItem = Annotated<LLMEngineOutput>;
     type DownReq = Boxed<PreprocessedRequest>;
@@ -419,9 +419,9 @@ impl gdl::Operator for GdlOperator<PrefillRouter, PreprocessedRequest> {
         cx: gdl::Cx,
         mut request: Boxed<PreprocessedRequest>,
         next: N,
-    ) -> impl Future<Output = gdl::Result<gdl::Items<Annotated<LLMEngineOutput>>>> + Send
+    ) -> impl Future<Output = gdl::Result<gdl::Ended<Annotated<LLMEngineOutput>>>> + Send
     where
-        N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<LLMEngineOutput>>,
+        N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<LLMEngineOutput>, gdl::EndedForm>,
     {
         let router = Arc::clone(&self.op);
         async move {
@@ -507,9 +507,9 @@ impl PrefillRouter {
         request: SingleIn<PreprocessedRequest>,
         next: RouteDownstream<N>,
         gate: PrefillGate,
-    ) -> Result<gdl::Items<Annotated<LLMEngineOutput>>>
+    ) -> Result<gdl::Ended<Annotated<LLMEngineOutput>>>
     where
-        N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<LLMEngineOutput>>,
+        N: gdl::Next<Boxed<PreprocessedRequest>, Annotated<LLMEngineOutput>, gdl::EndedForm>,
     {
         // Extract request data while preserving context
         let (mut req, mut context) = request.into_parts();
@@ -571,7 +571,7 @@ impl PrefillRouter {
                         response_stream.into_many_out(),
                         client_requested_bypass_marker,
                     )
-                    .map(|stream| gdl::items(stream.map(Ok)));
+                    .map(gdl::ended::clean);
                 }
                 Ok(None) => {
                     (req, context) = conditional_request.into_parts();
@@ -741,7 +741,7 @@ impl PrefillRouter {
         let outcome = match outcome {
             PrefillOutcome::Terminal { output } => {
                 let output = strip_terminal_disaggregated_params(*output);
-                return Ok(gdl::items(stream::once(async move { Ok(output) })));
+                return Ok(gdl::ended::clean(stream::once(async move { output })));
             }
             outcome => outcome,
         };
@@ -801,7 +801,7 @@ impl PrefillRouter {
                     .forward_decode(decode, engine_ctx, output, prefill_engine_ctx)
                     .await
             }
-            None => decode.await.map(|stream| gdl::items(stream.map(Ok))),
+            None => decode.await.map(gdl::ended),
         }
     }
 }

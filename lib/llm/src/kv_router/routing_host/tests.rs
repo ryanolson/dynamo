@@ -5573,10 +5573,9 @@ async fn the_host_as_a_gdl_sink_routes_as_the_dynamo_engine_does() {
         .collect()
         .await;
     let sink: Vec<_> = pipeline
-        .call::<_, _, gdl::ResultForm>(gdl::Cx::new(), Box::new(Context::new(request())))
+        .call(gdl::Cx::new(), Box::new(Context::new(request())))
         .await
         .unwrap()
-        .map(|item| item.expect("an Annotated item"))
         .collect()
         .await;
     assert_eq!(
@@ -5593,10 +5592,7 @@ async fn the_host_as_a_gdl_sink_routes_as_the_dynamo_engine_does() {
     let Err(engine) = AsyncEngine::generate(router.as_ref(), pinned()).await else {
         panic!("the engine refuses an unknown pinned worker");
     };
-    let Err(sink) = pipeline
-        .call::<_, _, gdl::ResultForm>(gdl::Cx::new(), Box::new(pinned()))
-        .await
-    else {
+    let Err(sink) = pipeline.call(gdl::Cx::new(), Box::new(pinned())).await else {
         panic!("the sink refuses an unknown pinned worker");
     };
     let mut chain =

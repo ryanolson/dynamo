@@ -16,16 +16,15 @@
 //! ([`Boxed`](dynamo_gdl_adapters::Boxed)), so gdl's chain moves a pointer, not the request. A
 //! native operator takes the request out of its box to run its body, and the body's first send
 //! puts the request it sends in that box again ([`GdlDownstream::with_spare`]). Items stay
-//! `Annotated<T>`; an operator that edits its items in place reads them in their gdl `Result`
-//! ([`GdlDownstream::send_items`], [`checked_mut`]), so an item is not taken out and wrapped
-//! again at every stage.
+//! `Annotated<T>`, in gdl's ended form: they cross each stage as they are, and an ending of the
+//! stages below reaches an operator as a last item ([`EndedItems`]).
 
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use dynamo_gdl_adapters::{AnnotatedItems, Carried, CheckedItems, CxBridge, enter};
+use dynamo_gdl_adapters::{Carried, CxBridge, EndedItems, enter};
 use dynamo_runtime::engine::Data;
 use dynamo_runtime::pipeline::{AsyncEngineContextProvider, SingleIn};
 use dynamo_runtime::protocols::annotated::Annotated;
@@ -33,36 +32,6 @@ use futures::FutureExt;
 
 #[cfg(test)]
 pub(crate) mod testing;
-
-/// The `Annotated` value of an item read through [`CheckedItems`], which is always `Ok`. An
-/// operator that edits its items in place reads them in their gdl `Result`, so an item is never
-/// taken out of its `Result` and wrapped again, which would move it (about 600 bytes) twice per
-/// stage.
-#[inline]
-pub(crate) fn checked<U>(item: &gdl::Result<Annotated<U>>) -> &Annotated<U> {
-    match item {
-        Ok(item) => item,
-        Err(_) => unreachable!("checked items carry no `Err`"),
-    }
-}
-
-/// As [`checked`], to edit in place.
-#[inline]
-pub(crate) fn checked_mut<U>(item: &mut gdl::Result<Annotated<U>>) -> &mut Annotated<U> {
-    match item {
-        Ok(item) => item,
-        Err(_) => unreachable!("checked items carry no `Err`"),
-    }
-}
-
-/// As [`checked`], by value, for a path that takes the item out of its `Result`.
-#[inline]
-pub(crate) fn into_checked<U>(item: gdl::Result<Annotated<U>>) -> Annotated<U> {
-    match item {
-        Ok(item) => item,
-        Err(_) => unreachable!("checked items carry no `Err`"),
-    }
-}
 
 /// The stage below a native operator, as the operator's body calls it: gdl's `cx` and `next`.
 /// `next` takes requests in the carrier `R` (see [`Carried`]): boxed for Migration and the
@@ -91,9 +60,9 @@ impl<N, R: Carried<Req>, Req: Data> GdlDownstream<N, R, Req> {
     pub(crate) fn send<T>(
         &self,
         request: SingleIn<Req>,
-    ) -> impl Future<Output = anyhow::Result<AnnotatedItems<T>>> + Send
+    ) -> impl Future<Output = anyhow::Result<EndedItems<T>>> + Send
     where
-        N: gdl::Next<R, Annotated<T>>,
+        N: gdl::Next<R, Annotated<T>, gdl::EndedForm>,
         T: Data,
     {
         self.send_under(self.cx.clone(), request)
@@ -105,9 +74,9 @@ impl<N, R: Carried<Req>, Req: Data> GdlDownstream<N, R, Req> {
     pub(crate) fn forward<T>(
         &self,
         request: SingleIn<Req>,
-    ) -> impl Future<Output = anyhow::Result<gdl::Items<Annotated<T>>>> + Send
+    ) -> impl Future<Output = anyhow::Result<gdl::Ended<Annotated<T>>>> + Send
     where
-        N: gdl::Next<R, Annotated<T>>,
+        N: gdl::Next<R, Annotated<T>, gdl::EndedForm>,
         T: Data,
     {
         self.forward_carried(R::carry_in(request, &self.spare))
@@ -119,9 +88,9 @@ impl<N, R: Carried<Req>, Req: Data> GdlDownstream<N, R, Req> {
     pub(crate) fn forward_carried<T>(
         &self,
         request: R,
-    ) -> impl Future<Output = anyhow::Result<gdl::Items<Annotated<T>>>> + Send
+    ) -> impl Future<Output = anyhow::Result<gdl::Ended<Annotated<T>>>> + Send
     where
-        N: gdl::Next<R, Annotated<T>>,
+        N: gdl::Next<R, Annotated<T>, gdl::EndedForm>,
         T: Data,
     {
         // Carried as itself, so `native` gives back the same `gdl::Error`.
@@ -138,35 +107,13 @@ impl<N, R: Carried<Req>, Req: Data> GdlDownstream<N, R, Req> {
     pub(crate) fn send_cleanup<T>(
         &self,
         request: SingleIn<Req>,
-    ) -> impl Future<Output = anyhow::Result<AnnotatedItems<T>>> + Send
+    ) -> impl Future<Output = anyhow::Result<EndedItems<T>>> + Send
     where
-        N: gdl::Next<R, Annotated<T>>,
+        N: gdl::Next<R, Annotated<T>, gdl::EndedForm>,
         T: Data,
     {
         let cx = CxBridge::cx_for_cleanup(request.context().as_ref());
         self.send_under(cx, request)
-    }
-
-    /// Send `request` on, as [`send`](Self::send) does, and read the response's items in their
-    /// gdl `Result`, for an operator that edits them in place (see [`checked_mut`]). gdl's
-    /// `Err` rule is already applied to the stream, so every item is `Ok`.
-    pub(crate) fn send_items<T>(
-        &self,
-        request: SingleIn<Req>,
-    ) -> impl Future<Output = anyhow::Result<CheckedItems<T>>> + Send
-    where
-        N: gdl::Next<R, Annotated<T>>,
-        T: Data,
-    {
-        let context = request.context();
-        let root = self.cx.clone();
-        self.next
-            .generate(self.cx.clone(), R::carry_in(request, &self.spare))
-            .map(move |result| match result {
-                Ok(items) => Ok(CheckedItems::new(items, root, context)),
-                // Carried as itself, so `native` gives back the same `gdl::Error`.
-                Err(error) => Err(anyhow::Error::new(error)),
-            })
     }
 
     /// Send `request` on under `cx` and read the response as a Dynamo stream.
@@ -174,9 +121,9 @@ impl<N, R: Carried<Req>, Req: Data> GdlDownstream<N, R, Req> {
         &self,
         cx: gdl::Cx,
         request: SingleIn<Req>,
-    ) -> impl Future<Output = anyhow::Result<AnnotatedItems<T>>> + Send
+    ) -> impl Future<Output = anyhow::Result<EndedItems<T>>> + Send
     where
-        N: gdl::Next<R, Annotated<T>>,
+        N: gdl::Next<R, Annotated<T>, gdl::EndedForm>,
         T: Data,
     {
         // The stream gives the request's own context: the stages below are Dynamo's, or keep
@@ -186,7 +133,7 @@ impl<N, R: Carried<Req>, Req: Data> GdlDownstream<N, R, Req> {
         self.next
             .generate(cx, R::carry_in(request, &self.spare))
             .map(move |result| match result {
-                Ok(items) => Ok(AnnotatedItems::new(items, root, context)),
+                Ok(items) => Ok(EndedItems::new(items, root, context)),
                 // Carried as itself, so `native` gives back the same `gdl::Error`.
                 Err(error) => Err(anyhow::Error::new(error)),
             })
@@ -227,7 +174,7 @@ pub(crate) fn boxed_work<T: Send + 'static>(
 
 /// A body's error as a native operator's: an error that came from below leaves as the same
 /// `gdl::Error`, and one the body raised enters gdl with its `anyhow::Error` as the source.
-pub(crate) fn native<T>(result: anyhow::Result<gdl::Items<T>>) -> gdl::Result<gdl::Items<T>> {
+pub(crate) fn native<T>(result: anyhow::Result<gdl::Ended<T>>) -> gdl::Result<gdl::Ended<T>> {
     result.map_err(gdl_error)
 }
 
