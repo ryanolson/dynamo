@@ -326,19 +326,45 @@ where
     type Item = Annotated<BackendOutput>;
 
     // hot path: per-item-response
+    // One frame (control for the stage measurement): the shared per-item body, called on the
+    // item where it was read.
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        let Some(state) = self.state.as_mut() else {
-            return Poll::Ready(None);
-        };
-        match ready!(state.poll_step(cx)) {
-            Some(output) => Poll::Ready(Some(backend_output(output))),
-            None => {
-                self.state = None;
-                Poll::Ready(None)
+        let (polled, ended) = {
+            let Some(state) = self.state.as_mut() else {
+                return Poll::Ready(None);
+            };
+            loop {
+                if state.finished {
+                    break (Poll::Ready(None), true);
+                }
+                if state.stream_ended {
+                    let next = state.pending_flush.pop();
+                    let ended = next.is_none();
+                    break (Poll::Ready(next.map(backend_output)), ended);
+                }
+                match ready!(state.stream.poll_next_unpin(cx)) {
+                    Some(mut item) => {
+                        if state.choice_finished(&item) {
+                            continue;
+                        }
+                        state.process(&mut item);
+                        break (Poll::Ready(Some(backend_output(item))), false);
+                    }
+                    None => {
+                        state.stream_ended = true;
+                        if state.stream.cut_short() {
+                            break (Poll::Ready(None), true);
+                        }
+                        state.queue_flush();
+                    }
+                }
             }
+        };
+        if ended {
+            self.state = None;
         }
-    }
-}
+        polled
+    }}
 
 /// Backend reads its input through [`EndedItems`], which gives an ending of the stages below as
 /// a last item, so Backend's own stream ends cleanly.
@@ -351,396 +377,24 @@ where
     }
 }
 
-impl<S> DecoderState<S>
-where
-    S: Stream<Item = Annotated<LLMEngineOutput>> + AsyncEngineContextProvider + CutShort + Unpin,
-{
-    /// The next item, detokenized in place, or `None` when the stream has ended.
-    fn poll_step(&mut self, cx: &mut TaskContext<'_>) -> Poll<Option<Annotated<LLMEngineOutput>>> {
-        // If we've already detected a local stop condition, end the stream
-        if self.finished {
-            return Poll::Ready(None);
-        }
-
-        // `stream` already yielded `None` once; do not poll it again (unspecified
-        // behavior for most `Stream` impls). Only drain the flush queue from here on.
-        if self.stream_ended {
-            return Poll::Ready(self.pending_flush.pop());
-        }
-
-        let output = loop {
-            let output = ready!(self.stream.poll_next_unpin(cx));
-            let choice_already_finished = output.as_ref().is_some_and(|output| {
-                !output.is_event()
-                    && output.data.as_ref().is_some_and(|data| {
-                        self.finished_choices
-                            .contains(&data.index.unwrap_or_default())
-                    })
-            });
-            if !choice_already_finished {
-                break output;
-            }
-        };
-
-        match output {
-            Some(mut item) => {
-                let output = &mut item;
-                // move to state.process_output
-                // handle any error conditions / unwraps here
-
-                // events are pass thru
-                if output.is_event() || output.data.is_none() {
-                    // A genuine stream-level error ends generation for every choice at
-                    // once -- `Annotated::from_err` carries no per-choice `index` the
-                    // way `LLMEngineOutput` does, so there is no narrower target than
-                    // "all of them". Mark them finished so the bare-EOF flush loop below
-                    // does not synthesize a spurious successful `Stop` for any choice
-                    // after a real error, the same hardening already applied to decode
-                    // errors and the decoded-text bypass path.
-                    if output.is_error() {
-                        self.finished_choices.extend(self.decoders.keys().copied());
-                    }
-                    return Poll::Ready(Some(item));
-                }
-
-                // Top-logprob text is independent of the selected token text. An engine may
-                // decode the selected token while still omitting candidate text, so repair the
-                // candidates before the decoded-text fast path below.
-                //
-                // Per-entry decode is O(positions * top_k) per delta. Bounded in
-                // practice (streaming: 1 * top_k <= 20) and dwarfed by serialization
-                // on the same path, so we ship the simple version. Revisit if a
-                // streaming flamegraph with top_logprobs=20 puts this above ~1%:
-                // the cheapest win is a shared LRU on the Tokenizer keyed by
-                // (token_id, skip_special_tokens) — top-k entries repeat heavily
-                // across positions and requests. Do NOT batch as a single
-                // decode(&[ids..]) call: BPE merge / leading-space rules differ
-                // between single-token and sequence decode and will corrupt strings.
-                if let Some(top_logprobs) = output
-                    .data
-                    .as_mut()
-                    .and_then(|data| data.top_logprobs.as_mut())
-                {
-                    fill_missing_top_logprob_text(
-                        &self.tokenizer,
-                        top_logprobs,
-                        self.skip_special_tokens,
-                    );
-                }
-
-                // A worker may send already-trimmed text alongside the raw
-                // IDs. Re-decode those IDs when stop-token text must survive
-                // (no_stop_trim, or a parser that needs the model's terminator)
-                // instead of using the text fast path. Text-only output cannot
-                // honor these options; don't silently return trimmed or empty
-                // content. Empty stop trailers are valid after this choice emitted IDs.
-                if (self.no_stop_trim || self.retain_model_stop_token_text)
-                    && let Some(data) = &output.data
-                    && data.token_ids.is_empty()
-                    && (data.text.as_ref().is_some_and(|text| !text.is_empty())
-                        || data
-                            .tokens
-                            .as_ref()
-                            .is_some_and(|tokens| !tokens.is_empty())
-                        || (data.finish_reason == Some(FinishReason::Stop)
-                            && self
-                                .decoders
-                                .get(&data.index.unwrap_or(0))
-                                .is_none_or(|decoder| decoder.generated_tokens == 0)))
-                {
-                    self.stream.context().stop_generating();
-                    self.finished = true;
-                    let error = DynamoError::builder()
-                        .class(ErrorClass::BackendProtocol)
-                        .message("no_stop_trim requires backend token IDs through the matched stop; the backend omitted them (also required when a parser retains the model's stop token text)")
-                        .build();
-                    return Poll::Ready(Some(Annotated::from_err(error)));
-                }
-
-                // if we have a data field without an event, then we might need to update the data
-                if let Some(data) = &mut output.data
-                    && data.text.is_some()
-                    && !self.validate_engine_decode
-                    && !(self.no_stop_trim || self.retain_model_stop_token_text)
-                {
-                    if data.log_probs.is_some() && data.tokens.is_none() {
-                        data.tokens = Some(
-                            data.token_ids
-                                .iter()
-                                .map(|token_id| {
-                                    self.tokenizer
-                                        .decode(&[*token_id], self.skip_special_tokens)
-                                        .ok()
-                                        // Lossy text cannot recover the original token bytes.
-                                        .filter(|decoded| {
-                                            decoded.is_complete()
-                                                && !decoded.as_str().contains('\u{fffd}')
-                                        })
-                                        .map(Into::into)
-                                })
-                                .collect(),
-                        );
-                    }
-                    // Text already decoded; track finish for this choice
-                    let choice_idx = data.index.unwrap_or(0);
-                    let has_finish = data.finish_reason.is_some();
-                    if has_finish {
-                        self.finished_choices.insert(choice_idx);
-                    }
-                    // This path bypasses the decoder entirely (the engine pre-decoded
-                    // its own text for this chunk), but the decoder for this choice is
-                    // still alive across chunks and may be holding text withheld by a
-                    // *previous* chunk that did go through it. Losing track of that here
-                    // would either drop it silently (on a terminal chunk) or make a
-                    // migration checkpoint captured from this chunk (see `jail_seed`)
-                    // look falsely resolved, so:
-                    if let Some(decoder) = self.decoders.get_mut(&choice_idx) {
-                        // On a terminal chunk, flush it and put it *before* this chunk's
-                        // own text -- it is strictly older -- rather than appending,
-                        // which would reorder output (e.g. "there" + withheld "o" must
-                        // come out as "othere", not "thereo").
-                        if has_finish && let Some(data) = &mut output.data {
-                            match decoder.finish() {
-                                Ok(result) => {
-                                    if let Some(trigger) = result.stop_trigger {
-                                        data.text = result.released_text;
-                                        if !matches!(
-                                            data.finish_reason,
-                                            Some(FinishReason::Error(_))
-                                        ) {
-                                            let (reason, stop) = trigger.reasons();
-                                            data.finish_reason = Some(reason);
-                                            data.stop_reason = stop;
-                                        }
-                                    } else if let Some(flushed) = result.released_text {
-                                        let newer = data.text.take().unwrap_or_default();
-                                        data.text = Some(flushed + &newer);
-                                    }
-                                }
-                                Err(error) => {
-                                    data.finish_reason =
-                                        Some(FinishReason::Error(format!("decode error: {error}")));
-                                }
-                            }
-                        }
-                        // Mirror the decoder's current withheld state on every chunk
-                        // (terminal or not), even though this chunk didn't change it, so
-                        // a checkpoint captured here reflects reality instead of always
-                        // reading as resolved. Skipped entirely when migration can't
-                        // happen -- nothing will ever read this checkpoint, so there is
-                        // no reason to allocate a snapshot of it.
-                        if self.migration_possible
-                            && let Some(data) = &mut output.data
-                        {
-                            data.jailed_text = decoder.checkpoint();
-                        }
-                    }
-                    return Poll::Ready(Some(item));
-                }
-
-                let data = output.data.as_ref().unwrap();
-                let choice_idx = data.index.unwrap_or(0);
-                // Snapshot the choice count before borrowing a specific decoder mutably
-                // below: that borrow stays alive until this choice's `checkpoint()` call
-                // near the end of this arm, so `self.decoders` can't be read again
-                // (even just its length) in between. The count itself never changes
-                // after `Backend::decoder()` creates the map, so this is safe to cache.
-                let decoders_count = self.decoders.len();
-
-                let Some(decoder) = self.decoders.get_mut(&choice_idx) else {
-                    tracing::error!(
-                        "engine emitted choice index {choice_idx}, but only {decoders_count} choices were requested"
-                    );
-                    if let Some(data) = &mut output.data {
-                        data.finish_reason = Some(FinishReason::Error(format!(
-                            "invalid choice index {choice_idx}"
-                        )));
-                    }
-                    return Poll::Ready(Some(item));
-                };
-
-                // Per-token text is read only with this chunk's logprobs (`create_logprobs`).
-                let needs_token_text = data.log_probs.is_some();
-                let result = decoder
-                    .process_token_ids_with_token_text(&data.token_ids, needs_token_text)
-                    .and_then(|mut result| {
-                        if result.stop_trigger.is_none() && data.finish_reason.is_some() {
-                            let final_step = decoder.finish()?;
-                            if let Some(text) = final_step.released_text {
-                                result.text.get_or_insert_default().push_str(&text);
-                            }
-                            result.stop_trigger = final_step.stop_trigger;
-                        }
-                        Ok(result)
-                    });
-                let result = match result {
-                    Ok(result) => result,
-                    Err(e) => {
-                        tracing::error!("Failed to process token_ids for choice {choice_idx}: {e}");
-                        self.finished_choices.insert(choice_idx);
-                        if self.finished_choices.len() >= decoders_count {
-                            self.stream.context().stop_generating();
-                            self.finished = true;
-                        }
-                        if let Some(data) = &mut output.data {
-                            data.finish_reason =
-                                Some(FinishReason::Error(format!("decode error: {e}")));
-                        }
-                        return Poll::Ready(Some(item));
-                    }
-                };
-
-                // NOTE: the `finish_reason` is computed from the generated `token_ids` alone.
-                // The `data` field can have a `finish_reason` set, coming from the underlying
-                // LLM inference `Engine`, and empty `token_ids`. See comment below for more details.
-                //
-                // stop_reason is only set for user-provided stop sequences, not for system
-                // EOS tokens (HiddenStopTokenDetected). This matches OpenAI API behavior where
-                // stop_reason is only present when a user-specified stop sequence is matched.
-                let (finish_reason, stop_reason) = result
-                    .stop_trigger
-                    .as_ref()
-                    .map(|trigger| {
-                        let (reason, stop) = trigger.reasons();
-                        (Some(reason), stop)
-                    })
-                    .unwrap_or((None, None));
-
-                // If we detected a local stop condition, mark this choice as finished.
-                // Once all expected choices are finished, stop the upstream generator.
-                if finish_reason.is_some() && data.finish_reason.is_none() {
-                    self.finished_choices.insert(choice_idx);
-                    if self.finished_choices.len() >= decoders_count {
-                        self.stream.context().stop_generating();
-                        self.finished = true;
-                    }
-                }
-
-                let text = result.text;
-                let tokens = result.tokens;
-
-                if self.validate_engine_decode {
-                    if data.finish_reason != finish_reason {
-                        tracing::warn!(
-                            "finish reason mismatch: expected {:?}, got {:?}",
-                            data.finish_reason,
-                            finish_reason
-                        );
-                    }
-
-                    if data.text.is_some() && data.text != text {
-                        tracing::warn!("text mismatch: expected {:?}, got {:?}", data.text, text);
-                    }
-                }
-
-                // update output in-place
-                let data = output.data.as_mut().unwrap();
-
-                // NOTE: If `finish_reason.is_some()`, then one of the stop conditions was triggered
-                // by the token generation. We should update the `data.finish_reason` in that case.
-                // However, if `finish_reason.is_none()`, it is possible that we are in the case where
-                // `data.token_ids` is empty, and `data.finish_reason` is already correctly set.
-                // In that case, `process_token_ids` above will rewrite `finish_reason` to `None`,
-                // which we don't want to propagate to `data.finish_reason`.
-                // A failed generation may carry EOS in its final token batch.
-                // Local stop detection must not turn the worker's error into success.
-                if finish_reason.is_some()
-                    && !matches!(data.finish_reason, Some(FinishReason::Error(_)))
-                {
-                    data.finish_reason = finish_reason;
-                    data.stop_reason = stop_reason.or(data.stop_reason.take());
-                }
-                data.text = text;
-
-                // A tokenizer-free engine can return tokens past a local
-                // stop in the same chunk. Keep its per-token fields aligned
-                // with the prefix the decoder consumed.
-                let consumed = tokens.len();
-                if consumed < data.token_ids.len() {
-                    data.token_ids.truncate(consumed);
-                    if let Some(log_probs) = data.log_probs.as_mut() {
-                        log_probs.truncate(consumed);
-                    }
-                    if let Some(top_logprobs) = data.top_logprobs.as_mut() {
-                        top_logprobs.truncate(consumed);
-                    }
-                }
-                data.tokens = Some(tokens);
-                // Snapshot of whatever this choice's decoder is still withholding as a
-                // possible hidden-stop-sequence prefix after this step -- `None` once
-                // resolved (matched, ruled out, or flushed). Carried so a migration
-                // retry's fresh decoder can be reseeded from the last known-good chunk
-                // instead of silently losing it (see `PreprocessedRequest::jail_seed`).
-                // Skipped when migration can't happen: nothing will ever read this
-                // checkpoint, so there is no reason to allocate a snapshot of it.
-                if self.migration_possible {
-                    data.jailed_text = decoder.checkpoint();
-                }
-
-                Poll::Ready(Some(item))
-            }
-
-            None => {
-                // The engine's stream ended without ever sending a terminal
-                // `finish_reason` to some choice -- no more tokens are coming for any
-                // of them, so flush whatever each decoder still holds back as an
-                // incomplete hidden-stop-sequence match before the decoders are
-                // dropped, and drain the flushed choices one synthetic chunk at a time.
-                self.stream_ended = true;
-                // Unless the request was killed or passed its deadline: then the stream
-                // ended because the answer was cut short, and a flush would mark it
-                // finished. Checked once, here, never per item.
-                if self.stream.cut_short() {
-                    return Poll::Ready(None);
-                }
-                for (idx, decoder) in self.decoders.iter_mut() {
-                    // A choice that already finished -- successfully or with an error --
-                    // was already given its chance to flush (see the decoder-driven and
-                    // decoded-text-passthrough paths above). Synthesizing another chunk
-                    // for it here would, at best, be redundant and, at worst, turn a
-                    // choice that ended in an error into a spurious extra `Stop`.
-                    if self.finished_choices.contains(idx) {
-                        continue;
-                    }
-                    let data = match decoder.finish() {
-                        Ok(result)
-                            if result.released_text.is_some() || result.stop_trigger.is_some() =>
-                        {
-                            let (reason, stop) = result
-                                .stop_trigger
-                                .as_ref()
-                                .map(StopTrigger::reasons)
-                                .unwrap_or((FinishReason::Stop, None));
-                            LLMEngineOutput {
-                                index: Some(*idx),
-                                text: result.released_text,
-                                finish_reason: Some(reason),
-                                stop_reason: stop,
-                                ..Default::default()
-                            }
-                        }
-                        Ok(_) => continue,
-                        Err(error) => LLMEngineOutput {
-                            index: Some(*idx),
-                            finish_reason: Some(FinishReason::Error(format!(
-                                "decode error: {error}"
-                            ))),
-                            ..Default::default()
-                        },
-                    };
-                    self.pending_flush.push(Annotated::from_data(data));
-                }
-                Poll::Ready(self.pending_flush.pop())
-            }
-        }
-    }
-}
-
 /// What Backend's stage reads beside its items: the request's Dynamo context, which a local stop
 /// reaches below, and the stage's `Cx`, for the cut-short check before a flush.
 pub struct StageInput {
     context: Arc<dyn AsyncEngineContext>,
     root: gdl::Cx,
+}
+
+impl std::fmt::Debug for StageInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StageInput").field("context", &self.context.id()).finish()
+    }
+}
+
+/// The request's Dynamo context, as the shared per-item body asks it of its input.
+impl AsyncEngineContextProvider for StageInput {
+    fn context(&self) -> Arc<dyn AsyncEngineContext> {
+        Arc::clone(&self.context)
+    }
 }
 
 /// Backend's backward half as a gdl stage (prototype): the per-item body of
@@ -750,8 +404,9 @@ pub struct BackendRun {
     state: DecoderState<StageInput>,
 }
 
-impl DecoderState<StageInput> {
-    /// One item, detokenized in place: the body of `poll_step`'s item arm.
+impl<S: AsyncEngineContextProvider> DecoderState<S> {
+    /// One item, detokenized in place: the body of `poll_step`'s item arm, shared by the
+    /// single-frame stream and the stage.
     fn process(&mut self, item: &mut Annotated<LLMEngineOutput>) {
         let output = &mut *item;
         // move to state.process_output
@@ -817,7 +472,7 @@ impl DecoderState<StageInput> {
                         .get(&data.index.unwrap_or(0))
                         .is_none_or(|decoder| decoder.generated_tokens == 0)))
         {
-            self.stream.context.stop_generating();
+            self.stream.context().stop_generating();
             self.finished = true;
             let error = DynamoError::builder()
                 .class(ErrorClass::BackendProtocol)
@@ -949,7 +604,7 @@ impl DecoderState<StageInput> {
                 tracing::error!("Failed to process token_ids for choice {choice_idx}: {e}");
                 self.finished_choices.insert(choice_idx);
                 if self.finished_choices.len() >= decoders_count {
-                    self.stream.context.stop_generating();
+                    self.stream.context().stop_generating();
                     self.finished = true;
                 }
                 if let Some(data) = &mut output.data {
@@ -981,7 +636,7 @@ impl DecoderState<StageInput> {
         if finish_reason.is_some() && data.finish_reason.is_none() {
             self.finished_choices.insert(choice_idx);
             if self.finished_choices.len() >= decoders_count {
-                self.stream.context.stop_generating();
+                self.stream.context().stop_generating();
                 self.finished = true;
             }
         }
