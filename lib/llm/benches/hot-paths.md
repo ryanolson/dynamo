@@ -220,6 +220,31 @@ the stages.
   5 runs per case: at 2,048 output tokens and concurrency 512, where the frontend is the
   bottleneck, gdl gives 5.9% fewer output tokens per second and uses 6.9% more frontend CPU per
   token; at 16 output tokens it gives 5 to 7% more, as the per-request saving wins.
+- **Base for aarch64:** the table a change to this path compares against on the aarch64 bench
+  host (Neoverse-V2), with gdl from `NVIDIA-dev/dynamo-gdl` at `3686ff4d`. Rust 1.99.0,
+  `RUSTFLAGS="-C target-cpu=neoverse-n1 -C force-frame-pointers=yes --cfg tokio_unstable --cfg
+  rustix_use_libc"`, valgrind 3.28, `hotpath.sh` with `HOTPATH_RUNS=3`. Save the block as a file
+  and pass it to `hotpath.sh --base`:
+
+  ```text
+  # hotpath format=3 arch=aarch64 gdl=3686ff4d927d commit=6e9970c2e937
+  pipeline     form    allocs allocs/item     instr instr/item memcpy memcpy/item allocs@16   instr@16 memcpy@16  range
+  engine       -            7        1.00      9530        617     24        4.00        22      18787        84  7..7,22..22
+  A            gdl        329       34.20    155923      21065    336       51.20       842     471893      1104  329..329,842..842
+  B            gdl        344       34.20    170455      21408    376       53.20       857     491573      1174  344..344,857..857
+  C            gdl         39        1.00     30712       1398     76       10.00        54      51682       226  39..39,54..54
+  embed-engine -            8        1.00      6141        960      7        3.00        23      20544        52  8..8,23..23
+  embeddings   gdl        178      139.00     95380      76675    125       90.80      2263    1245508      1487  178..178,2262..2263
+  ingress      dynamo      49        3.00     49215       2846    139        7.00        94      91904       244  49..49,94..94
+  ```
+
+  Against gdl `83319c8f`, the same tree otherwise: allocations and `memcpy` equal on every row,
+  and instructions per item within 75 (A −73, B +29, C 0). The `embeddings` row moves by several
+  percent per item from run to run: 76,675 in this table, 81,763 on a later run of the same
+  binary, and 81,210 on one run with gdl `83319c8f`. Its 16 inputs are tokenized on rayon's
+  pool, and the instructions of rayon's work-stealing loop depend on thread timing; the whole
+  difference between those two runs is in that loop. Read that row's per-item column with that
+  spread in mind.
 - **Not covered:** the window starts where the HTTP handler calls the engine. HTTP parsing, the
   handler's request metrics and SSE encoding are outside it, and the reasoning and tool-call
   parsers are not on these rows.
