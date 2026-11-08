@@ -265,7 +265,7 @@ pub trait CutShort {
 /// The rule for a gdl ending ([`EndedItems`]): the last item of a stream that
 /// ended in `error`, or `None` when it is a cancel of a request that was
 /// killed, since a killed Dynamo stream just ends.
-fn last_item<T>(
+pub fn last_item<T>(
     error: gdl::Error,
     root: &gdl::Cx,
     context: &dyn AsyncEngineContext,

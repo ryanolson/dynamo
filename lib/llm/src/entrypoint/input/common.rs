@@ -465,8 +465,10 @@ where
     );
     let (preprocessor_forward, preprocessor_backward) =
         gdl::around(Arc::new(PreprocessorNode::<Req>::new(preprocessor, below)));
-    let (backend_forward, backend_backward) =
-        gdl::around(Arc::new(GdlOperator::<_, Pre>::new(backend)));
+    // Backend's backward half as a gdl stage (prototype): run inline by gdl's driver.
+    let backend_node = Arc::new(GdlOperator::<_, Pre>::new(backend));
+    let (backend_forward, _) = gdl::around(Arc::clone(&backend_node));
+    let backend_backward = gdl::drive::StageHalf::new(backend_node);
     let hop = Hop::new(
         (preprocessor_forward, (backend_forward, ())),
         engine,
@@ -610,7 +612,7 @@ impl PreprocessedRouting {
         // and, as an engine of its own, where a speculative prefill is sent.
         let migration = gdl::OperatorStage::new(
             Arc::new(GdlOperator::<_, BackendOutput>::new(migration)),
-            around::<_, Pre, _>(token_backend, self.gdl_routers()),
+            stage_around(token_backend, self.gdl_routers()),
         );
         let below =
             Arc::new(
@@ -693,6 +695,21 @@ where
 {
     let (forward, backward) = gdl::around(Arc::new(GdlOperator::new(op)));
     gdl::Hop::new((forward, ()), inner, (backward, ()))
+}
+
+/// Backend as an around node of the hop to `inner`, with a gdl stage for its backward half
+/// (prototype).
+fn stage_around<I>(
+    op: Arc<Backend>,
+    inner: I,
+) -> gdl::Hop<
+    (gdl::ForwardHalf<GdlOperator<Backend, PreprocessedRequest>, gdl::EndedForm>, ()),
+    I,
+    (gdl::drive::StageHalf<GdlOperator<Backend, PreprocessedRequest>>, ()),
+> {
+    let node = Arc::new(GdlOperator::new(op));
+    let (forward, _) = gdl::around(Arc::clone(&node));
+    gdl::Hop::new((forward, ()), inner, (gdl::drive::StageHalf::new(node), ()))
 }
 
 /// `op` as a native gdl operator, keyed by `K` (see [`GdlOperator`]), over the hop `next`.
