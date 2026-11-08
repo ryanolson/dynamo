@@ -479,3 +479,28 @@ async fn a_kill_with_a_cancel_yields_no_item() {
         );
     }
 }
+
+#[tokio::test]
+#[ignore = "edge-endings item 3: the deadline fixture assumes dispatch takes less than 100 ms"]
+async fn a_dispatch_pause_preserves_the_deadline_fixtures_mid_stream_order() {
+    let pipeline = pipeline_a(holding(None), RootEdit::Deadline);
+    let mut dispatch = Box::pin(pipeline.generate(chat()));
+    let mut paused = false;
+    let result = std::future::poll_fn(|task| {
+        let poll = dispatch.as_mut().poll(task);
+        if !paused && poll.is_pending() {
+            paused = true;
+            // Model a deschedule after the deadline is armed, without changing the worker.
+            std::thread::sleep(MID_STREAM * 2);
+        }
+        poll
+    })
+    .await;
+    assert!(
+        paused,
+        "the fixture dispatch must reach its tokenizer await"
+    );
+    let stream = result.expect("the deadline fixture must reach its streaming assertion");
+    let items: Vec<_> = stream.map(|item| describe(&item)).collect().await;
+    assert_eq!(items, ["text", "finish Length", "error DeadlineExceeded"]);
+}
