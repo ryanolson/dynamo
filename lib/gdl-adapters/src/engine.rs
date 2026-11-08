@@ -206,16 +206,23 @@ impl<T: Data> Stream for EndedItems<T> {
     type Item = Annotated<T>;
 
     fn poll_next(mut self: Pin<&mut Self>, task: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        let Some(items) = self.items.as_mut() else {
+        let this = &mut *self;
+        let Some(items) = this.items.as_mut() else {
             return Poll::Ready(None);
         };
-        // The end is matched without the item, and nothing is called while an item is held,
-        // so the compiler can build each item where the caller reads it.
-        let poll = items.as_mut().poll_next(task);
-        if let Poll::Ready(None) = poll {
-            return Poll::Ready(self.end());
+        // gdl's boundary shape: no item is read, and the end's poll is consumed before
+        // anything is called, so the compiler builds each item where the caller reads it.
+        // Matching the end with `if let` and returning the poll after it copies every item
+        // (632 bytes for an `Annotated<LLMEngineOutput>`), measured.
+        let polled = items.as_mut().poll_next(task);
+        match polled {
+            Poll::Ready(Some(_)) | Poll::Pending => {}
+            Poll::Ready(None) => {
+                drop(polled);
+                return Poll::Ready(this.end());
+            }
         }
-        poll
+        polled
     }
 }
 
