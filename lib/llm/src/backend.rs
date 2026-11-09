@@ -3404,4 +3404,99 @@ mod tests {
         let outputs = backward_under(form, &past).await;
         assert_eq!(finish_reasons(&outputs), vec![], "{outputs:?}");
     }
+
+    async fn assert_engine_dropped_before_eof_flush(form: Form) {
+        type Pre = PreprocessedRequest;
+        // Migration forwards the same context, so gdl runs Backend under the request scope.
+        struct Forward;
+        impl gdl::Operator<gdl::EndedForm> for Forward {
+            type UpReq = Boxed<Pre>;
+            type DownReq = Self::UpReq;
+            type UpItem = Annotated<BackendOutput>;
+            type DownItem = Self::UpItem;
+
+            fn generate<N>(
+                &self,
+                cx: gdl::Cx,
+                request: Self::UpReq,
+                next: N,
+            ) -> impl Future<Output = gdl::Result<gdl::Ended<Self::UpItem>>> + Send
+            where
+                N: gdl::Next<Self::DownReq, Self::DownItem, gdl::EndedForm>,
+            {
+                async move { next.generate(cx, request).await }
+            }
+        }
+
+        fn nested<N>(next: N) -> ServerStreamingEngine<Pre, Annotated<BackendOutput>>
+        where
+            N: gdl::Next<Boxed<Pre>, Annotated<BackendOutput>, gdl::EndedForm> + Clone,
+        {
+            Arc::new(dynamo_gdl_adapters::PipelineEngine::<
+                _,
+                Pre,
+                BackendOutput,
+                Boxed<Pre>,
+            >::for_dynamo_stages(gdl::Hop::new(
+                (),
+                gdl::OperatorStage::new(Arc::new(Forward), next),
+                (),
+            )))
+        }
+
+        let tokenizer: Arc<dyn traits::Tokenizer> = Arc::new(JailingTokenizer);
+        let backend = Backend::from_tokenizer(Tokenizer::from(tokenizer));
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let engine: ServerStreamingEngine<Pre, Annotated<LLMEngineOutput>> =
+            Arc::new(DropFlagEngine {
+                chunks: withholding_chunks(),
+                dropped: dropped.clone(),
+            });
+        let inner = crate::operator::testing::sink_stage(engine);
+        let node = Arc::new(GdlOperator::<Backend, Pre>::new(backend));
+        let (forward, backward) = gdl::around(node.clone());
+        let pipeline = match form {
+            Form::Stream => nested(gdl::Hop::new((forward, ()), inner, (backward, ()))),
+            Form::Inline => nested(gdl::Hop::new(
+                (forward, ()),
+                inner,
+                (gdl::inline::InlineHalf::new(node), ()),
+            )),
+        };
+        let mut stream = pipeline
+            .generate(SingleIn::new(jailing_request(1)))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            assert!(
+                stream
+                    .next()
+                    .await
+                    .unwrap()
+                    .data
+                    .unwrap()
+                    .finish_reason
+                    .is_none()
+            );
+        }
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        let flush = stream.next().await.unwrap().data.unwrap();
+        assert_eq!(flush.text.as_deref(), Some("STOP"));
+        assert_eq!(flush.finish_reason, Some(FinishReason::Stop));
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "{form:?}: the exhausted engine stream must be dropped before the EOF flush reaches the caller"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_stream_drops_engine_before_request_scope_flush() {
+        assert_engine_dropped_before_eof_flush(Form::Stream).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "request-scoped EOF flush: InlineHalf retains the exhausted engine across its closing item"]
+    async fn backend_inline_drops_engine_before_request_scope_flush() {
+        assert_engine_dropped_before_eof_flush(Form::Inline).await;
+    }
 }
