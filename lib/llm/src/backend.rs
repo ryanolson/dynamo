@@ -3405,7 +3405,11 @@ mod tests {
         assert_eq!(finish_reasons(&outputs), vec![], "{outputs:?}");
     }
 
-    async fn assert_engine_dropped_before_eof_flush(form: Form) {
+    /// When the engine's stream is dropped, with Backend under the request scope (as Migration
+    /// runs it in pipeline B) and its held text flushed at a bare end of the engine's stream:
+    /// whether it was dropped when the flush reached the caller, and when Backend's stream
+    /// ended.
+    async fn request_scope_release(form: Form) -> (bool, bool) {
         type Pre = PreprocessedRequest;
         // Migration forwards the same context, so gdl runs Backend under the request scope.
         struct Forward;
@@ -3415,16 +3419,16 @@ mod tests {
             type UpItem = Annotated<BackendOutput>;
             type DownItem = Self::UpItem;
 
-            fn generate<N>(
+            async fn generate<N>(
                 &self,
                 cx: gdl::Cx,
                 request: Self::UpReq,
                 next: N,
-            ) -> impl Future<Output = gdl::Result<gdl::Ended<Self::UpItem>>> + Send
+            ) -> gdl::Result<gdl::Ended<Self::UpItem>>
             where
                 N: gdl::Next<Self::DownReq, Self::DownItem, gdl::EndedForm>,
             {
-                async move { next.generate(cx, request).await }
+                next.generate(cx, request).await
             }
         }
 
@@ -3466,37 +3470,42 @@ mod tests {
         let mut stream = pipeline
             .generate(SingleIn::new(jailing_request(1)))
             .await
-            .unwrap();
+            .expect("backend generation succeeds");
         for _ in 0..2 {
-            assert!(
-                stream
-                    .next()
-                    .await
-                    .unwrap()
-                    .data
-                    .unwrap()
-                    .finish_reason
-                    .is_none()
-            );
+            let item = stream.next().await.expect("a chunk").data.expect("data");
+            assert!(item.finish_reason.is_none(), "{form:?}: {item:?}");
         }
         assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
-        let flush = stream.next().await.unwrap().data.unwrap();
+        let flush = stream.next().await.expect("the flush").data.expect("data");
         assert_eq!(flush.text.as_deref(), Some("STOP"));
         assert_eq!(flush.finish_reason, Some(FinishReason::Stop));
+        let at_flush = dropped.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(stream.next().await.is_none(), "{form:?}: one flush");
+        (at_flush, dropped.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Under the request scope no node boundary drops the engine's stream when it ends, so
+    /// Backend's own end must, before its caller drops the response, in both forms.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn backend_drops_the_engine_stream_by_its_end_under_the_request_scope(
+        #[values(Form::Stream, Form::Inline)] form: Form,
+    ) {
+        let (_, at_end) = request_scope_release(form).await;
         assert!(
-            dropped.load(std::sync::atomic::Ordering::SeqCst),
-            "{form:?}: the exhausted engine stream must be dropped before the EOF flush reaches the caller"
+            at_end,
+            "{form:?}: dropped only when the caller drops the response"
         );
     }
 
+    /// The stream form reads the engine's stream through `EndedItems`, which drops it when it
+    /// ends, so it is gone before the flush. The inline form keeps it until Backend's stream
+    /// ends, after the flush, as Dynamo's Backend did before gdl: gdl keeps a request-scoped
+    /// node's input until the node's stream ends. The flush is at most one item per choice
+    /// that held text when the engine's stream ended without finishing it.
     #[tokio::test]
-    async fn backend_stream_drops_engine_before_request_scope_flush() {
-        assert_engine_dropped_before_eof_flush(Form::Stream).await;
-    }
-
-    #[tokio::test]
-    #[ignore = "request-scoped EOF flush: InlineHalf retains the exhausted engine across its closing item"]
-    async fn backend_inline_drops_engine_before_request_scope_flush() {
-        assert_engine_dropped_before_eof_flush(Form::Inline).await;
+    async fn backend_stream_form_drops_the_engine_stream_before_the_flush() {
+        let (at_flush, _) = request_scope_release(Form::Stream).await;
+        assert!(at_flush);
     }
 }
