@@ -17,6 +17,7 @@ pub mod media;
 #[cfg(feature = "mm-routing")]
 pub mod mm_routing;
 pub mod prompt;
+mod response;
 pub mod speculative_prefill;
 pub(crate) mod structural_tag;
 pub use structural_tag::structural_tag_parser_names;
@@ -54,7 +55,6 @@ use std::{
     collections::{HashMap, HashSet},
     pin::Pin,
     sync::{Arc, Mutex, OnceLock},
-    task::{Poll, ready},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{self, Instrument};
@@ -6106,18 +6106,7 @@ impl OpenAIPreprocessor {
             return Box::pin(stream);
         }
 
-        Box::pin(edit::edit_items(stream, |response| {
-            if let Some(data) = response.data.as_mut() {
-                for choice in &mut data.inner.choices {
-                    choice.delta.tool_calls = None;
-                    if choice.finish_reason
-                        == Some(dynamo_protocols::types::FinishReason::ToolCalls)
-                    {
-                        choice.finish_reason = Some(dynamo_protocols::types::FinishReason::Stop);
-                    }
-                }
-            }
-        }))
+        Box::pin(edit::edit_items(stream, response::strip_tool_calls))
     }
 
     /// Ensure the first emitted delta for each choice carries the assistant role.
@@ -6133,13 +6122,7 @@ impl OpenAIPreprocessor {
         let mut role_emitted_choices = HashSet::new();
 
         edit::edit_items(stream, move |response| {
-            if let Some(data) = response.data.as_mut() {
-                for choice in &mut data.inner.choices {
-                    choice.delta.role = role_emitted_choices
-                        .insert(choice.index)
-                        .then_some(dynamo_protocols::types::Role::Assistant);
-                }
-            }
+            response::normalize_roles(&mut role_emitted_choices, response)
         })
     }
 
@@ -6193,348 +6176,21 @@ impl OpenAIPreprocessor {
         S: Stream<Item = Annotated<BackendOutput>> + CutShort + Send + Unpin + 'static,
         Resp: Send + Sync + Clone + 'static + std::fmt::Debug,
     {
-        struct DetokenizeMetricsGuard {
-            tracker: Option<Arc<RequestTracker>>,
+        response::Postprocessed {
+            state: Some(response::TransformState::new(
+                stream,
+                response::ResponseTransform::new(
+                    generator,
+                    context,
+                    emit_payload_usage_chunk,
+                    trace_tokens_enabled,
+                    trace_finish_reason_metadata,
+                    mm_counts,
+                    image_tokens,
+                    cut,
+                ),
+            )),
         }
-
-        impl DetokenizeMetricsGuard {
-            #[inline]
-            fn tracker(&self) -> Option<&RequestTracker> {
-                self.tracker.as_deref()
-            }
-        }
-
-        impl Drop for DetokenizeMetricsGuard {
-            fn drop(&mut self) {
-                let Some(tracker) = self.tracker() else {
-                    return;
-                };
-                if let Some(total) = tracker.detokenize_total_latency() {
-                    DETOKENIZE_TOTAL_US.inc_by(total.as_micros() as f64);
-                }
-                DETOKENIZE_TOKEN_COUNT.inc_by(tracker.detokenize_count() as f64);
-            }
-        }
-
-        struct State<S, Resp>
-        where
-            Resp: Send + Sync + Clone + 'static + std::fmt::Debug,
-        {
-            response_stream: S,
-            response_generator: Box<dyn DeltaGeneratorExt<Resp>>,
-            detokenize_metrics: DetokenizeMetricsGuard,
-            context: Arc<dyn AsyncEngineContext>,
-            cancelled: bool,
-            cumulative_output_tokens: usize,
-            finish_reason_sent: bool,
-            usage_chunk_sent: bool,
-            /// Buffered plain usage chunk to send to the client after the payload
-            /// chunk (ANNOTATION_PAYLOAD_USAGE). Only Some when is_usage_enabled().
-            pending_client_usage: Option<Annotated<Resp>>,
-            finished: bool,
-            emit_payload_usage_chunk: bool,
-            trace_tokens_enabled: bool,
-            trace_finish_reason_metadata: Option<crate::request_trace::SharedFinishReasonMetadata>,
-            mm_counts: MultimodalCounts,
-            image_tokens: Option<usize>,
-            /// Set when the response stream ended because the request was cut short.
-            cut: Option<cut::CutFlag>,
-        }
-
-        let tracker = generator.tracker();
-        let state = State {
-            response_stream: stream,
-            response_generator: generator,
-            detokenize_metrics: DetokenizeMetricsGuard { tracker },
-            context: context.clone(),
-            cancelled: false,
-            cumulative_output_tokens: 0,
-            finish_reason_sent: false,
-            usage_chunk_sent: false,
-            pending_client_usage: None,
-            finished: false,
-            emit_payload_usage_chunk,
-            trace_tokens_enabled,
-            trace_finish_reason_metadata,
-            mm_counts,
-            image_tokens,
-            cut,
-        };
-
-        /// The response stream: a stream that owns its state, in place of `unfold` and
-        /// `fuse`, which moved the state (with its buffered usage chunk, the size of an item)
-        /// and the item through a new future on every item. `None` once the stream has ended,
-        /// which drops the state, and so flushes the detokenize metrics, when this stream
-        /// ends rather than when its caller drops it.
-        struct Postprocessed<S, Resp>
-        where
-            Resp: Send + Sync + Clone + 'static + std::fmt::Debug,
-        {
-            state: Option<State<S, Resp>>,
-        }
-
-        // Nothing in the state is pinned: the stream below is `Unpin`, and the rest is moved
-        // and edited freely.
-        impl<S: Unpin, Resp> Unpin for Postprocessed<S, Resp> where
-            Resp: Send + Sync + Clone + 'static + std::fmt::Debug
-        {
-        }
-
-        impl<S, Resp> Stream for Postprocessed<S, Resp>
-        where
-            S: Stream<Item = Annotated<BackendOutput>> + CutShort + Unpin,
-            Resp: Send + Sync + Clone + 'static + std::fmt::Debug,
-        {
-            type Item = Annotated<Resp>;
-
-            fn poll_next(
-                mut self: Pin<&mut Self>,
-                cx: &mut std::task::Context<'_>,
-            ) -> Poll<Option<Annotated<Resp>>> {
-                let Some(state) = self.state.as_mut() else {
-                    return Poll::Ready(None);
-                };
-                // Returned as it is: taking the item out of the `Poll` would move it again.
-                let poll = state.poll_step(cx);
-                if let Poll::Ready(None) = poll {
-                    self.state = None;
-                }
-                poll
-            }
-        }
-
-        impl<S, Resp> State<S, Resp>
-        where
-            S: Stream<Item = Annotated<BackendOutput>> + CutShort + Unpin,
-            Resp: Send + Sync + Clone + 'static + std::fmt::Debug,
-        {
-            /// The next chunk of the response, or `None` when it has ended.
-            fn poll_step(
-                &mut self,
-                cx: &mut std::task::Context<'_>,
-            ) -> Poll<Option<Annotated<Resp>>> {
-                // Drain the buffered client-facing plain usage chunk first.
-                // This MUST come before the `finished` guard: the stream-end
-                // handler sets self.finished = true before returning the payload
-                // chunk, so on the very next iteration the finished guard would
-                // terminate before we ever emit the client chunk.
-                if let Some(client_chunk) = self.pending_client_usage.take() {
-                    self.finished = true;
-                    // Emit unconditionally to match the non-payload path below; the
-                    // chunk is only buffered after a finish_reason, so payload capture must
-                    // not alter the client SSE tail.
-                    return Poll::Ready(Some(client_chunk));
-                }
-
-                // If already finished (and no pending client chunk), stop.
-                if self.finished {
-                    return Poll::Ready(None);
-                }
-
-                if let Some(mut response) = ready!(self.response_stream.poll_next_unpin(cx)) {
-                    // Split topology: overlay a standalone router's forwarded routing_data
-                    // (timing, query-only token_ids) onto this request's tracker so the
-                    // frontend's nvext/timing surfaces populate.
-                    drain_router_routing_data(
-                        &mut response.data,
-                        self.detokenize_metrics.tracker(),
-                    );
-
-                    if self.cancelled {
-                        tracing::debug!(
-                            request_id = self.context.id(),
-                            "Cancellation issued last message; closing stream"
-                        );
-                        // self.finished = true; // Mark as finished
-                        return Poll::Ready(None);
-                    }
-
-                    tracing::trace!(
-                        request_id = self.context.id(),
-                        "Processing common response: {:?}",
-                        response
-                    );
-
-                    // Check if this response has a finish_reason
-                    let has_finish_reason = response
-                        .data
-                        .as_ref()
-                        .map(|d| d.finish_reason.is_some())
-                        .unwrap_or(false);
-
-                    let (chunk_tokens, isl) = if let Some(ref backend_output) = response.data {
-                        let chunk_tokens = backend_output.token_ids.len();
-                        self.cumulative_output_tokens += chunk_tokens;
-
-                        let isl = self.response_generator.get_isl().map(|isl| isl as usize);
-
-                        crate::request_trace::record_backend_finish_reason_metadata(
-                            self.trace_finish_reason_metadata.as_ref(),
-                            backend_output.index,
-                            backend_output.finish_reason.as_ref(),
-                            backend_output.stop_reason.as_ref(),
-                        );
-
-                        (chunk_tokens, isl)
-                    } else {
-                        (0, None)
-                    };
-
-                    let current_osl = self.cumulative_output_tokens;
-
-                    let mut response = response.map_data(|data| {
-                        self.response_generator
-                            .choice_from_postprocessor(data)
-                            .inspect_err(|e| {
-                                tracing::error!(
-                                    request_id = self.context.id(),
-                                    "Error processing common response: {:?}",
-                                    e
-                                );
-                                self.cancelled = true;
-                                self.context.stop_generating();
-                            })
-                            .map_err(|e| e.to_string())
-                    });
-
-                    // Create LLM metrics annotation with prefill/decode worker info from tracker.
-                    // Worker types are stored at routing time to avoid expensive MDC lookup.
-                    let tracker = self.detokenize_metrics.tracker();
-                    let llm_metrics = build_llm_metric_annotation(
-                        tracker,
-                        isl.unwrap_or(0),
-                        current_osl,
-                        chunk_tokens,
-                        None,
-                        self.mm_counts,
-                        self.image_tokens,
-                    );
-                    if self.trace_tokens_enabled {
-                        crate::request_trace::record_llm_metric_tokens(
-                            tracker,
-                            isl,
-                            current_osl,
-                            None,
-                        );
-                    }
-
-                    attach_llm_metrics(&mut response, llm_metrics);
-
-                    // Mark if we've seen a finish_reason
-                    if has_finish_reason {
-                        self.finish_reason_sent = true;
-                    }
-
-                    tracing::trace!(
-                        request_id = self.context.id(),
-                        "OpenAI NvCreateChatCompletionStreamResponse: {:?}",
-                        response
-                    );
-
-                    Poll::Ready(Some(response))
-                } else {
-                    // Stream has ended - must set finished to true to prevent unfold from polling
-                    // again. The stream is exhausted and will panic if polled after None.
-                    self.finished = true;
-
-                    // A request killed or past its deadline ends its stream cleanly too, and
-                    // its answer is not whole: write nothing more. Checked once, here.
-                    if self.response_stream.cut_short() {
-                        if let Some(cut) = &self.cut {
-                            cut.set();
-                        }
-                        return Poll::Ready(None);
-                    }
-
-                    if self.finish_reason_sent && !self.usage_chunk_sent {
-                        self.usage_chunk_sent = true;
-
-                        let usage_chunk = self.response_generator.create_usage_chunk();
-                        let usage = self.response_generator.get_usage();
-                        let tracker = self.detokenize_metrics.tracker();
-                        let cached_tokens = usage
-                            .prompt_tokens_details
-                            .as_ref()
-                            .and_then(|d| d.cached_tokens.map(|c| c as usize));
-                        let llm_metrics = build_llm_metric_annotation(
-                            tracker,
-                            usage.prompt_tokens as usize,
-                            usage.completion_tokens as usize,
-                            0,
-                            cached_tokens,
-                            self.mm_counts,
-                            self.image_tokens,
-                        );
-                        if self.trace_tokens_enabled {
-                            crate::request_trace::record_llm_metric_tokens(
-                                tracker,
-                                Some(usage.prompt_tokens as usize),
-                                usage.completion_tokens as usize,
-                                cached_tokens,
-                            );
-                        }
-
-                        let usage_requested = self.response_generator.is_usage_enabled();
-
-                        if self.emit_payload_usage_chunk {
-                            // Payload capture on: emit a dedicated payload-usage chunk that
-                            // always carries usage for the payload DeltaAggregator
-                            // (the EventConverter strips it entirely from the
-                            // client), and buffer the plain client usage chunk only
-                            // when include_usage was requested.
-                            if usage_requested {
-                                self.pending_client_usage = Some(Annotated::<Resp> {
-                                    id: None,
-                                    data: Some(usage_chunk.clone()),
-                                    event: None,
-                                    comment: None,
-                                    error: None,
-                                });
-                            }
-
-                            let annotation =
-                                llm_metrics.to_annotation::<()>().unwrap_or_else(|e| {
-                                    tracing::warn!("Failed to serialize metrics: {}", e);
-                                    Annotated::<()>::from_data(())
-                                });
-                            let payload_usage = Annotated::<Resp> {
-                                id: None,
-                                data: Some(usage_chunk),
-                                event: Some(ANNOTATION_PAYLOAD_USAGE.to_string()),
-                                comment: annotation.comment,
-                                error: None,
-                            };
-                            Poll::Ready(Some(payload_usage))
-                        } else {
-                            // Payload capture off: a single usage chunk; data is present only
-                            // when include_usage was requested. Metrics ride via the
-                            // typed (serde-skip) llm_metrics field for internal
-                            // observation, never reaching the client.
-                            let data = if usage_requested {
-                                Some(usage_chunk)
-                            } else {
-                                None
-                            };
-                            let mut annotated_usage = Annotated::<Resp> {
-                                id: None,
-                                data,
-                                event: None,
-                                comment: None,
-                                error: None,
-                            };
-                            attach_llm_metrics(&mut annotated_usage, llm_metrics);
-                            Poll::Ready(Some(annotated_usage))
-                        }
-                    } else {
-                        // stream closed
-                        Poll::Ready(None)
-                    }
-                }
-            }
-        }
-
-        // transform the common response stream into a chat response stream
-        Postprocessed { state: Some(state) }
     }
 
     /// Transform engine embedding output stream to OpenAI embedding response stream
@@ -8554,6 +8210,13 @@ impl gdl::Around<gdl::EndedForm> for PreprocessorNode<NvCreateChatCompletionRequ
         input: gdl::Ended<Annotated<BackendOutput>>,
     ) -> gdl::Ended<Annotated<NvCreateChatCompletionStreamResponse>> {
         let input = EndedItems::new(input, cx.clone(), state.context.clone());
+        // The default response path runs in one frame (see `OpenAIPreprocessor::chat_response`).
+        if self
+            .op
+            .chat_response_is_default(&state.request, &state.state)
+        {
+            return Box::pin(OpenAIPreprocessor::chat_response(*state, input));
+        }
         let stream = self.op.chat_backward(
             &state.request,
             state.state,
@@ -8921,6 +8584,69 @@ impl OpenAIPreprocessor {
 
         // prepend the annotations to the response stream
         stream::iter(state.annotations).chain(final_stream)
+    }
+}
+
+impl OpenAIPreprocessor {
+    /// Whether a chat request's response takes the default path: no reasoning parser, no
+    /// tool-call parsing route, no deferred reasoning, no payload capture, no request-trace end,
+    /// no annotations to send first, and no speculative prefill. Then
+    /// [`chat_backward`](Self::chat_backward) builds only the transform, the tool-call policy
+    /// and the role normalization, which [`chat_response`](Self::chat_response) runs in one
+    /// frame. Decided once per request.
+    pub(crate) fn chat_response_is_default(
+        &self,
+        request: &NvCreateChatCompletionRequest,
+        state: &ChatState,
+    ) -> bool {
+        self.runtime_config.reasoning_parser.is_none()
+            && matches!(
+                state.tool_processing_route,
+                ToolProcessingRoute::PassThrough
+            )
+            && !Self::wants_reasoning_as_content_when_empty(request.chat_template_args.as_ref())
+            && state.payload_handle.is_none()
+            && state.trace_state.is_none()
+            && state.annotations.is_empty()
+            && !speculative_prefill::enabled(request)
+    }
+
+    /// The default response path (see [`chat_response_is_default`](Self::chat_response_is_default))
+    /// over `input`, Backend's items, in one frame: the same per-item code as
+    /// [`chat_backward`](Self::chat_backward)'s streams on that path.
+    fn chat_response<S>(state: ChatNodeState, input: S) -> response::ChatResponse<S>
+    where
+        S: Stream<Item = Annotated<BackendOutput>> + CutShort + Unpin,
+    {
+        let ChatNodeState {
+            request,
+            state,
+            context,
+            ..
+        } = state;
+        let strip_tool_calls = !Self::tool_call_parsing_enabled(&request);
+        drop(request);
+        response::ChatResponse::new(
+            response::TransformState::new(input, Self::chat_transform(state, context)),
+            strip_tool_calls,
+        )
+    }
+
+    /// The response transform of the default path.
+    fn chat_transform(
+        state: ChatState,
+        context: Arc<dyn AsyncEngineContext>,
+    ) -> response::ResponseTransform<NvCreateChatCompletionStreamResponse> {
+        response::ResponseTransform::new(
+            state.response_generator,
+            context,
+            false,
+            state.trace_tokens_enabled,
+            state.trace_finish_reason_metadata,
+            state.mm_counts,
+            state.image_tokens,
+            None,
+        )
     }
 }
 
