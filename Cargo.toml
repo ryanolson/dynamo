@@ -103,7 +103,7 @@ velo = { version = "=0.21.0", default-features = false }
 
 # gdl's node traits, without its runtime, which takes velo from git rather
 # than the crates.io release above.
-gdl = { git = "ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git", rev = "43629be7275ea87d0a3a5927c6d8183657655d7a" }
+gdl = { git = "ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git", rev = "14daedb7eb00f4a3d078282e8ac1442b5654c89b" }
 
 # External dependencies
 anyhow = { version = "1" }
