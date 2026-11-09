@@ -813,6 +813,7 @@ impl gdl::inline::AroundInline for GdlOperator<Backend, PreprocessedRequest> {
         })
     }
 
+    #[inline(always)]
     fn convert(_: &mut BackendRun, item: Annotated<LLMEngineOutput>) -> Annotated<BackendOutput> {
         backend_output(item)
     }

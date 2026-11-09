@@ -8623,6 +8623,8 @@ impl gdl::inline::AroundInline for PreprocessorNode<NvCreateChatCompletionReques
         ))
     }
 
+    // Inlined into the half's frame: a call would take and return the item by value.
+    #[inline(always)]
     fn convert(
         run: &mut response::ChatRun,
         item: Annotated<BackendOutput>,

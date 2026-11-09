@@ -574,6 +574,7 @@ impl ChatRun {
 
 impl gdl::inline::Edit<Annotated<BackendOutput>> for ChatRun {
     // hot path: per-item-response
+    #[inline(always)]
     fn edit(&mut self, item: &mut Annotated<BackendOutput>) -> gdl::inline::Verdict {
         self.transform.drain(item);
         if self.transform.cancelled || self.stopped {
