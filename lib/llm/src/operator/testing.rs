@@ -155,8 +155,36 @@ pub(crate) fn backend_stream(
 }
 
 /// The chat or completions preprocessor over `next`, as the frontend composes it: an around
-/// node of the hop to `next`, with `next` also as the engine a speculative prefill goes to.
+/// node of the hop to `next`, its backward half an inline node, with `next` also as the engine
+/// a speculative prefill goes to.
 pub(crate) fn preprocessor<Req, Resp>(
+    preprocessor: Arc<OpenAIPreprocessor>,
+    next: Arc<DynEngine<PreprocessedRequest, BackendOutput>>,
+) -> Arc<DynEngine<Req, Resp>>
+where
+    Req: Data,
+    Resp: Data,
+    PreprocessorNode<Req>: gdl::Around<
+            gdl::EndedForm,
+            UpReq = Boxed<Req>,
+            UpItem = Annotated<Resp>,
+            DownReq = Boxed<PreprocessedRequest>,
+            DownItem = Annotated<BackendOutput>,
+        >,
+    PreprocessorNode<Req>: gdl::inline::AroundInline,
+{
+    let node = Arc::new(PreprocessorNode::<Req>::new(preprocessor, next.clone()));
+    let (forward, _) = gdl::around(Arc::clone(&node));
+    engine_for_dynamo_stages::<_, Req, Resp, Boxed<Req>>(gdl::Hop::new(
+        (forward, ()),
+        sink_stage::<_, _, Boxed<PreprocessedRequest>>(next),
+        (gdl::inline::InlineHalf::new(node), ()),
+    ))
+}
+
+/// [`preprocessor`] with its backward half as a stream node: the form the preprocessor's own
+/// tests check beside the inline one.
+pub(crate) fn preprocessor_stream<Req, Resp>(
     preprocessor: Arc<OpenAIPreprocessor>,
     next: Arc<DynEngine<PreprocessedRequest, BackendOutput>>,
 ) -> Arc<DynEngine<Req, Resp>>

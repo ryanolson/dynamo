@@ -494,3 +494,139 @@ where
         None
     }
 }
+
+/// The chat preprocessor's backward half as a gdl inline node, for one request on the default
+/// path: gdl calls the same per-item code as [`ChatResponse`] on each of Backend's items, in
+/// place of `EndedItems` and the frame, and answers the ending below as `EndedItems` does.
+///
+/// The item changes type in the conversion, which runs the transform and the two edits. The
+/// transform's usage chunk at the end is a chat chunk, so `close` keeps it and sends a
+/// placeholder of Backend's type, which the conversion swaps for it.
+pub struct ChatRun {
+    transform: ResponseTransform<NvCreateChatCompletionStreamResponse>,
+    strip_tool_calls: bool,
+    roles: HashSet<u32>,
+    root: gdl::Cx,
+    context: Arc<dyn AsyncEngineContext>,
+    // The stream form ended here: an item came after a failed one.
+    stopped: bool,
+    // The usage chunk, sent in place of the placeholder `close` gave.
+    usage: Option<Annotated<NvCreateChatCompletionStreamResponse>>,
+}
+
+impl ChatRun {
+    pub(super) fn new(
+        transform: ResponseTransform<NvCreateChatCompletionStreamResponse>,
+        strip_tool_calls: bool,
+        root: gdl::Cx,
+        context: Arc<dyn AsyncEngineContext>,
+    ) -> Self {
+        Self {
+            transform,
+            strip_tool_calls,
+            roles: HashSet::new(),
+            root,
+            context,
+            stopped: false,
+            usage: None,
+        }
+    }
+
+    /// An item after a failed one: the stream form ends there, so every later item is dropped
+    /// and nothing more is written.
+    #[cold]
+    #[inline(never)]
+    fn stop(&mut self) -> gdl::inline::Verdict {
+        if !self.stopped {
+            tracing::debug!(
+                request_id = self.context.id(),
+                "Cancellation issued last message; closing stream"
+            );
+        }
+        self.stopped = true;
+        gdl::inline::Verdict::Skip
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn take_usage(&mut self) -> Annotated<NvCreateChatCompletionStreamResponse> {
+        self.usage.take().expect("the usage chunk was kept")
+    }
+
+    /// The chat chunk for one of Backend's items, or the usage chunk for the placeholder.
+    // hot path: per-item-response
+    #[inline(always)]
+    pub(super) fn convert(
+        &mut self,
+        item: Annotated<BackendOutput>,
+    ) -> Annotated<NvCreateChatCompletionStreamResponse> {
+        if self.usage.is_some() {
+            return self.take_usage();
+        }
+        let mut response = self.transform.item(item);
+        if self.strip_tool_calls {
+            strip_tool_calls(&mut response);
+        }
+        normalize_roles(&mut self.roles, &mut response);
+        response
+    }
+}
+
+impl gdl::inline::Edit<Annotated<BackendOutput>> for ChatRun {
+    // hot path: per-item-response
+    fn edit(&mut self, item: &mut Annotated<BackendOutput>) -> gdl::inline::Verdict {
+        self.transform.drain(item);
+        if self.transform.cancelled || self.stopped {
+            return self.stop();
+        }
+        gdl::inline::Verdict::Keep
+    }
+
+    // As `EndedItems`: an ending below is a last item, unless it is the cancel of a killed
+    // request, which just ends. After a failed item the stream form drops it and ends.
+    fn end(&mut self, ending: Option<gdl::Error>) -> gdl::inline::AtEnd<Annotated<BackendOutput>> {
+        let Some(mut item) = ending.and_then(|error| {
+            dynamo_gdl_adapters::last_item(error, &self.root, self.context.as_ref())
+        }) else {
+            return gdl::inline::AtEnd::Pass(None);
+        };
+        self.transform.drain(&mut item);
+        if self.transform.cancelled || self.stopped {
+            self.stop();
+            return gdl::inline::AtEnd::Pass(None);
+        }
+        gdl::inline::AtEnd::Item(item)
+    }
+
+    // As the transform's end: the usage chunk, unless the request was cut short, through the
+    // same two edits.
+    fn close(&mut self) -> Option<Annotated<BackendOutput>> {
+        if self.stopped || self.transform.finished {
+            return None;
+        }
+        let cut_short = dynamo_gdl_adapters::cut_short(&self.root, self.context.as_ref());
+        let mut usage = self.transform.end(cut_short)?;
+        if self.strip_tool_calls {
+            strip_tool_calls(&mut usage);
+        }
+        normalize_roles(&mut self.roles, &mut usage);
+        self.usage = Some(usage);
+        Some(Annotated {
+            id: None,
+            data: None,
+            event: None,
+            comment: None,
+            error: None,
+        })
+    }
+}
+
+/// The inline half of a node that always declines the inline form: the completions
+/// preprocessor, whose requests all run through its stream form.
+pub enum Declines {}
+
+impl gdl::inline::Edit<Annotated<BackendOutput>> for Declines {
+    fn edit(&mut self, _: &mut Annotated<BackendOutput>) -> gdl::inline::Verdict {
+        match *self {}
+    }
+}

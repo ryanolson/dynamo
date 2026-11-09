@@ -448,6 +448,7 @@ where
             DownReq = Boxed<PreprocessedRequest>,
             DownItem = Annotated<BackendOutput>,
         >,
+    PreprocessorNode<Req>: gdl::inline::AroundInline,
 {
     use gdl::{Hop, SinkStage};
     type Pre = PreprocessedRequest;
@@ -464,8 +465,11 @@ where
                 inline_around::<_, Pre, _>(backend.clone(), engine.clone()),
             ),
         );
-    let (preprocessor_forward, preprocessor_backward) =
-        gdl::around(Arc::new(PreprocessorNode::<Req>::new(preprocessor, below)));
+    // The preprocessor's backward half runs as an inline node too, on the default response
+    // path; any other request runs its stream form.
+    let preprocessor_node = Arc::new(PreprocessorNode::<Req>::new(preprocessor, below));
+    let (preprocessor_forward, _) = gdl::around(Arc::clone(&preprocessor_node));
+    let preprocessor_backward = gdl::inline::InlineHalf::new(preprocessor_node);
     // Backend's backward half runs as an inline node: no box, node boundary or stream of its
     // own per item.
     let backend_node = Arc::new(GdlOperator::<_, Pre>::new(backend));
@@ -578,6 +582,7 @@ impl PreprocessedRouting {
                 DownReq = Boxed<PreprocessedRequest>,
                 DownItem = Annotated<BackendOutput>,
             >,
+        PreprocessorNode<Req>: gdl::inline::AroundInline,
     {
         let token_backend = Backend::from_tokenizer(tokenizer);
         let migration = Migration::from_mdc(card, migration_limit, migration_max_seq_len, metrics);
@@ -608,6 +613,7 @@ impl PreprocessedRouting {
                 DownReq = Boxed<PreprocessedRequest>,
                 DownItem = Annotated<BackendOutput>,
             >,
+        PreprocessorNode<Req>: gdl::inline::AroundInline,
     {
         type Pre = PreprocessedRequest;
         // Migration over Backend's hop to the routers: the inner end of the preprocessor's hop,
@@ -622,8 +628,10 @@ impl PreprocessedRouting {
                     gdl::Hop::new((), migration.clone(), ()),
                 ),
             );
-        let (forward, backward) =
-            gdl::around(Arc::new(PreprocessorNode::<Req>::new(preprocessor, below)));
+        // The preprocessor's backward half as an inline node, as in `build_pipeline`.
+        let node = Arc::new(PreprocessorNode::<Req>::new(preprocessor, below));
+        let (forward, _) = gdl::around(Arc::clone(&node));
+        let backward = gdl::inline::InlineHalf::new(node);
         gdl::Source::new(gdl::Hop::new((forward, ()), migration, (backward, ())))
     }
 

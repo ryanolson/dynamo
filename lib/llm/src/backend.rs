@@ -804,16 +804,16 @@ impl gdl::inline::Edit<Annotated<LLMEngineOutput>> for BackendRun {
 impl gdl::inline::AroundInline for GdlOperator<Backend, PreprocessedRequest> {
     type Run = BackendRun;
 
-    fn start(&self, cx: &gdl::Cx, state: BackendState) -> BackendRun {
-        BackendRun {
+    fn start(&self, cx: &gdl::Cx, state: BackendState) -> Result<BackendRun, BackendState> {
+        Ok(BackendRun {
             state: state.decoder.reading(InlineInput {
                 context: state.context,
                 root: cx.clone(),
             }),
-        }
+        })
     }
 
-    fn convert(item: Annotated<LLMEngineOutput>) -> Annotated<BackendOutput> {
+    fn convert(_: &mut BackendRun, item: Annotated<LLMEngineOutput>) -> Annotated<BackendOutput> {
         backend_output(item)
     }
 }
@@ -3364,7 +3364,9 @@ mod tests {
                 .collect()
                 .await;
         }
-        let mut run = AroundInline::start(&op, cx, state);
+        let Ok(mut run) = AroundInline::start(&op, cx, state) else {
+            panic!("Backend runs every request inline");
+        };
         let mut out = Vec::new();
         for mut item in withholding_chunks() {
             match run.edit(&mut item) {
@@ -3381,7 +3383,9 @@ mod tests {
         }
         out.extend(std::iter::from_fn(|| run.close()));
         out.into_iter()
-            .map(<GdlOperator<Backend, PreprocessedRequest> as AroundInline>::convert)
+            .map(|item| {
+                <GdlOperator<Backend, PreprocessedRequest> as AroundInline>::convert(&mut run, item)
+            })
             .collect()
     }
 

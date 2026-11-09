@@ -286,6 +286,7 @@ mod tests {
                 DownReq = dynamo_gdl_adapters::Boxed<PreprocessedRequest>,
                 DownItem = Annotated<BackendOutput>,
             >,
+        PreprocessorNode<Req>: gdl::inline::AroundInline,
     {
         let below = Arc::new(SignalAtEnd { outputs, at_end });
         crate::operator::testing::preprocessor::<Req, Resp>(preprocessor, below)

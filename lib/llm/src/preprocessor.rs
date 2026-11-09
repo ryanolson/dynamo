@@ -8173,6 +8173,8 @@ impl gdl::Around<gdl::EndedForm> for PreprocessorNode<NvCreateChatCompletionRequ
     type DownReq = Boxed<PreprocessedRequest>;
     type DownItem = Annotated<BackendOutput>;
     type State = Box<ChatNodeState>;
+    // The inline half drops every item after a failed one (`response::ChatRun`).
+    const FILTERS: bool = true;
 
     // As `chat_forward`: a block, which uses its captures in place.
     #[allow(clippy::manual_async_fn)]
@@ -8584,6 +8586,68 @@ impl OpenAIPreprocessor {
 
         // prepend the annotations to the response stream
         stream::iter(state.annotations).chain(final_stream)
+    }
+}
+
+/// The chat preprocessor's backward half as an inline node: a request on the default path
+/// runs as [`response::ChatRun`], and any other through the stream form above, which builds
+/// the layers it needs. Decided once, when the half starts.
+impl gdl::inline::AroundInline for PreprocessorNode<NvCreateChatCompletionRequest> {
+    type Run = response::ChatRun;
+
+    fn start(
+        &self,
+        cx: &gdl::Cx,
+        state: Box<ChatNodeState>,
+    ) -> Result<response::ChatRun, Box<ChatNodeState>> {
+        if !self
+            .op
+            .chat_response_is_default(&state.request, &state.state)
+        {
+            return Err(state);
+        }
+        let ChatNodeState {
+            request,
+            state,
+            context,
+            ..
+        } = *state;
+        let strip_tool_calls = !OpenAIPreprocessor::tool_call_parsing_enabled(&request);
+        drop(request);
+        let transform = OpenAIPreprocessor::chat_transform(state, context.clone());
+        Ok(response::ChatRun::new(
+            transform,
+            strip_tool_calls,
+            cx.clone(),
+            context,
+        ))
+    }
+
+    fn convert(
+        run: &mut response::ChatRun,
+        item: Annotated<BackendOutput>,
+    ) -> Annotated<NvCreateChatCompletionStreamResponse> {
+        run.convert(item)
+    }
+}
+
+/// The completions preprocessor runs every request through its stream form.
+impl gdl::inline::AroundInline for PreprocessorNode<NvCreateCompletionRequest> {
+    type Run = response::Declines;
+
+    fn start(
+        &self,
+        _: &gdl::Cx,
+        state: CompletionNodeState,
+    ) -> Result<response::Declines, CompletionNodeState> {
+        Err(state)
+    }
+
+    fn convert(
+        run: &mut response::Declines,
+        _: Annotated<BackendOutput>,
+    ) -> Annotated<NvCreateCompletionResponse> {
+        match *run {}
     }
 }
 
@@ -20774,5 +20838,231 @@ mod beam_route_tests {
         let mut omitted = history_request(None);
         preprocessor.apply_preserve_thinking(&mut omitted).unwrap();
         assert!(omitted.chat_template_args.is_none());
+    }
+}
+
+/// The chat preprocessor's two forms on gdl: its backward half as an inline node, which runs a
+/// request on the default response path inline and declines any other, and as a stream node.
+/// Each request gives the same chunks in both forms.
+#[cfg(test)]
+mod inline_forms {
+    use super::*;
+    use crate::protocols::common::FinishReason;
+    use dynamo_runtime::engine::ResponseStream;
+    use dynamo_runtime::pipeline::async_trait;
+
+    type Chat = NvCreateChatCompletionRequest;
+
+    /// Answers every request with the same scripted items.
+    struct Script(Vec<Annotated<BackendOutput>>);
+
+    #[async_trait]
+    impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>
+        for Script
+    {
+        async fn generate(
+            &self,
+            request: SingleIn<PreprocessedRequest>,
+        ) -> Result<ManyOut<Annotated<BackendOutput>>, Error> {
+            let (_, context) = request.into_parts();
+            Ok(ResponseStream::new(
+                Box::pin(stream::iter(self.0.clone())),
+                context.context(),
+            ))
+        }
+    }
+
+    fn chunk(index: u32, text: &str, finish: Option<FinishReason>) -> Annotated<BackendOutput> {
+        let mut output: BackendOutput =
+            serde_json::from_value(serde_json::json!({"token_ids": [7], "tokens": []}))
+                .expect("a backend output");
+        output.text = Some(text.to_string());
+        output.index = Some(index);
+        output.finish_reason = finish;
+        Annotated::from_data(output)
+    }
+
+    fn preprocessor() -> Arc<OpenAIPreprocessor> {
+        let mdc = ModelDeploymentCard::load_from_disk(
+            "tests/data/sample-models/mock-llama-3.1-8b-instruct",
+            None,
+        )
+        .expect("the sample card");
+        OpenAIPreprocessor::new(mdc).expect("a preprocessor")
+    }
+
+    fn request(extra: serde_json::Value) -> Chat {
+        let mut request = serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": true,
+        });
+        for (key, value) in extra.as_object().expect("an object") {
+            request[key] = value.clone();
+        }
+        serde_json::from_value(request).expect("a chat request")
+    }
+
+    /// Each chunk as the client would read it, without what differs per request.
+    fn wire(item: &Annotated<NvCreateChatCompletionStreamResponse>) -> String {
+        let mut value = serde_json::to_value(item).expect("serializable");
+        if let Some(data) = value.get_mut("data").and_then(|d| d.as_object_mut()) {
+            data.remove("id");
+            data.remove("created");
+        }
+        // The tokenize latency is measured per request.
+        if let Some(comments) = value.get_mut("comment").and_then(|c| c.as_array_mut()) {
+            for comment in comments {
+                if let Some(mut parsed) = comment
+                    .as_str()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                {
+                    if let Some(fields) = parsed.as_object_mut() {
+                        fields.remove("tokenize_latency");
+                    }
+                    *comment = parsed;
+                }
+            }
+        }
+        let metrics = item.data.as_ref().map(|d| {
+            let mut metrics = d.llm_metrics.clone();
+            if let Some(metrics) = metrics.as_mut() {
+                metrics.tokenize_latency = None;
+            }
+            format!("{metrics:?}")
+        });
+        format!("{value} {metrics:?}")
+    }
+
+    async fn run(inline: bool, request: Chat, script: &[Annotated<BackendOutput>]) -> Vec<String> {
+        let next: BelowEngine = Arc::new(Script(script.to_vec()));
+        let engine = if inline {
+            crate::operator::testing::preprocessor::<Chat, NvCreateChatCompletionStreamResponse>(
+                preprocessor(),
+                next,
+            )
+        } else {
+            crate::operator::testing::preprocessor_stream::<
+                Chat,
+                NvCreateChatCompletionStreamResponse,
+            >(preprocessor(), next)
+        };
+        let stream = engine
+            .generate(SingleIn::new(request))
+            .await
+            .expect("a stream");
+        stream.map(|item| wire(&item)).collect().await
+    }
+
+    /// Whether the inline half runs `request` inline.
+    async fn runs_inline(request: Chat) -> bool {
+        use gdl::inline::AroundInline;
+        let next: BelowEngine = Arc::new(Script(Vec::new()));
+        let node = PreprocessorNode::<Chat>::new(preprocessor(), next);
+        let cx = gdl::Cx::new();
+        let (_sent, state) =
+            gdl::Around::<gdl::EndedForm>::forward(&node, &cx, Box::new(SingleIn::new(request)))
+                .await
+                .unwrap_or_else(|_| panic!("the preprocessor accepts the request"));
+        AroundInline::start(&node, &cx, state).is_ok()
+    }
+
+    fn scripts() -> Vec<(&'static str, Vec<Annotated<BackendOutput>>)> {
+        vec![
+            (
+                "a finished answer",
+                vec![
+                    chunk(0, "Hi", None),
+                    chunk(0, " there", None),
+                    chunk(0, "!", Some(FinishReason::Stop)),
+                ],
+            ),
+            (
+                "no finish reason",
+                vec![chunk(0, "Hi", None), chunk(0, " there", None)],
+            ),
+            ("an empty stream", vec![]),
+            (
+                "an error finish, then more items",
+                vec![
+                    chunk(0, "Hi", None),
+                    chunk(0, "", Some(FinishReason::Error("decode error".into()))),
+                    chunk(0, " late", None),
+                    chunk(0, "!", Some(FinishReason::Stop)),
+                ],
+            ),
+            (
+                "an error finish last",
+                vec![
+                    chunk(0, "Hi", None),
+                    chunk(0, "", Some(FinishReason::Error("decode error".into()))),
+                ],
+            ),
+            (
+                "an error item",
+                vec![
+                    chunk(0, "Hi", None),
+                    Annotated::from_error("engine failed"),
+                    chunk(0, "!", Some(FinishReason::Stop)),
+                ],
+            ),
+            (
+                "two choices",
+                vec![
+                    chunk(0, "Hi", None),
+                    chunk(1, "Yo", None),
+                    chunk(1, "!", Some(FinishReason::Length)),
+                    chunk(0, "!", Some(FinishReason::Stop)),
+                ],
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn every_request_gives_the_same_chunks_inline_and_as_a_stream() {
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {"name": "f", "parameters": {"type": "object", "properties": {}}}
+        }]);
+        let requests = [
+            ("default", serde_json::json!({}), true),
+            (
+                "usage",
+                serde_json::json!({"stream_options": {"include_usage": true}}),
+                true,
+            ),
+            ("two choices", serde_json::json!({"n": 2}), true),
+            ("logprobs", serde_json::json!({"logprobs": true}), true),
+            (
+                "tools, no parser",
+                serde_json::json!({"tools": tools}),
+                true,
+            ),
+            (
+                "annotations first",
+                serde_json::json!({"nvext": {"annotations": ["formatted_prompt"]}}),
+                false,
+            ),
+            (
+                "deferred reasoning",
+                serde_json::json!({"chat_template_args": {"force_nonempty_content": true}}),
+                false,
+            ),
+        ];
+        for (name, extra, inline) in requests {
+            assert_eq!(
+                runs_inline(request(extra.clone())).await,
+                inline,
+                "{name}: the inline half runs it inline"
+            );
+            for (script_name, script) in scripts() {
+                let streamed = run(false, request(extra.clone()), &script).await;
+                let inlined = run(true, request(extra.clone()), &script).await;
+                assert_eq!(inlined, streamed, "{name}, {script_name}");
+                if !script.is_empty() {
+                    assert!(!streamed.is_empty(), "{name}, {script_name}: chunks came");
+                }
+            }
+        }
     }
 }
