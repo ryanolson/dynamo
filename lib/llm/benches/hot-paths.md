@@ -286,6 +286,29 @@ the stages.
   Against Backend as a stream node in the ended form (the table above), that is 472 fewer
   instructions per item on A and 395 on B, and 4 fewer copies on each. C has no Backend. On A,
   the inline half and the engine's node boundary share one box: 2 allocations fewer per request.
+- **The chat preprocessor's default path in one frame:** a request with no reasoning parser, no
+  tool-call parsing route, no deferred reasoning, no payload capture, no request-trace end, no
+  annotations and no speculative prefill gets its response from one stream frame
+  (`preprocessor/response.rs`). The frame runs the transform and the two edits on each chunk in
+  place. Before, three streams ran them, with a chain for the annotations and a clean ending
+  around them. Every other request keeps its streams. Same setup as above, gdl `ff1bbfe0`, the
+  change against its parent, both measured in one session; the median of 6 per-run slopes, with
+  min to max:
+
+  | Row | Instructions per request, 1 item | Per extra item | memcpy per item | Allocations per request |
+  |---|---:|---:|---:|---:|
+  | A | 153,076 -> 152,132 | 19,624 [19,578..19,717] -> 19,377 [19,254..19,444] (-247) | 37.2 -> 36.2 | 326 -> 323 |
+  | B | 167,764 -> 166,585 | 19,860 [19,805..19,909] -> 19,650 [19,632..19,687] (-210) | 38.2 -> 37.2 | 343 -> 340 |
+  | C | 30,106 -> 30,131 | 881 -> 882 | 5 -> 5 | 38 -> 38 |
+
+  A second count, by a reviewer with `HOTPATH_RUNS=3`, gave A 19,678 -> 19,489 and B 19,843 ->
+  19,650 per extra item, with the same memcpy and allocation changes. Charged by address, the
+  preprocessor's streams made 10 copies per item on A before. The frame makes 5, and
+  `Annotated::map_data` 4 more, out of line. Writing the response as gdl inline nodes in place
+  of the frame was measured and rejected: it cost 167 instructions per item on A and 134 on B
+  against the parent. The transform builds a new chunk of about 1 KB from each item, and as a
+  conversion it took the item by value, which added copies. The base block below is not yet
+  moved to this change.
 - **Base for aarch64:** the table a change to this path compares against on the aarch64 bench
   host (Neoverse-V2), with gdl from `NVIDIA-dev/dynamo-gdl` at `3cf13c1a`, the ended form, and
   Backend's backward half as an inline node. Rust 1.99.0, `RUSTFLAGS="-C target-cpu=neoverse-n1 -C force-frame-pointers=yes --cfg tokio_unstable
