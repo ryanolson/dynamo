@@ -11,11 +11,12 @@ per item grows with every token of every stream. A cost per request is paid once
 ## per-item-response
 
 The per-item path of a chat response: Migration's response stream (pipelines B and C), Backend's
-decoder stream, then the preprocessor's response transform, through the stream layers between
+detokenizing, then the preprocessor's response transform, through the stream layers between
 the stages.
 
-- **Entry points:** `DecoderStream::poll_next` in `lib/llm/src/backend.rs` (Backend's stream over
-  the engine's stream, built by the backward half of Backend's around node), and
+- **Entry points:** `BackendRun::edit` in `lib/llm/src/backend.rs` (Backend's backward half as a
+  gdl inline node, which pipelines A and B run) and `DecoderStream::poll_next` (the same per-item
+  body, `DecoderState::process`, as a stream node, which Backend's tests also run), and
   `transform_postprocessor_stream_with_image_tokens` in `lib/llm/src/preprocessor.rs`, with the
   in-place edits of `lib/llm/src/preprocessor/edit.rs` after the parsers, and
   `Migrated::poll_next` in `lib/llm/src/migration.rs` (Migration's stream over the active
@@ -270,27 +271,44 @@ the stages.
   instructions per token both +0.6%, IPC unchanged (1.250 and 1.248), context switches 2% fewer.
   The reference itself moved between those two sessions, from 9.82 to 10.10 µs per token at that
   point, so compare arms run in one session only.
+- **Backend as an inline node:** Backend's backward half is a gdl inline node
+  (`gdl::inline::AroundInline`, used through `InlineHalf`). gdl calls its `edit` on each item in
+  the stream that already holds the hop's boundaries, so the box, node boundary and stream of its
+  own that a stream node has are gone, with the `EndedItems` it read through. Same setup as
+  above, gdl `3cf13c1a`, against the same reference; the median of 6 per-run slopes (C: of 3):
+
+  | Row | Instructions per request, 1 item | Per extra item | memcpy per item |
+  |---|---:|---:|---:|
+  | A | 169,768 -> 154,177 | 19,906 -> 19,624 (-282) | 41.2 -> 37.2 |
+  | B | 214,865 -> 168,942 | 20,103 -> 19,833 (-270) | 42.2 -> 38.2 |
+  | C | 62,446 -> 30,246 | 798 -> 882 (+84) | 5 -> 5 |
+
+  Against Backend as a stream node in the ended form (the table above), that is 472 fewer
+  instructions per item on A and 395 on B, and 4 fewer copies on each. C has no Backend. On A,
+  the inline half and the engine's node boundary share one box: 2 allocations fewer per request.
 - **Base for aarch64:** the table a change to this path compares against on the aarch64 bench
-  host (Neoverse-V2), with gdl from `NVIDIA-dev/dynamo-gdl` at `43629be7`, the ended form. Rust
-  1.99.0, `RUSTFLAGS="-C target-cpu=neoverse-n1 -C force-frame-pointers=yes --cfg tokio_unstable
+  host (Neoverse-V2), with gdl from `NVIDIA-dev/dynamo-gdl` at `3cf13c1a`, the ended form, and
+  Backend's backward half as an inline node. Rust 1.99.0, `RUSTFLAGS="-C target-cpu=neoverse-n1 -C force-frame-pointers=yes --cfg tokio_unstable
   --cfg rustix_use_libc"`, valgrind 3.28, `hotpath.sh` with `HOTPATH_RUNS=3`, which keeps the
   lowest instructions of 3 runs. Save the block as a file and pass it to `hotpath.sh --base`:
 
   ```text
-  # hotpath format=3 arch=aarch64 gdl=43629be7275e commit=b4a87784c01c
+  # hotpath format=3 arch=aarch64 gdl=3cf13c1a0572 commit=a54f04d8e5f6
   pipeline     form    allocs allocs/item     instr instr/item memcpy memcpy/item allocs@16   instr@16 memcpy@16  range
-  engine       -            7        1.00      9501        621     24        4.00        22      18819        84  7..7,22..22
-  A            gdl        328       34.20    154579      20050    324       41.20       841     455325       942  328..328,841..841
-  B            gdl        343       34.20    168972      20140    363       42.20       856     471078       996  343..343,856..856
-  C            gdl         38        1.00     30258        882     72        5.00        53      43488       147  38..38,53..53
-  embed-engine -            8        1.00      6130        962      7        3.00        23      20564        52  8..8,23..23
-  embeddings   gdl        177      139.00     95313      80427    125       90.80      2262    1301716      1487  177..177,2261..2262
-  ingress      dynamo      49        3.00     49209       2846    139        7.00        94      91902       244  49..49,94..94
+  engine       -            7        1.00      9568        606     24        4.00        22      18654        84  7..7,22..22
+  A            gdl        326       34.20    152196      19779    319       37.20       839     448876       877  326..326,839..839
+  B            gdl        343       34.20    167368      19907    359       38.20       856     465968       932  343..343,856..856
+  C            gdl         38        1.00     30077        893     72        5.00        53      43474       147  38..38,53..53
+  embed-engine -            8        1.00      5975        961      7        3.00        23      20395        52  8..8,23..23
+  embeddings   gdl        177      139.00     95327      81032    125       90.80      2262    1310804      1487  177..177,2261..2262
+  ingress      dynamo      49        3.00     48915       2808    139        7.00        94      91042       244  49..49,94..94
   ```
 
-  Against the `Result` form's base on the same host (gdl `3686ff4d`): per item, `memcpy` 51.2 ->
-  41.2 on A, 53.2 -> 42.2 on B and 10 -> 5 on C, and instructions -1,015 on A, -1,268 on B and
-  -516 on C; per request, one allocation fewer on every gdl row. The `embeddings` row moves by
+  The ended form with Backend as a stream node (gdl `43629be7`), against the `Result` form's base
+  on the same host (gdl `3686ff4d`): per item, `memcpy` 51.2 -> 41.2 on A, 53.2 -> 42.2 on B and
+  10 -> 5 on C, and instructions -1,015 on A, -1,268 on B and -516 on C; per request, one
+  allocation fewer on every gdl row. Backend as an inline node then took per item 4 more `memcpy`
+  calls off A and B and 271 and 233 instructions, and per request 2 allocations off A. The `embeddings` row moves by
   several percent per item from run to run: its 16 inputs are tokenized on rayon's pool, and the
   instructions of rayon's work-stealing loop depend on thread timing. Read that row's per-item
   column with that spread in mind.
