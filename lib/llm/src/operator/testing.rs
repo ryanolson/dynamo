@@ -125,8 +125,25 @@ where
     Arc::new(PipelineEngine::<_, Req, T, R>::for_dynamo_stages(next))
 }
 
-/// `backend` over `next`, as the frontend composes it: an around node of the hop to `next`.
+/// `backend` over `next`, as the frontend composes it: an around node of the hop to `next`,
+/// with its backward half as an inline node.
 pub(crate) fn backend(
+    backend: Arc<Backend>,
+    next: Arc<DynEngine<PreprocessedRequest, LLMEngineOutput>>,
+) -> Arc<DynEngine<PreprocessedRequest, BackendOutput>> {
+    let node = Arc::new(GdlOperator::<_, PreprocessedRequest>::new(backend));
+    let (forward, _) = gdl::around(Arc::clone(&node));
+    let hop = gdl::Hop::new(
+        (forward, ()),
+        sink_stage(next),
+        (gdl::inline::InlineHalf::new(node), ()),
+    );
+    engine_for_dynamo_stages::<_, _, _, Boxed<PreprocessedRequest>>(hop)
+}
+
+/// `backend` over `next` with its backward half as a stream node: the form Backend's own tests
+/// check beside the inline one.
+pub(crate) fn backend_stream(
     backend: Arc<Backend>,
     next: Arc<DynEngine<PreprocessedRequest, LLMEngineOutput>>,
 ) -> Arc<DynEngine<PreprocessedRequest, BackendOutput>> {

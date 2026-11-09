@@ -458,15 +458,19 @@ where
     let backend = Backend::from_tokenizer(tokenizer);
 
     let engine = SinkStage::new(Arc::new(EngineSink::<_, Pre, _, Boxed<Pre>>::new(engine)));
-    let below = Arc::new(
-        PipelineEngine::<_, Pre, BackendOutput, Boxed<Pre>>::for_dynamo_stages(
-            around::<_, Pre, _>(backend.clone(), engine.clone()),
-        ),
-    );
+    let below =
+        Arc::new(
+            PipelineEngine::<_, Pre, BackendOutput, Boxed<Pre>>::for_dynamo_stages(
+                inline_around::<_, Pre, _>(backend.clone(), engine.clone()),
+            ),
+        );
     let (preprocessor_forward, preprocessor_backward) =
         gdl::around(Arc::new(PreprocessorNode::<Req>::new(preprocessor, below)));
-    let (backend_forward, backend_backward) =
-        gdl::around(Arc::new(GdlOperator::<_, Pre>::new(backend)));
+    // Backend's backward half runs as an inline node: no box, node boundary or stream of its
+    // own per item.
+    let backend_node = Arc::new(GdlOperator::<_, Pre>::new(backend));
+    let (backend_forward, _) = gdl::around(Arc::clone(&backend_node));
+    let backend_backward = gdl::inline::InlineHalf::new(backend_node);
     let hop = Hop::new(
         (preprocessor_forward, (backend_forward, ())),
         engine,
@@ -610,7 +614,7 @@ impl PreprocessedRouting {
         // and, as an engine of its own, where a speculative prefill is sent.
         let migration = gdl::OperatorStage::new(
             Arc::new(GdlOperator::<_, BackendOutput>::new(migration)),
-            around::<_, Pre, _>(token_backend, self.gdl_routers()),
+            inline_around::<_, Pre, _>(token_backend, self.gdl_routers()),
         );
         let below =
             Arc::new(
@@ -679,20 +683,27 @@ impl PreprocessedRouting {
     }
 }
 
-/// A hop to `I` with `GdlOperator<O, K>` as its one around node.
-type AroundHop<O, K, I> = gdl::Hop<
+/// A hop to `I` with `GdlOperator<O, K>` as its one around node, its backward half an inline
+/// node.
+type InlineAroundHop<O, K, I> = gdl::Hop<
     (gdl::ForwardHalf<GdlOperator<O, K>, gdl::EndedForm>, ()),
     I,
-    (gdl::BackwardHalf<GdlOperator<O, K>, gdl::EndedForm>, ()),
+    (gdl::inline::InlineHalf<GdlOperator<O, K>>, ()),
 >;
 
-/// `op` as an around node of the hop to `inner`, keyed by `K` (see [`GdlOperator`]).
-fn around<O, K, I>(op: Arc<O>, inner: I) -> AroundHop<O, K, I>
+/// `op` as an around node of the hop to `inner`, keyed by `K`, with its backward half as an
+/// inline node (see [`gdl::inline::AroundInline`]).
+fn inline_around<O, K, I>(op: Arc<O>, inner: I) -> InlineAroundHop<O, K, I>
 where
-    GdlOperator<O, K>: gdl::Around<gdl::EndedForm>,
+    GdlOperator<O, K>: gdl::inline::AroundInline,
 {
-    let (forward, backward) = gdl::around(Arc::new(GdlOperator::new(op)));
-    gdl::Hop::new((forward, ()), inner, (backward, ()))
+    let node = Arc::new(GdlOperator::new(op));
+    let (forward, _) = gdl::around(Arc::clone(&node));
+    gdl::Hop::new(
+        (forward, ()),
+        inner,
+        (gdl::inline::InlineHalf::new(node), ()),
+    )
 }
 
 /// `op` as a native gdl operator, keyed by `K` (see [`GdlOperator`]), over the hop `next`.

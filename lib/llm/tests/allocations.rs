@@ -49,8 +49,8 @@
 //! | Row | Allocations, 1 item | Bytes, 1 item | Allocations, 16 items | Bytes, 16 items |
 //! |---|---:|---:|---:|---:|
 //! | `engine` | 7 | 2,752 | 22 | 2,812 |
-//! | `a-gdl` | 328 | 63,727 | 841 | 85,215 |
-//! | `b-gdl` | 343 | 80,378 | 856 | 101,866 |
+//! | `a-gdl` | 326 | 63,871 | 839 | 85,359 |
+//! | `b-gdl` | 343 | 80,554 | 856 | 102,042 |
 //! | `c-gdl` | 38 | 28,188 | 53 | 28,248 |
 //! | `embed-engine` | 8 | 6,548 | 23 | 88,868 |
 //! | `embeddings-gdl` | 177 | 41,719 | 2,261 | 527,167 |
@@ -73,7 +73,10 @@
 //! (`PipelineEngine` above, `EngineSink` below); a `link` stage made 14. Every operator in the gdl rows is native, and
 //! Backend and the chat preprocessor are around nodes of the hop below them; the test engine
 //! at the terminal enters through `EngineSink`, where the frontend's `RoutingHost` is a gdl
-//! sink of its own.
+//! sink of its own. Backend's backward half is an inline node (`gdl::inline::InlineHalf`). On
+//! `a-gdl` it reads the engine's node boundary directly, and its stream and that boundary share
+//! one box: 2 allocations fewer per request than as a stream node. It asks for 144 bytes more
+//! per request on `a-gdl` and 176 more on `b-gdl`.
 //! Each gdl row asked for fewer bytes than the `link` chain it replaced: the `link` chain boxed a
 //! future per edge, the gdl composition one per stage, and `embeddings-gdl` has no backend stage.
 //! The largest allocation of `b` and `c` was Migration's boxed future, 59,592 bytes per request;
@@ -135,11 +138,11 @@ const BASELINE: &[Row] = &[
     row("engine", 1, 7, 2752),
     row("engine", 16, 22, 2812),
     // +2 for the boxed chat and preprocessed requests (see the module docs).
-    row("a-gdl", 1, 328, 63727),
-    row("a-gdl", 16, 841, 85215),
+    row("a-gdl", 1, 326, 63871),
+    row("a-gdl", 16, 839, 85359),
     // +2 for the boxed chat and preprocessed requests (see the module docs).
-    row("b-gdl", 1, 343, 80378),
-    row("b-gdl", 16, 856, 101866),
+    row("b-gdl", 1, 343, 80554),
+    row("b-gdl", 16, 856, 102042),
     // +1 for the boxed preprocessed request (see the module docs).
     row("c-gdl", 1, 38, 28188),
     row("c-gdl", 16, 53, 28248),
