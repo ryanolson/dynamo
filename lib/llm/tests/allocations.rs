@@ -138,18 +138,18 @@ const BASELINE: &[Row] = &[
     row("engine", 1, 7, 2752),
     row("engine", 16, 22, 2812),
     // +2 for the boxed chat and preprocessed requests (see the module docs).
-    row("a-gdl", 1, 326, 63871),
-    row("a-gdl", 16, 839, 85359),
+    row("a-gdl", 1, 327, 63873),
+    row("a-gdl", 16, 840, 85361),
     // +2 for the boxed chat and preprocessed requests (see the module docs).
-    row("b-gdl", 1, 343, 80554),
-    row("b-gdl", 16, 856, 102042),
+    row("b-gdl", 1, 344, 80556),
+    row("b-gdl", 16, 857, 102044),
     // +1 for the boxed preprocessed request (see the module docs).
-    row("c-gdl", 1, 38, 28188),
-    row("c-gdl", 16, 53, 28248),
+    row("c-gdl", 1, 38, 28196),
+    row("c-gdl", 16, 53, 28256),
     row("embed-engine", 1, 8, 6548),
     row("embed-engine", 16, 23, 88868),
-    row("embeddings-gdl", 1, 177, 41719),
-    row("embeddings-gdl", 16, 2261, 527167),
+    row("embeddings-gdl", 1, 177, 41727),
+    row("embeddings-gdl", 16, 2261, 527175),
 ];
 
 #[global_allocator]
