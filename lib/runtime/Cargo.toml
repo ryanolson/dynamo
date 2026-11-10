@@ -37,6 +37,11 @@ tcp-low-latency = [] # Enable Linux-specific TCP optimizations (TCP_QUICKACK, SO
 # feature has no libnvToolsExt.so dependency (CUDA 12.9+ no longer ships that library).
 nvtx = ["dep:nvtx"]
 
+# dynamo's builds set `--cfg tokio_unstable` (`.cargo/config.toml`). A crate
+# that links this one may not, so tokio's unstable metrics are gated on it.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tokio_unstable)"] }
+
 [dependencies]
 velo = { workspace = true }
 # repo
