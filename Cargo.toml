@@ -175,7 +175,7 @@ axum = { version = "=0.8.9", features = ["macros", "ws"] }
 axum-core = { version = "0.5.2" }
 hyper = { version = "=1.7.0" }
 hyper-util = { version = "=0.1.17" }
-mio = { version = "=1.2.2" }
+mio = { version = "=1.2.4" }
 tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = [
     "env-filter",
