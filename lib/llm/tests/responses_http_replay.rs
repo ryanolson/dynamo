@@ -93,6 +93,46 @@ async fn unsupported_hosted_tools_fail_before_dispatch_or_streaming() {
     .await;
 }
 
+/// Claim: a Codex-shaped request, function tools plus the hosted web search
+/// tool, should be served rather than rejected. This contradicts
+/// `unsupported_hosted_tools_fail_before_dispatch_or_streaming`, which pins the
+/// current reject policy; one of the two goes when the policy is decided.
+#[tokio::test]
+#[serial]
+#[ignore = "claim: convert_tools rejects hosted web_search with HTTP 400 before dispatch"]
+async fn codex_hosted_web_search_request_is_served() {
+    temp_env::async_with_vars(ENV, async {
+        let script = load_agent_fixture("text.sse").await.unwrap();
+        let hosted = [
+            json!({"type": "web_search"}),
+            json!({"type": "web_search", "external_web_access": false, "search_context_size": "low"}),
+            json!({"type": "web_search_preview"}),
+        ];
+        let svc = HarnessService::start(vec![script; hosted.len() * 2]).await;
+        for stream in [false, true] {
+            for web_search in &hosted {
+                let body = json!({
+                    "model": MODEL,
+                    "input": "ping",
+                    "stream": stream,
+                    "tools": [tool("exec_command"), web_search],
+                });
+                let response = post_responses(&svc, &body).await;
+                let status = response.status();
+                let text = response.text().await.unwrap();
+                assert_eq!(
+                    status,
+                    reqwest::StatusCode::OK,
+                    "stream={stream} tool={web_search}: {text}"
+                );
+            }
+        }
+        assert_eq!(svc.engine.take_requests().await.len(), hosted.len() * 2);
+        svc.shutdown().await;
+    })
+    .await;
+}
+
 /// Unsupported choices return HTTP 400 without dispatch for unary and streaming
 /// requests even when the supplied function tool definitions are valid.
 /// Custom tools now share the function-template adapter while retaining their

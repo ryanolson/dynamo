@@ -542,3 +542,54 @@ fn unary_boundaries_preserve_aggregate_reasoning_and_refusal() {
         );
     }
 }
+
+/// Records the current hosted-tool policy: the Chat Completions adapter rejects
+/// every hosted tool by type, so the HTTP layer answers 400 before dispatch.
+/// Covers the shapes Codex sends (`web_search`, with `external_web_access`)
+/// and the other hosted kinds, so a policy change must update this table.
+#[test]
+fn hosted_tools_are_rejected_by_type_during_conversion() {
+    let cases = [
+        ("web_search", json!({"type":"web_search"})),
+        (
+            "web_search",
+            json!({"type":"web_search","external_web_access":false,"search_context_size":"low"}),
+        ),
+        ("web_search_preview", json!({"type":"web_search_preview"})),
+        (
+            "web_search_2025_08_26",
+            json!({"type":"web_search_2025_08_26"}),
+        ),
+        (
+            "file_search",
+            json!({"type":"file_search","vector_store_ids":["vs_1"]}),
+        ),
+        (
+            "code_interpreter",
+            json!({"type":"code_interpreter","container":{"type":"auto"}}),
+        ),
+        ("image_generation", json!({"type":"image_generation"})),
+        (
+            "computer_use_preview",
+            json!({"type":"computer_use_preview","environment":"browser","display_width":1024,"display_height":768}),
+        ),
+        (
+            "mcp",
+            json!({"type":"mcp","server_label":"docs","server_url":"https://example.com/mcp"}),
+        ),
+        ("local_shell", json!({"type":"local_shell"})),
+    ];
+    for (tool_type, tool) in cases {
+        let req: NvCreateResponse = serde_json::from_value(
+            json!({"model":"m","input":"hi","tools":[func("read_file"), tool]}),
+        )
+        .unwrap_or_else(|error| panic!("{tool_type} should deserialize: {error}"));
+        let error = NvCreateChatCompletionRequest::try_from(req)
+            .expect_err(tool_type)
+            .to_string();
+        assert!(
+            error.contains(&format!("Unsupported Responses tools type '{tool_type}'")),
+            "{tool_type}: {error}"
+        );
+    }
+}
