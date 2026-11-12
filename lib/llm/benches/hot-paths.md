@@ -307,25 +307,50 @@ the stages.
   `Annotated::map_data` 4 more, out of line. Writing the response as gdl inline nodes in place
   of the frame was measured and rejected: it cost 167 instructions per item on A and 134 on B
   against the parent. The transform builds a new chunk of about 1 KB from each item, and as a
-  conversion it took the item by value, which added copies. The base block below is not yet
-  moved to this change.
+  conversion it took the item by value, which added copies.
+- **Against Dynamo at the same dependencies:** the port at `4a675e6a5d` (gdl `dc3d9d2c`, the
+  ended form, Backend inline, the preprocessor in one frame) against the reference `11ad043f26`,
+  which is the reference above with the same pins of `dynamo-protocols`, `dynamo-renderer`,
+  `tokio`, `axum` and `mio` as the port. Same host, flags and valgrind as the base block below;
+  the reference with `callgrind.sh`, each pair 3 times, lowest instructions kept:
+
+  | Row | Instructions per request, 1 item | Per extra item | memcpy per item | Allocations per request |
+  |---|---:|---:|---:|---:|
+  | A | 170,344 -> 153,367 (-10.0%) | 19,841 -> 19,389 (-2.3%) | 41.2 -> 36.2 | 350 -> 327 |
+  | B | 214,454 -> 167,716 (-21.8%) | 20,108 -> 19,667 (-2.2%) | 42.2 -> 37.2 | 403 -> 344 |
+  | C | 62,500 -> 30,149 (-51.8%) | 795 -> 877 | 5 -> 5 | 71 -> 38 |
+  | embeddings | 99,549 -> 95,265 (-4.3%) | 81,499 -> 81,397 | 90.8 -> 90.8 | 199 -> 177 |
+
+  The dependency pins add 4 allocations per request to A and B on both trees, so they are not
+  the port's. End to end, the method above (pipeline B on 2 cores, 5 interleaved runs per arm,
+  every output length and concurrency), in one session: the port used less frontend CPU per
+  token at every point, 0.9 to 3.0% less at 2,048 output tokens and 7 to 8% less at 16, and at
+  2,048 output tokens and concurrency 512 its median (9.78 µs) was below the reference's range
+  (9.93 to 10.18 µs). The per-item gap the `Result` form had (+6% instructions, +7% CPU per
+  token) is gone.
 - **Base for aarch64:** the table a change to this path compares against on the aarch64 bench
-  host (Neoverse-V2), with gdl from `NVIDIA-dev/dynamo-gdl` at `3cf13c1a`, the ended form, and
-  Backend's backward half as an inline node. Rust 1.99.0, `RUSTFLAGS="-C target-cpu=neoverse-n1 -C force-frame-pointers=yes --cfg tokio_unstable
+  host (Neoverse-V2), with gdl from `NVIDIA-dev/dynamo-gdl` at `dc3d9d2c`, the ended form,
+  Backend's backward half as an inline node, and the preprocessor's default path in one frame.
+  Rust 1.99.0, `RUSTFLAGS="-C target-cpu=neoverse-n1 -C force-frame-pointers=yes --cfg tokio_unstable
   --cfg rustix_use_libc"`, valgrind 3.28, `hotpath.sh` with `HOTPATH_RUNS=3`, which keeps the
   lowest instructions of 3 runs. Save the block as a file and pass it to `hotpath.sh --base`:
 
   ```text
-  # hotpath format=3 arch=aarch64 gdl=3cf13c1a0572 commit=a54f04d8e5f6
+  # hotpath format=3 arch=aarch64 gdl=dc3d9d2c85bc commit=4a675e6a5d26
   pipeline     form    allocs allocs/item     instr instr/item memcpy memcpy/item allocs@16   instr@16 memcpy@16  range
-  engine       -            7        1.00      9568        606     24        4.00        22      18654        84  7..7,22..22
-  A            gdl        326       34.20    152196      19779    319       37.20       839     448876       877  326..326,839..839
-  B            gdl        343       34.20    167368      19907    359       38.20       856     465968       932  343..343,856..856
-  C            gdl         38        1.00     30077        893     72        5.00        53      43474       147  38..38,53..53
-  embed-engine -            8        1.00      5975        961      7        3.00        23      20395        52  8..8,23..23
-  embeddings   gdl        177      139.00     95327      81032    125       90.80      2262    1310804      1487  177..177,2261..2262
-  ingress      dynamo      49        3.00     48915       2808    139        7.00        94      91042       244  49..49,94..94
+  engine       -            7        1.00      9413        627     24        4.00        22      18823        84  7..7,22..22
+  A            gdl        327       34.20    153367      19389    319       36.20       840     444197       862  327..327,840..840
+  B            gdl        344       34.20    167716      19667    359       37.20       857     462716       917  344..344,857..857
+  C            gdl         38        1.00     30149        877     72        5.00        53      43302       147  38..38,53..53
+  embed-engine -            8        1.00      5974        965      7        3.00        23      20442        52  8..8,23..23
+  embeddings   gdl        177      139.00     95265      81397    125       90.80      2262    1316217      1487  177..177,2261..2262
+  ingress      dynamo      49        3.00     48918       2812    139        7.00        94      91102       244  49..49,94..94
   ```
+
+  Against the previous base (gdl `3cf13c1a`, commit `a54f04d8e5f6`): per item, 390 fewer
+  instructions and one `memcpy` fewer on A, 240 and one fewer on B; per request, one allocation
+  more on A and B, and 1,171 more instructions on A and 348 on B. The per-request rise comes
+  with the dependency pins above.
 
   The ended form with Backend as a stream node (gdl `43629be7`), against the `Result` form's base
   on the same host (gdl `3686ff4d`): per item, `memcpy` 51.2 -> 41.2 on A, 53.2 -> 42.2 on B and
@@ -341,4 +366,7 @@ the stages.
 - **Second view:** a sampling profile (`perf record`, cycles) of the frontend at 2,048 output
   tokens and concurrency 64 has the same top symbols, in the same order, for the port and the
   reference: `memcpy` about 7%, then the tokenizer, `malloc` and `free`, and `serde_json`. No gdl
-  boundary reaches 1.5% of the samples, and cycles per token follow instructions per token.
+  boundary reaches 1.5% of the samples, and cycles per token follow instructions per token. At
+  `4a675e6a5d` against the reference at the same dependencies, cycles per token were 4.6% fewer
+  there and 1.0% fewer at an open-loop 450 requests per second (256 output tokens). gdl's
+  symbols together took 0.7 to 0.8% of the frontend's cycles, none more than 0.25%.
