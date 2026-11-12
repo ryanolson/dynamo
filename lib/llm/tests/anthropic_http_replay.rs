@@ -1098,3 +1098,128 @@ async fn explicit_thinking_controls_reach_the_chat_engine() {
     })
     .await;
 }
+
+/// A Claude Code-shaped request: a system prompt, a client tool, and the
+/// advisor server tool, which carries `type` and `name` but no `input_schema`.
+fn claude_code_request(stream: bool, messages: Value) -> Value {
+    json!({
+        "model": MODEL,
+        "max_tokens": 64,
+        "stream": stream,
+        "system": [{"type": "text", "text": "You are a coding agent."}],
+        "messages": messages,
+        "tools": [tool("Read"), {"type": "advisor_20260301", "name": "advisor"}]
+    })
+}
+
+async fn assert_rejected_before_dispatch(svc: &HarnessService, body: &Value, message: &str) {
+    let response = post_messages(svc, body).await;
+    let status = response.status();
+    let mut body: Value = response.json().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
+    // The error middleware stamps a per-request id into the body.
+    assert!(body["request_id"].is_string(), "{body}");
+    body.as_object_mut().unwrap().remove("request_id");
+    assert_eq!(
+        body,
+        json!({"type": "error", "error": {"type": "invalid_request_error", "message": message}})
+    );
+}
+
+/// Records the current server-tool policy on `/v1/messages`: the advisor
+/// server tool that Claude Code sends gets HTTP 400 before dispatch, while the
+/// same request without it is served.
+#[tokio::test]
+#[serial]
+async fn advisor_server_tool_is_rejected_before_dispatch() {
+    temp_env::async_with_vars(ENV, async {
+        let script = load_agent_fixture("text.sse").await.unwrap();
+        let svc = HarnessService::start([script.clone(), script]).await;
+        for stream in [false, true] {
+            let body = claude_code_request(stream, json!([{"role": "user", "content": "ping"}]));
+            // Control: the same request without the advisor tool is served.
+            let mut control = body.clone();
+            control["tools"] = json!([tool("Read")]);
+            let response = post_messages(&svc, &control).await;
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let _ = response.bytes().await.unwrap();
+
+            assert_rejected_before_dispatch(
+                &svc,
+                &body,
+                "tools[1]: server tool type \"advisor_20260301\" is not supported",
+            )
+            .await;
+        }
+        assert_eq!(svc.engine.take_requests().await.len(), 2);
+        svc.shutdown().await;
+    })
+    .await;
+}
+
+/// Records how an `advisor_tool_result` block in an assistant turn is handled:
+/// message validation runs before tool validation and rejects the unknown
+/// block with HTTP 400, with or without the advisor tool in `tools`.
+#[tokio::test]
+#[serial]
+async fn advisor_tool_result_block_is_rejected_before_dispatch() {
+    temp_env::async_with_vars(ENV, async {
+        let svc = HarnessService::start([load_agent_fixture("text.sse").await.unwrap()]).await;
+        let messages = json!([
+            {"role": "user", "content": "plan the change"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "Let me ask the advisor."},
+                {"type": "server_tool_use", "id": "srvtoolu_1", "name": "advisor", "input": {}},
+                {"type": "advisor_tool_result", "tool_use_id": "srvtoolu_1",
+                 "content": {"type": "advisor_result", "text": "Read the file first."}},
+                {"type": "text", "text": "I will read the file."}
+            ]},
+            {"role": "user", "content": "go on"}
+        ]);
+        let expected =
+            "messages[1].content[2]: content block type \"advisor_tool_result\" is not supported";
+        for stream in [false, true] {
+            let with_tool = claude_code_request(stream, messages.clone());
+            assert_rejected_before_dispatch(&svc, &with_tool, expected).await;
+
+            let mut without_tool = with_tool;
+            without_tool["tools"] = json!([tool("Read")]);
+            assert_rejected_before_dispatch(&svc, &without_tool, expected).await;
+        }
+        assert!(svc.engine.take_requests().await.is_empty());
+
+        // Control: without the result block the request is served, and the
+        // advisor `server_tool_use` reaches the backend as an ordinary tool
+        // call with no matching tool result.
+        let mut control = claude_code_request(false, messages);
+        control["tools"] = json!([tool("Read")]);
+        control["messages"][1]["content"]
+            .as_array_mut()
+            .unwrap()
+            .remove(2);
+        let response = post_messages(&svc, &control).await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let _ = response.bytes().await.unwrap();
+        let requests = svc.engine.take_requests().await;
+        assert_eq!(requests.len(), 1);
+        let ChatCompletionRequestMessage::Assistant(assistant) = &requests[0].inner.messages[2]
+        else {
+            panic!(
+                "expected assistant message: {:#?}",
+                requests[0].inner.messages
+            );
+        };
+        let calls = assistant.tool_calls.as_ref().expect("advisor tool call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "advisor");
+        assert!(
+            !requests[0]
+                .inner
+                .messages
+                .iter()
+                .any(|message| matches!(message, ChatCompletionRequestMessage::Tool(_)))
+        );
+        svc.shutdown().await;
+    })
+    .await;
+}
