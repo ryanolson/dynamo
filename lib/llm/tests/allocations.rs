@@ -141,8 +141,8 @@ const BASELINE: &[Row] = &[
     row("a-gdl", 1, 327, 63873),
     row("a-gdl", 16, 840, 85361),
     // +2 for the boxed chat and preprocessed requests (see the module docs).
-    row("b-gdl", 1, 344, 80556),
-    row("b-gdl", 16, 857, 102044),
+    row("b-gdl", 1, 344, 80508),
+    row("b-gdl", 16, 857, 101996),
     // +1 for the boxed preprocessed request (see the module docs).
     row("c-gdl", 1, 38, 28196),
     row("c-gdl", 16, 53, 28256),
