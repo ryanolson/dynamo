@@ -118,16 +118,26 @@ fn response_mux_config() -> Result<MuxConfig> {
         "a non-negative integer in milliseconds",
         |value| value.parse().ok(),
     )?;
-    Ok(MuxConfig {
+    // Scratch knobs for the response plane cost study.
+    let on_complete = std::env::var("DYN_VELO_RESPONSE_ON_COMPLETE").is_ok_and(|v| v == "1");
+    let mut config = MuxConfig {
         enabled: true,
         initial_credit: RESPONSE_CREDIT_WINDOW,
         flush_policy: FlushPolicy::Auto(AutoFlush {
             on_admission: batch_ms == 0,
             max_linger: (batch_ms != 0).then(|| Duration::from_millis(batch_ms)),
+            on_complete: on_complete && batch_ms != 0,
             ..Default::default()
         }),
         ..Default::default()
-    })
+    };
+    if let Ok(us) = std::env::var("DYN_VELO_RESPONSE_REPLY_LINGER_US") {
+        config.reply_linger = Duration::from_micros(
+            us.parse()
+                .map_err(|_| anyhow::anyhow!("DYN_VELO_RESPONSE_REPLY_LINGER_US must be an integer"))?,
+        );
+    }
+    Ok(config)
 }
 
 /// Velo has no TLS, so refuse to build a service while TLS is configured
@@ -794,6 +804,7 @@ impl VeloResponseService {
             .inspect_err(|error| {
             tracing::warn!(context_id = %context.id(), %error, "Failed to prepare Velo response peer");
         })?;
+        crate::stage_probe::mark(crate::stage_probe::W_PEER_READY, context.id());
         let sender = if address.anchor.unpack().0 == self.velo.instance_id().worker_id() {
             self.velo.attach_anchor::<Bytes>(address.anchor).await?
         } else {

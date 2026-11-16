@@ -17,6 +17,7 @@ pub use anyhow::{
 
 use async_once_cell::OnceCell;
 
+pub mod stage_probe;
 pub mod config;
 pub use config::RuntimeConfig;
 

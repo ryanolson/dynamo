@@ -335,6 +335,7 @@ where
             };
             if first_response {
                 first_response = false;
+                crate::stage_probe::mark(crate::stage_probe::F_FIRST_ITEM, engine_ctx_for_stream.id());
                 REQUEST_PLANE_ROUNDTRIP_TTFT_SECONDS.observe(tx_start.elapsed().as_secs_f64());
                 STAGE_DURATION_SECONDS
                     .with_label_values(&["transport_roundtrip"])
@@ -824,6 +825,7 @@ impl AddressedPushRouter {
         let defer_cancellation_until_prologue =
             matches!(prologue_wait, PrologueWait::Retained { .. });
 
+        crate::stage_probe::mark(crate::stage_probe::F_START, context.id());
         let queue_start = Instant::now();
         REQUEST_PLANE_INFLIGHT.inc();
         let inflight_guard = InflightGuard::new();
@@ -841,6 +843,7 @@ impl AddressedPushRouter {
                 defer_cancellation_until_prologue,
             )
             .await?;
+        crate::stage_probe::mark(crate::stage_probe::F_REGISTERED, context.id());
 
         // Tombstone check: if discovery already removed the worker, fail fast
         // with a migratable error rather than writing to the request plane.
@@ -908,6 +911,7 @@ impl AddressedPushRouter {
         let tx_start = Instant::now();
         let request_plane_response = self.dispatch_buffer(address, buffer, context.id()).await?;
         REQUEST_PLANE_SEND_SECONDS.observe(tx_start.elapsed().as_secs_f64());
+        crate::stage_probe::mark(crate::stage_probe::F_DISPATCHED, context.id());
 
         // A worker rejection surfaces on the request-plane ACK, not the response
         // stream. Short-circuit before waiting on a response-plane connection the
@@ -976,7 +980,10 @@ impl AddressedPushRouter {
         // RecvError → migratable Disconnected (watcher cancelled the subject
         // or the worker died before establishing the response stream).
         let response_stream = match prologue {
-            Ok(Ok(stream)) => stream,
+            Ok(Ok(stream)) => {
+                crate::stage_probe::mark(crate::stage_probe::F_PROLOGUE, context.id());
+                stream
+            }
             Err(_) | Ok(Err(_)) if engine_ctx.is_stopped() || engine_ctx.is_killed() => {
                 return Ok(ResponseStream::new(
                     Box::pin(futures::stream::empty()),

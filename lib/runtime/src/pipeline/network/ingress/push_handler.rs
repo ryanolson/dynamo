@@ -364,7 +364,11 @@ where
         // TODO: Detect end-of-stream using Server-Sent Events (SSE)
         let mut send_complete_final = true;
         let mut saw_error_response = false;
+        let mut probe_first = true;
         while let Some(resp) = stream.next().await {
+            if probe_first {
+                crate::stage_probe::mark(crate::stage_probe::W_FIRST_FROM_ENGINE, context.id());
+            }
             // Everything inside this range is Dynamo-side egress work for one
             // chunk. The gaps *between* consecutive `worker.egress.chunk` ranges
             // are the engine producing the next token — that split is the whole
@@ -415,6 +419,10 @@ where
             let nvtx_publish = dynamo_nvtx_range!("worker.egress.publish");
             let publish_result = payload.publish(publisher).await;
             drop(nvtx_publish);
+            if probe_first {
+                probe_first = false;
+                crate::stage_probe::mark(crate::stage_probe::W_FIRST_SENT, context.id());
+            }
             if let Err(send_err) = publish_result {
                 send_complete_final = false;
                 if context.is_stopped() {
@@ -868,6 +876,7 @@ where
             Ok(stream) => {
                 tracing::trace!("Successfully generated response stream; sending prologue");
                 let result = publisher.send_prologue(None).await;
+                crate::stage_probe::mark(crate::stage_probe::W_PROLOGUE_SENT, request_context.id());
                 // Marked only on a successful send: the prologue is what tells the
                 // frontend the stream is live, so a marker on the failure path would
                 // put an acknowledgement on the timeline that the frontend never got.
@@ -964,6 +973,9 @@ where
         // Outer band for one request's entire time inside the worker, from wire
         // arrival to terminal frame. Held across awaits, hence a start/end range.
         let _nvtx_request = dynamo_nvtx_range!("worker.ingress.request");
+        if let Some(rid) = &request_id {
+            crate::stage_probe::mark(crate::stage_probe::W_START, rid);
+        }
 
         let t2_wallclock_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1066,6 +1078,7 @@ where
                 })?;
                 drop(nvtx_open);
                 drop(worker_admission);
+                crate::stage_probe::mark(crate::stage_probe::W_OPENED, request.context().id());
                 self.generate_and_publish(
                     request,
                     payload_codec,
@@ -1101,6 +1114,7 @@ where
                     ))
                 })?;
                 drop(worker_admission);
+                crate::stage_probe::mark(crate::stage_probe::W_OPENED, context.id());
                 tokio::select! {
                     biased;
                     _ = context.killed() => return Ok(()),
