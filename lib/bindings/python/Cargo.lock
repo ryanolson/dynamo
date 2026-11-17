@@ -3314,12 +3314,12 @@ dependencies = [
 [[package]]
 name = "gdl"
 version = "0.1.0"
-source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=b8373bcbfe9ef71f8db01a92b925b2bd69f25866#b8373bcbfe9ef71f8db01a92b925b2bd69f25866"
+source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=a2b0d658ef4f6809e9257010396ebe83529b307c#a2b0d658ef4f6809e9257010396ebe83529b307c"
 dependencies = [
  "futures",
  "gdl-macros",
  "gdl-message",
- "gdl-model",
+ "gdl-schema",
  "pin-project-lite",
  "prometheus",
  "rmp-serde",
@@ -3330,12 +3330,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "gdl-attrs"
+version = "0.1.0"
+source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=a2b0d658ef4f6809e9257010396ebe83529b307c#a2b0d658ef4f6809e9257010396ebe83529b307c"
+dependencies = [
+ "gdl-schema",
+ "proc-macro2",
+ "syn 2.0.118",
+]
+
+[[package]]
 name = "gdl-macros"
 version = "0.1.0"
-source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=b8373bcbfe9ef71f8db01a92b925b2bd69f25866#b8373bcbfe9ef71f8db01a92b925b2bd69f25866"
+source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=a2b0d658ef4f6809e9257010396ebe83529b307c#a2b0d658ef4f6809e9257010396ebe83529b307c"
 dependencies = [
- "gdl-model",
- "gdl-syntax",
+ "gdl-attrs",
+ "gdl-schema",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -3344,34 +3354,21 @@ dependencies = [
 [[package]]
 name = "gdl-message"
 version = "0.1.0"
-source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=b8373bcbfe9ef71f8db01a92b925b2bd69f25866#b8373bcbfe9ef71f8db01a92b925b2bd69f25866"
+source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=a2b0d658ef4f6809e9257010396ebe83529b307c#a2b0d658ef4f6809e9257010396ebe83529b307c"
 dependencies = [
  "gdl-macros",
- "gdl-model",
+ "gdl-schema",
  "linkme",
  "serde",
  "toml 0.9.12+spec-1.1.0",
 ]
 
 [[package]]
-name = "gdl-model"
+name = "gdl-schema"
 version = "0.1.0"
-source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=b8373bcbfe9ef71f8db01a92b925b2bd69f25866#b8373bcbfe9ef71f8db01a92b925b2bd69f25866"
+source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=a2b0d658ef4f6809e9257010396ebe83529b307c#a2b0d658ef4f6809e9257010396ebe83529b307c"
 dependencies = [
  "serde",
- "serde_json",
- "serde_path_to_error",
- "toml 0.9.12+spec-1.1.0",
-]
-
-[[package]]
-name = "gdl-syntax"
-version = "0.1.0"
-source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=b8373bcbfe9ef71f8db01a92b925b2bd69f25866#b8373bcbfe9ef71f8db01a92b925b2bd69f25866"
-dependencies = [
- "gdl-model",
- "proc-macro2",
- "syn 2.0.118",
 ]
 
 [[package]]
