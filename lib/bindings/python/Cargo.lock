@@ -3314,7 +3314,7 @@ dependencies = [
 [[package]]
 name = "gdl"
 version = "0.1.0"
-source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=42381494df0c885d2a0c9bd92d76dc5fe056f21b#42381494df0c885d2a0c9bd92d76dc5fe056f21b"
+source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=b5648f3c058bda3f23433fe92fe4165b05778693#b5648f3c058bda3f23433fe92fe4165b05778693"
 dependencies = [
  "arc-swap",
  "futures",
@@ -3334,7 +3334,7 @@ dependencies = [
 [[package]]
 name = "gdl-macros"
 version = "0.1.0"
-source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=42381494df0c885d2a0c9bd92d76dc5fe056f21b#42381494df0c885d2a0c9bd92d76dc5fe056f21b"
+source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=b5648f3c058bda3f23433fe92fe4165b05778693#b5648f3c058bda3f23433fe92fe4165b05778693"
 dependencies = [
  "gdl-model",
  "gdl-syntax",
@@ -3346,7 +3346,7 @@ dependencies = [
 [[package]]
 name = "gdl-message"
 version = "0.1.0"
-source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=42381494df0c885d2a0c9bd92d76dc5fe056f21b#42381494df0c885d2a0c9bd92d76dc5fe056f21b"
+source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=b5648f3c058bda3f23433fe92fe4165b05778693#b5648f3c058bda3f23433fe92fe4165b05778693"
 dependencies = [
  "gdl-macros",
  "gdl-model",
@@ -3358,7 +3358,7 @@ dependencies = [
 [[package]]
 name = "gdl-model"
 version = "0.1.0"
-source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=42381494df0c885d2a0c9bd92d76dc5fe056f21b#42381494df0c885d2a0c9bd92d76dc5fe056f21b"
+source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=b5648f3c058bda3f23433fe92fe4165b05778693#b5648f3c058bda3f23433fe92fe4165b05778693"
 dependencies = [
  "serde",
  "serde_json",
@@ -3369,7 +3369,7 @@ dependencies = [
 [[package]]
 name = "gdl-syntax"
 version = "0.1.0"
-source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=42381494df0c885d2a0c9bd92d76dc5fe056f21b#42381494df0c885d2a0c9bd92d76dc5fe056f21b"
+source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=b5648f3c058bda3f23433fe92fe4165b05778693#b5648f3c058bda3f23433fe92fe4165b05778693"
 dependencies = [
  "gdl-model",
  "proc-macro2",
