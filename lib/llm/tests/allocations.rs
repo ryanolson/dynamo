@@ -57,6 +57,9 @@
 //!
 //! With the same dependencies, Dynamo's linked chains made 23 more allocations on A, 59 on B,
 //! 33 on C and 22 on embeddings. Each difference was the same for one and 16 items.
+//! The earlier switch comparison recorded gaps of 18 on A and 56 on B against its reference.
+//! With the dependency-matched Dynamo reference `11ad043f26`, the port already saved 23 and
+//! 59 before the rebase. Both gaps stayed the same on the new base.
 //!
 //! The rows carry the chat and preprocessed requests boxed (`dynamo_gdl_adapters::Boxed`),
 //! accepted at one allocation per box: `a-gdl` and `b-gdl` +2 (the chat request where it enters
