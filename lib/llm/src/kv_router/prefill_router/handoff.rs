@@ -5,9 +5,10 @@
 
 use std::{future::Future, sync::Arc};
 
+use dynamo_gdl_adapters::EndedItems;
 use dynamo_runtime::{
     error::{DynamoError, ErrorClass},
-    pipeline::{AsyncEngineContext, AsyncEngineContextProvider, ManyOut, ResponseStream},
+    pipeline::{AsyncEngineContext, AsyncEngineContextProvider},
     protocols::{annotated::Annotated, maybe_error::MaybeError},
 };
 use futures::{StreamExt, stream};
@@ -110,11 +111,11 @@ impl PrefillTask {
     /// finishes (`BeforeLast`), or before any decode output (`BeforeFirst`).
     pub(super) async fn forward_decode(
         self,
-        decode: impl Future<Output = anyhow::Result<ManyOut<Annotated<LLMEngineOutput>>>>,
+        decode: impl Future<Output = anyhow::Result<EndedItems<LLMEngineOutput>>>,
         request_context: Arc<dyn AsyncEngineContext>,
         output: PrefillNeed,
         prefill_context: Arc<dyn AsyncEngineContext>,
-    ) -> anyhow::Result<ManyOut<Annotated<LLMEngineOutput>>> {
+    ) -> anyhow::Result<gdl::Ended<Annotated<LLMEngineOutput>>> {
         let emit = output != PrefillNeed::None; // Prefill metadata, not generated tokens.
         let mut completion = Box::pin(self.wait());
         tokio::pin!(decode);
@@ -124,11 +125,10 @@ impl PrefillTask {
                 let prefill = result.inspect_err(|_| request_context.stop_generating())?;
                 let response = decode.await?;
                 if !emit {
-                    return Ok(response);
+                    return Ok(gdl::ended(response));
                 }
-                let context = response.context();
                 let stream = stream::iter(output_item(prefill)).chain(response);
-                return Ok(ResponseStream::new(Box::pin(stream), context));
+                return Ok(gdl::ended::clean(stream));
             }
             result = &mut decode => match result {
                 Ok(response) => response,
@@ -140,8 +140,7 @@ impl PrefillTask {
         };
         // Move the completion future into the response stream. The task itself
         // keeps running if this stream is dropped during client cancellation.
-        let context = response.context();
-        let stream_context = context.clone();
+        let stream_context = response.context();
         let stream = async_stream::stream! {
             if output == PrefillNeed::BeforeFirst {
                 // Admission refusals are the first decode stream item on this path.
@@ -259,7 +258,7 @@ impl PrefillTask {
                 }
             }
         };
-        Ok(ResponseStream::new(Box::pin(stream), context))
+        Ok(gdl::ended::clean(stream))
     }
 }
 
@@ -301,6 +300,34 @@ fn cancel_prefill_on_decode_rejection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operator::testing;
+    use dynamo_gdl_adapters::CxBridge;
+    use dynamo_runtime::pipeline::{ManyOut, ResponseStream};
+
+    impl PrefillTask {
+        /// [`forward_decode`](Self::forward_decode) as the prefill router's native gdl operator
+        /// calls it: `decode` arrives as the gdl downstream reads the stage below, under a `Cx`
+        /// that follows `request_context`, and the response is read as the frontend reads it.
+        pub(crate) async fn forward_decode_on_gdl(
+            self,
+            decode: impl Future<Output = anyhow::Result<ManyOut<Annotated<LLMEngineOutput>>>>,
+            request_context: Arc<dyn AsyncEngineContext>,
+            output: PrefillNeed,
+            prefill_context: Arc<dyn AsyncEngineContext>,
+        ) -> anyhow::Result<ManyOut<Annotated<LLMEngineOutput>>> {
+            let cx = CxBridge::cx(request_context.as_ref());
+            let root = cx.clone();
+            let decode = async move {
+                let decode = decode.await?;
+                let context = decode.context();
+                Ok(EndedItems::new(gdl::ended::clean(decode), root, context))
+            };
+            let response = self
+                .forward_decode(decode, request_context.clone(), output, prefill_context)
+                .await?;
+            Ok(testing::read(response, cx, request_context))
+        }
+    }
     use dynamo_runtime::{
         error::{BackendError, ErrorType},
         pipeline::context::Controller,
@@ -331,7 +358,7 @@ mod tests {
     async fn failure_interrupts_pending_decode_dispatch() {
         let (tx, task) = pending_prefill();
         let context = Arc::new(Controller::default());
-        let mut response = Box::pin(task.forward_decode(
+        let mut response = Box::pin(task.forward_decode_on_gdl(
             std::future::pending(),
             context.clone(),
             PrefillNeed::None,
@@ -354,7 +381,7 @@ mod tests {
         let decode: ManyOut<Annotated<LLMEngineOutput>> =
             ResponseStream::new(Box::pin(stream::pending()), context.clone());
         let mut response = task
-            .forward_decode(
+            .forward_decode_on_gdl(
                 async { Ok(decode) },
                 context.clone(),
                 PrefillNeed::None,
@@ -398,7 +425,7 @@ mod tests {
             context.clone(),
         );
         let mut response = task
-            .forward_decode(
+            .forward_decode_on_gdl(
                 async { Ok(decode) },
                 context.clone(),
                 PrefillNeed::None,
@@ -435,7 +462,7 @@ mod tests {
             context.clone(),
         );
         let mut response = task
-            .forward_decode(
+            .forward_decode_on_gdl(
                 async { Ok(decode) },
                 context,
                 PrefillNeed::None,
@@ -462,7 +489,7 @@ mod tests {
             context.clone(),
         );
         let mut response = task
-            .forward_decode(
+            .forward_decode_on_gdl(
                 async { Ok(decode) },
                 context,
                 PrefillNeed::None,
@@ -496,7 +523,7 @@ mod tests {
             context.clone(),
         );
         let mut response = task
-            .forward_decode(
+            .forward_decode_on_gdl(
                 async { Ok(decode) },
                 context.clone(),
                 PrefillNeed::None,
@@ -528,7 +555,7 @@ mod tests {
         let decode: ManyOut<Annotated<LLMEngineOutput>> =
             ResponseStream::new(Box::pin(stream::pending()), context.clone());
         let response = task
-            .forward_decode(
+            .forward_decode_on_gdl(
                 async { Ok(decode) },
                 context.clone(),
                 PrefillNeed::None,
@@ -567,7 +594,7 @@ mod tests {
             );
             let context = Arc::new(Controller::default());
             let mut response = task
-                .forward_decode(
+                .forward_decode_on_gdl(
                     async { Ok(decode) },
                     context.clone(),
                     PrefillNeed::BeforeFirst,
@@ -601,7 +628,7 @@ mod tests {
         let context = Arc::new(Controller::default());
         let decode: ManyOut<Annotated<LLMEngineOutput>> =
             ResponseStream::new(Box::pin(stream::pending()), context.clone());
-        let response = task.forward_decode(
+        let response = task.forward_decode_on_gdl(
             async { Ok(decode) },
             context.clone(),
             PrefillNeed::BeforeFirst,
@@ -629,7 +656,7 @@ mod tests {
         );
         let context = Arc::new(Controller::default());
         let mut response = task
-            .forward_decode(
+            .forward_decode_on_gdl(
                 async { Ok(decode) },
                 context,
                 PrefillNeed::BeforeLast,
@@ -681,7 +708,7 @@ mod tests {
                 context.clone(),
             );
             let mut response = task
-                .forward_decode(
+                .forward_decode_on_gdl(
                     async { Ok(decode) },
                     context.clone(),
                     PrefillNeed::BeforeFirst,
@@ -732,7 +759,7 @@ mod tests {
         let error = anyhow::Error::new(error).context("decode admission rejected");
         let request_context = Arc::new(Controller::default());
         let result = task
-            .forward_decode(
+            .forward_decode_on_gdl(
                 async { Err(error) },
                 request_context,
                 output,
@@ -778,7 +805,7 @@ mod tests {
             request_context.clone(),
         );
         let mut response = task
-            .forward_decode(
+            .forward_decode_on_gdl(
                 async { Ok(decode) },
                 request_context,
                 output,
@@ -814,7 +841,7 @@ mod tests {
         let request_context = Arc::new(Controller::default());
         let case = format!("{output:?}: {error}");
         let result = task
-            .forward_decode(
+            .forward_decode_on_gdl(
                 async { Err(error) },
                 request_context,
                 output,
@@ -923,6 +950,66 @@ mod tests {
             {
                 assert_decode_error_preserves_prefill(output, error).await;
             }
+        }
+    }
+    /// A kill lands while decode's stream ends cleanly. The handoff still sends prefill's
+    /// output, which reports a prefill that did complete, but nothing that marks the answer
+    /// finished: no `finish_reason` and no error.
+    #[tokio::test]
+    async fn a_kill_as_decode_ends_adds_no_finish() {
+        for output in [
+            PrefillNeed::None,
+            PrefillNeed::BeforeLast,
+            PrefillNeed::BeforeFirst,
+        ] {
+            let (tx, task) = pending_prefill();
+            let context = Arc::new(Controller::default());
+            let killed = context.clone();
+            let decode: ManyOut<Annotated<LLMEngineOutput>> = ResponseStream::new(
+                Box::pin(
+                    stream::iter([Annotated::from_data(LLMEngineOutput {
+                        token_ids: vec![42],
+                        ..Default::default()
+                    })])
+                    .chain(stream::poll_fn(move |_| {
+                        killed.kill();
+                        std::task::Poll::Ready(None)
+                    })),
+                ),
+                context.clone(),
+            );
+            tx.send(Ok(Some(Box::new(serde_json::json!({"prefill": "done"})))))
+                .unwrap();
+            let response = task
+                .forward_decode_on_gdl(
+                    async { Ok(decode) },
+                    context.clone(),
+                    output,
+                    Arc::new(Controller::default()),
+                )
+                .await
+                .unwrap();
+            let items: Vec<_> = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                response.collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+            assert!(context.is_killed());
+            assert!(
+                items.iter().all(|item| item.err().is_none()
+                    && item
+                        .data
+                        .as_ref()
+                        .is_none_or(|data| data.finish_reason.is_none())),
+                "{output:?}: {items:?}"
+            );
+            assert!(
+                items
+                    .iter()
+                    .any(|item| item.data.as_ref().is_some_and(|d| d.token_ids == [42])),
+                "{output:?}: {items:?}"
+            );
         }
     }
 }

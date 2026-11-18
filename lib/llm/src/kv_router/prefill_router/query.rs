@@ -666,7 +666,7 @@ mod tests {
             );
             let request_context = request.context();
             let error = prefill
-                .forward_decode(
+                .forward_decode_on_gdl(
                     decode.router.generate(request),
                     request_context,
                     output,

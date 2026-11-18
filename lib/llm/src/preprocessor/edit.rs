@@ -6,7 +6,8 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use futures::{Stream, StreamExt};
+use futures::Stream;
+use pin_project_lite::pin_project;
 
 /// `stream`, with `edit` applied to each item through `&mut`.
 ///
@@ -15,30 +16,33 @@ use futures::{Stream, StreamExt};
 /// per item. Here the item is edited in the value the stream below returned.
 pub(super) fn edit_items<S, F>(stream: S, edit: F) -> EditItems<S, F>
 where
-    S: Stream + Unpin,
+    S: Stream,
     F: FnMut(&mut S::Item),
 {
     EditItems { stream, edit }
 }
 
-/// The stream of [`edit_items`].
-pub(super) struct EditItems<S, F> {
-    stream: S,
-    edit: F,
+pin_project! {
+    /// The stream of [`edit_items`].
+    pub(super) struct EditItems<S, F> {
+        #[pin]
+        stream: S,
+        edit: F,
+    }
 }
 
 impl<S, F> Stream for EditItems<S, F>
 where
-    S: Stream + Unpin,
-    F: FnMut(&mut S::Item) + Unpin,
+    S: Stream,
+    F: FnMut(&mut S::Item),
 {
     type Item = S::Item;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<S::Item>> {
-        let this = &mut *self;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<S::Item>> {
+        let this = self.project();
         // Edit the item inside the `Poll` the stream below returned, and return that same
         // value: taking the item out of it and wrapping it again would move it twice more.
-        let mut poll = this.stream.poll_next_unpin(cx);
+        let mut poll = this.stream.poll_next(cx);
         if let Poll::Ready(Some(item)) = &mut poll {
             (this.edit)(item);
         }

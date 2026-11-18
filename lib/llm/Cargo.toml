@@ -73,6 +73,7 @@ required-features = ["media-ffmpeg"]
 [dependencies]
 dynamo-router-policies = { workspace = true }
 # repo
+dynamo-gdl-adapters = { workspace = true }
 dynamo-global-discovery-client = { workspace = true }
 dynamo-admission = { workspace = true }
 dynamo-global-common = { workspace = true, features = ["grpc"] }
@@ -93,6 +94,7 @@ dynamo-mocker = { workspace = true, features = ["zmq-events"] }
 dynamo-rl = { workspace = true }
 dynamo-runtime = { workspace = true }
 dynamo-tokenizers = { workspace = true }
+gdl = { workspace = true }
 dynamo-renderer = { workspace = true }
 dynamo-tokens = { workspace = true }
 
@@ -124,6 +126,7 @@ moka = { workspace = true }
 oneshot = { workspace = true }
 parking_lot = { workspace = true }
 percent-encoding = "2.3.2"
+pin-project-lite = { workspace = true }
 prometheus = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
@@ -299,3 +302,11 @@ tonic-build = { version = "0.13.1" }
 name = "bench_local_transfer_v2"
 path = "bin/bench_local_transfer_v2.rs"
 required-features = ["block-manager-bench"]
+
+[[test]]
+name = "allocations"
+harness = false
+
+[[test]]
+name = "routing_allocations"
+harness = false

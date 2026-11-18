@@ -944,7 +944,7 @@ class DynamoFrontendProcess(ManagedProcess):
         migration_limit: int = 0,
         migration_max_seq_len: Optional[int] = None,
         extra_args: Optional[list[str]] = None,
-        extra_env: Optional[dict[str, str]] = None,
+        extra_env: Optional[dict[str, Optional[str]]] = None,
         # Default to false so pytest-xdist workers don't kill each other's frontends.
         terminate_all_matching_process_names: bool = False,
         display_name: Optional[str] = None,
@@ -982,8 +982,12 @@ class DynamoFrontendProcess(ManagedProcess):
         # Unset DYN_SYSTEM_PORT - frontend doesn't use system metrics server
         env = os.environ.copy()
         env.pop("DYN_SYSTEM_PORT", None)
-        if extra_env:
-            env.update(extra_env)
+        # A None value removes the variable, so an inherited value cannot leak in.
+        for name, value in (extra_env or {}).items():
+            if value is None:
+                env.pop(name, None)
+            else:
+                env[name] = value
 
         log_dir = f"{request.node.name}_frontend"
 

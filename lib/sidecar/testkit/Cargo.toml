@@ -40,6 +40,8 @@ tonic-health-v14 = { workspace = true }
 serde_json = { workspace = true }
 dynamo-runtime = { workspace = true }
 dynamo-llm = { workspace = true }
+dynamo-gdl-adapters = { workspace = true }
+gdl = { workspace = true }
 tempfile = { workspace = true }
 tokio-util = { workspace = true }
 libc = { workspace = true }

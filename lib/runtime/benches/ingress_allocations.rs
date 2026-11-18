@@ -30,6 +30,8 @@ use dynamo_runtime::{
     protocols::annotated::Annotated,
 };
 
+#[path = "../tests/common/callgrind.rs"]
+mod callgrind;
 #[path = "../tests/common/ingress.rs"]
 mod ingress;
 use ingress::{request_payload, start_response_peer};
@@ -128,7 +130,7 @@ async fn measure_one(ingress: &dyn PushWorkHandler, payload: Bytes, id: String) 
 /// Prints the per-request allocations and bytes after warm-up, as the range over
 /// the measured requests.
 async fn report(items: usize) {
-    let address = start_response_peer();
+    let address = start_response_peer().address;
     let ingress = Ingress::for_engine(Arc::new(EchoEngine { items })).unwrap();
     let mut counts = Vec::with_capacity(MEASURED_REQUESTS);
     for n in 0..WARMUP_REQUESTS + MEASURED_REQUESTS {

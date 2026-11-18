@@ -1,0 +1,1535 @@
+{
+  "a_stop_string_stops_the_terminal_and_ends_the_stream_both_ways": {
+    "items": [
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " The",
+                "role": "assistant"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " fo"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "x"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " crossed"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " the"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " "
+              },
+              "finish_reason": "stop",
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "event": "llm_metrics",
+        "comment": [
+          "{\"input_tokens\":19,\"output_tokens\":6,\"chunk_tokens\":0,\"cached_tokens\":null,\"tokenize_latency\":0,\"detokenize_total_latency\":0,\"detokenize_count\":6}"
+        ]
+      }
+    ]
+  },
+  "backend_detokenizes_the_same_both_ways": {
+    "items": [
+      {
+        "data": {
+          "token_ids": [
+            450
+          ],
+          "tokens": [
+            null
+          ],
+          "text": " The",
+          "cum_log_probs": null,
+          "log_probs": null,
+          "top_logprobs": null,
+          "finish_reason": null,
+          "index": null
+        }
+      },
+      {
+        "data": {
+          "token_ids": [
+            1701
+          ],
+          "tokens": [
+            null
+          ],
+          "text": " fo",
+          "cum_log_probs": null,
+          "log_probs": null,
+          "top_logprobs": null,
+          "finish_reason": null,
+          "index": null
+        }
+      },
+      {
+        "data": {
+          "token_ids": [
+            29916
+          ],
+          "tokens": [
+            null
+          ],
+          "text": "x",
+          "cum_log_probs": null,
+          "log_probs": null,
+          "top_logprobs": null,
+          "finish_reason": null,
+          "index": null
+        }
+      },
+      {
+        "data": {
+          "token_ids": [
+            21692
+          ],
+          "tokens": [
+            null
+          ],
+          "text": " crossed",
+          "cum_log_probs": null,
+          "log_probs": null,
+          "top_logprobs": null,
+          "finish_reason": null,
+          "index": null
+        }
+      },
+      {
+        "data": {
+          "token_ids": [
+            278
+          ],
+          "tokens": [
+            null
+          ],
+          "text": " the",
+          "cum_log_probs": null,
+          "log_probs": null,
+          "top_logprobs": null,
+          "finish_reason": null,
+          "index": null
+        }
+      },
+      {
+        "data": {
+          "token_ids": [
+            8580
+          ],
+          "tokens": [
+            null
+          ],
+          "text": " river",
+          "cum_log_probs": null,
+          "log_probs": null,
+          "top_logprobs": null,
+          "finish_reason": null,
+          "index": null
+        }
+      },
+      {
+        "data": {
+          "token_ids": [
+            472
+          ],
+          "tokens": [
+            null
+          ],
+          "text": " at",
+          "cum_log_probs": null,
+          "log_probs": null,
+          "top_logprobs": null,
+          "finish_reason": null,
+          "index": null
+        }
+      },
+      {
+        "data": {
+          "token_ids": [
+            27470
+          ],
+          "tokens": [
+            null
+          ],
+          "text": " dawn",
+          "cum_log_probs": null,
+          "log_probs": null,
+          "top_logprobs": null,
+          "finish_reason": null,
+          "index": null
+        }
+      },
+      {
+        "data": {
+          "token_ids": [
+            29889
+          ],
+          "tokens": [
+            null
+          ],
+          "text": ".",
+          "cum_log_probs": null,
+          "log_probs": null,
+          "top_logprobs": null,
+          "finish_reason": "stop",
+          "index": null
+        }
+      }
+    ]
+  },
+  "backend_passes_an_error_item_on_the_same_both_ways": {
+    "items": [
+      {
+        "data": {
+          "token_ids": [
+            450
+          ],
+          "tokens": [
+            null
+          ],
+          "text": " The",
+          "cum_log_probs": null,
+          "log_probs": null,
+          "top_logprobs": null,
+          "finish_reason": null,
+          "index": null
+        }
+      },
+      {
+        "data": {
+          "token_ids": [
+            1701
+          ],
+          "tokens": [
+            null
+          ],
+          "text": " fo",
+          "cum_log_probs": null,
+          "log_probs": null,
+          "top_logprobs": null,
+          "finish_reason": null,
+          "index": null
+        }
+      },
+      {
+        "data": {
+          "token_ids": [
+            29916
+          ],
+          "tokens": [
+            null
+          ],
+          "text": "x",
+          "cum_log_probs": null,
+          "log_probs": null,
+          "top_logprobs": null,
+          "finish_reason": null,
+          "index": null
+        }
+      },
+      {
+        "event": "error",
+        "error": {
+          "error_type": "Unknown",
+          "class": "Internal",
+          "reason": "runtime.internal",
+          "message": "worker went away",
+          "diagnostic": "worker went away"
+        }
+      }
+    ]
+  },
+  "backend_returns_the_terminals_eager_error_both_ways": {
+    "debug": "(Some(Unavailable), \"Unavailable: prefill routing is still activating\")"
+  },
+  "backend_stops_the_terminal_on_a_text_only_output_both_ways": {
+    "items": [
+      {
+        "event": "error",
+        "error": {
+          "error_type": "Unknown",
+          "class": "BackendProtocol",
+          "reason": "backend.protocol",
+          "message": "no_stop_trim requires backend token IDs through the matched stop; the backend omitted them (also required when a parser retains the model's stop token text)",
+          "diagnostic": "no_stop_trim requires backend token IDs through the matched stop; the backend omitted them (also required when a parser retains the model's stop token text)"
+        }
+      }
+    ]
+  },
+  "chat_is_the_same_both_ways": {
+    "items {}": [
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " The",
+                "role": "assistant"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " fo"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "x"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " crossed"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " the"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " river"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " at"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " dawn"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "."
+              },
+              "finish_reason": "stop",
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "event": "llm_metrics",
+        "comment": [
+          "{\"input_tokens\":19,\"output_tokens\":9,\"chunk_tokens\":0,\"cached_tokens\":null,\"tokenize_latency\":0,\"detokenize_total_latency\":0,\"detokenize_count\":9}"
+        ]
+      }
+    ],
+    "items {\"stream_options\":{\"include_usage\":true}}": [
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " The",
+                "role": "assistant"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " fo"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "x"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " crossed"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " the"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " river"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " at"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " dawn"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "."
+              },
+              "finish_reason": "stop",
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk",
+          "usage": {
+            "prompt_tokens": 19,
+            "completion_tokens": 9,
+            "total_tokens": 28
+          }
+        }
+      }
+    ],
+    "items {\"stream\":false}": [
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " The",
+                "role": "assistant"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " fo"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "x"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " crossed"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " the"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " river"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " at"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " dawn"
+              },
+              "finish_reason": null,
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "."
+              },
+              "finish_reason": "stop",
+              "logprobs": null
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk"
+        }
+      },
+      {
+        "data": {
+          "id": "chatcmpl-req-1",
+          "choices": [],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "object": "chat.completion.chunk",
+          "usage": {
+            "prompt_tokens": 19,
+            "completion_tokens": 9,
+            "total_tokens": 28
+          }
+        }
+      }
+    ],
+    "debug": "[(\"req-1\", Some(\"a\"), [529, 29989, 1792, 29989, 29958, 13, 6113, 697, 10541, 1048, 263, 1701, 29916, 19423, 29989, 355, 29989, 29958, 13]), (\"req-1\", Some(\"a\"), [529, 29989, 1792, 29989, 29958, 13, 6113, 697, 10541, 1048, 263, 1701, 29916, 19423, 29989, 355, 29989, 29958, 13]), (\"req-1\", Some(\"a\"), [529, 29989, 1792, 29989, 29958, 13, 6113, 697, 10541, 1048, 263, 1701, 29916, 19423, 29989, 355, 29989, 29958, 13])]"
+  },
+  "chat_rejects_an_invalid_request_before_dispatch_both_ways": {
+    "debug": "(Some(InvalidArgument), \"Failed to gather tokens: InvalidRequest: nvext.token_data token id 4000000 is out of range (must be < 32000)\")"
+  },
+  "completions_are_the_same_both_ways": {
+    "items {}": [
+      {
+        "data": {
+          "id": "cmpl-req-1",
+          "choices": [
+            {
+              "text": " ",
+              "index": 0
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "system_fingerprint": null,
+          "object": "text_completion",
+          "usage": null
+        },
+        "event": "llm_metrics",
+        "comment": [
+          "{\"input_tokens\":3,\"output_tokens\":1,\"chunk_tokens\":1,\"cached_tokens\":null,\"tokenize_latency\":0,\"detokenize_total_latency\":0,\"detokenize_count\":1}"
+        ]
+      },
+      {
+        "data": {
+          "id": "cmpl-req-1",
+          "choices": [
+            {
+              "text": " crossed",
+              "index": 0
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "system_fingerprint": null,
+          "object": "text_completion",
+          "usage": null
+        },
+        "event": "llm_metrics",
+        "comment": [
+          "{\"input_tokens\":3,\"output_tokens\":2,\"chunk_tokens\":1,\"cached_tokens\":null,\"tokenize_latency\":0,\"detokenize_total_latency\":0,\"detokenize_count\":2}"
+        ]
+      },
+      {
+        "data": {
+          "id": "cmpl-req-1",
+          "choices": [
+            {
+              "text": " the",
+              "index": 0
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "system_fingerprint": null,
+          "object": "text_completion",
+          "usage": null
+        },
+        "event": "llm_metrics",
+        "comment": [
+          "{\"input_tokens\":3,\"output_tokens\":3,\"chunk_tokens\":1,\"cached_tokens\":null,\"tokenize_latency\":0,\"detokenize_total_latency\":0,\"detokenize_count\":3}"
+        ]
+      },
+      {
+        "data": {
+          "id": "cmpl-req-1",
+          "choices": [
+            {
+              "text": " river",
+              "index": 0
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "system_fingerprint": null,
+          "object": "text_completion",
+          "usage": null
+        },
+        "event": "llm_metrics",
+        "comment": [
+          "{\"input_tokens\":3,\"output_tokens\":4,\"chunk_tokens\":1,\"cached_tokens\":null,\"tokenize_latency\":0,\"detokenize_total_latency\":0,\"detokenize_count\":4}"
+        ]
+      },
+      {
+        "data": {
+          "id": "cmpl-req-1",
+          "choices": [
+            {
+              "text": " at",
+              "index": 0
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "system_fingerprint": null,
+          "object": "text_completion",
+          "usage": null
+        },
+        "event": "llm_metrics",
+        "comment": [
+          "{\"input_tokens\":3,\"output_tokens\":5,\"chunk_tokens\":1,\"cached_tokens\":null,\"tokenize_latency\":0,\"detokenize_total_latency\":0,\"detokenize_count\":5}"
+        ]
+      },
+      {
+        "data": {
+          "id": "cmpl-req-1",
+          "choices": [
+            {
+              "text": " dawn",
+              "index": 0
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "system_fingerprint": null,
+          "object": "text_completion",
+          "usage": null
+        },
+        "event": "llm_metrics",
+        "comment": [
+          "{\"input_tokens\":3,\"output_tokens\":6,\"chunk_tokens\":1,\"cached_tokens\":null,\"tokenize_latency\":0,\"detokenize_total_latency\":0,\"detokenize_count\":6}"
+        ]
+      },
+      {
+        "data": {
+          "id": "cmpl-req-1",
+          "choices": [
+            {
+              "text": ".",
+              "index": 0,
+              "finish_reason": "stop"
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "system_fingerprint": null,
+          "object": "text_completion",
+          "usage": null
+        },
+        "event": "llm_metrics",
+        "comment": [
+          "{\"input_tokens\":3,\"output_tokens\":7,\"chunk_tokens\":1,\"cached_tokens\":null,\"tokenize_latency\":0,\"detokenize_total_latency\":0,\"detokenize_count\":7}"
+        ]
+      },
+      {
+        "event": "llm_metrics",
+        "comment": [
+          "{\"input_tokens\":3,\"output_tokens\":7,\"chunk_tokens\":0,\"cached_tokens\":null,\"tokenize_latency\":0,\"detokenize_total_latency\":0,\"detokenize_count\":7}"
+        ]
+      }
+    ],
+    "items {\"echo\":true}": [
+      {
+        "data": {
+          "id": "cmpl-req-1",
+          "choices": [
+            {
+              "text": " ",
+              "index": 0
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "system_fingerprint": null,
+          "object": "text_completion",
+          "usage": null
+        },
+        "event": "llm_metrics",
+        "comment": [
+          "{\"input_tokens\":3,\"output_tokens\":1,\"chunk_tokens\":1,\"cached_tokens\":null,\"tokenize_latency\":0,\"detokenize_total_latency\":0,\"detokenize_count\":1}"
+        ]
+      },
+      {
+        "data": {
+          "id": "cmpl-req-1",
+          "choices": [
+            {
+              "text": " crossed",
+              "index": 0
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "system_fingerprint": null,
+          "object": "text_completion",
+          "usage": null
+        },
+        "event": "llm_metrics",
+        "comment": [
+          "{\"input_tokens\":3,\"output_tokens\":2,\"chunk_tokens\":1,\"cached_tokens\":null,\"tokenize_latency\":0,\"detokenize_total_latency\":0,\"detokenize_count\":2}"
+        ]
+      },
+      {
+        "data": {
+          "id": "cmpl-req-1",
+          "choices": [
+            {
+              "text": " the",
+              "index": 0
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "system_fingerprint": null,
+          "object": "text_completion",
+          "usage": null
+        },
+        "event": "llm_metrics",
+        "comment": [
+          "{\"input_tokens\":3,\"output_tokens\":3,\"chunk_tokens\":1,\"cached_tokens\":null,\"tokenize_latency\":0,\"detokenize_total_latency\":0,\"detokenize_count\":3}"
+        ]
+      },
+      {
+        "data": {
+          "id": "cmpl-req-1",
+          "choices": [
+            {
+              "text": " river",
+              "index": 0
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "system_fingerprint": null,
+          "object": "text_completion",
+          "usage": null
+        },
+        "event": "llm_metrics",
+        "comment": [
+          "{\"input_tokens\":3,\"output_tokens\":4,\"chunk_tokens\":1,\"cached_tokens\":null,\"tokenize_latency\":0,\"detokenize_total_latency\":0,\"detokenize_count\":4}"
+        ]
+      },
+      {
+        "data": {
+          "id": "cmpl-req-1",
+          "choices": [
+            {
+              "text": " at",
+              "index": 0
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "system_fingerprint": null,
+          "object": "text_completion",
+          "usage": null
+        },
+        "event": "llm_metrics",
+        "comment": [
+          "{\"input_tokens\":3,\"output_tokens\":5,\"chunk_tokens\":1,\"cached_tokens\":null,\"tokenize_latency\":0,\"detokenize_total_latency\":0,\"detokenize_count\":5}"
+        ]
+      },
+      {
+        "data": {
+          "id": "cmpl-req-1",
+          "choices": [
+            {
+              "text": " dawn",
+              "index": 0
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "system_fingerprint": null,
+          "object": "text_completion",
+          "usage": null
+        },
+        "event": "llm_metrics",
+        "comment": [
+          "{\"input_tokens\":3,\"output_tokens\":6,\"chunk_tokens\":1,\"cached_tokens\":null,\"tokenize_latency\":0,\"detokenize_total_latency\":0,\"detokenize_count\":6}"
+        ]
+      },
+      {
+        "data": {
+          "id": "cmpl-req-1",
+          "choices": [
+            {
+              "text": ".",
+              "index": 0,
+              "finish_reason": "stop"
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "system_fingerprint": null,
+          "object": "text_completion",
+          "usage": null
+        },
+        "event": "llm_metrics",
+        "comment": [
+          "{\"input_tokens\":3,\"output_tokens\":7,\"chunk_tokens\":1,\"cached_tokens\":null,\"tokenize_latency\":0,\"detokenize_total_latency\":0,\"detokenize_count\":7}"
+        ]
+      },
+      {
+        "event": "llm_metrics",
+        "comment": [
+          "{\"input_tokens\":3,\"output_tokens\":7,\"chunk_tokens\":0,\"cached_tokens\":null,\"tokenize_latency\":0,\"detokenize_total_latency\":0,\"detokenize_count\":7}"
+        ]
+      }
+    ],
+    "items {\"stream\":false}": [
+      {
+        "data": {
+          "id": "cmpl-req-1",
+          "choices": [
+            {
+              "text": " ",
+              "index": 0
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "system_fingerprint": null,
+          "object": "text_completion",
+          "usage": null
+        },
+        "event": "llm_metrics",
+        "comment": [
+          "{\"input_tokens\":3,\"output_tokens\":1,\"chunk_tokens\":1,\"cached_tokens\":null,\"tokenize_latency\":0,\"detokenize_total_latency\":0,\"detokenize_count\":1}"
+        ]
+      },
+      {
+        "data": {
+          "id": "cmpl-req-1",
+          "choices": [
+            {
+              "text": " crossed",
+              "index": 0
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "system_fingerprint": null,
+          "object": "text_completion",
+          "usage": null
+        },
+        "event": "llm_metrics",
+        "comment": [
+          "{\"input_tokens\":3,\"output_tokens\":2,\"chunk_tokens\":1,\"cached_tokens\":null,\"tokenize_latency\":0,\"detokenize_total_latency\":0,\"detokenize_count\":2}"
+        ]
+      },
+      {
+        "data": {
+          "id": "cmpl-req-1",
+          "choices": [
+            {
+              "text": " the",
+              "index": 0
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "system_fingerprint": null,
+          "object": "text_completion",
+          "usage": null
+        },
+        "event": "llm_metrics",
+        "comment": [
+          "{\"input_tokens\":3,\"output_tokens\":3,\"chunk_tokens\":1,\"cached_tokens\":null,\"tokenize_latency\":0,\"detokenize_total_latency\":0,\"detokenize_count\":3}"
+        ]
+      },
+      {
+        "data": {
+          "id": "cmpl-req-1",
+          "choices": [
+            {
+              "text": " river",
+              "index": 0
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "system_fingerprint": null,
+          "object": "text_completion",
+          "usage": null
+        },
+        "event": "llm_metrics",
+        "comment": [
+          "{\"input_tokens\":3,\"output_tokens\":4,\"chunk_tokens\":1,\"cached_tokens\":null,\"tokenize_latency\":0,\"detokenize_total_latency\":0,\"detokenize_count\":4}"
+        ]
+      },
+      {
+        "data": {
+          "id": "cmpl-req-1",
+          "choices": [
+            {
+              "text": " at",
+              "index": 0
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "system_fingerprint": null,
+          "object": "text_completion",
+          "usage": null
+        },
+        "event": "llm_metrics",
+        "comment": [
+          "{\"input_tokens\":3,\"output_tokens\":5,\"chunk_tokens\":1,\"cached_tokens\":null,\"tokenize_latency\":0,\"detokenize_total_latency\":0,\"detokenize_count\":5}"
+        ]
+      },
+      {
+        "data": {
+          "id": "cmpl-req-1",
+          "choices": [
+            {
+              "text": " dawn",
+              "index": 0
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "system_fingerprint": null,
+          "object": "text_completion",
+          "usage": null
+        },
+        "event": "llm_metrics",
+        "comment": [
+          "{\"input_tokens\":3,\"output_tokens\":6,\"chunk_tokens\":1,\"cached_tokens\":null,\"tokenize_latency\":0,\"detokenize_total_latency\":0,\"detokenize_count\":6}"
+        ]
+      },
+      {
+        "data": {
+          "id": "cmpl-req-1",
+          "choices": [
+            {
+              "text": ".",
+              "index": 0,
+              "finish_reason": "stop"
+            }
+          ],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "system_fingerprint": null,
+          "object": "text_completion",
+          "usage": null
+        },
+        "event": "llm_metrics",
+        "comment": [
+          "{\"input_tokens\":3,\"output_tokens\":7,\"chunk_tokens\":1,\"cached_tokens\":null,\"tokenize_latency\":0,\"detokenize_total_latency\":0,\"detokenize_count\":7}"
+        ]
+      },
+      {
+        "data": {
+          "id": "cmpl-req-1",
+          "choices": [],
+          "created": 0,
+          "model": "TinyLlama_v1.1",
+          "system_fingerprint": null,
+          "object": "text_completion",
+          "usage": {
+            "prompt_tokens": 3,
+            "completion_tokens": 7,
+            "total_tokens": 10
+          }
+        },
+        "event": "llm_metrics",
+        "comment": [
+          "{\"input_tokens\":3,\"output_tokens\":7,\"chunk_tokens\":0,\"cached_tokens\":null,\"tokenize_latency\":0,\"detokenize_total_latency\":0,\"detokenize_count\":7}"
+        ]
+      }
+    ]
+  },
+  "embeddings_are_the_same_both_ways": {
+    "items \"float\"": [
+      {
+        "data": {
+          "object": "list",
+          "model": "TinyLlama_v1.1",
+          "data": [
+            {
+              "index": 0,
+              "object": "embedding",
+              "embedding": [
+                0.0,
+                0.125,
+                0.25,
+                0.375,
+                0.5,
+                0.625,
+                0.75,
+                0.875
+              ]
+            },
+            {
+              "index": 1,
+              "object": "embedding",
+              "embedding": [
+                0.0,
+                0.125,
+                0.25,
+                0.375,
+                0.5,
+                0.625,
+                0.75,
+                0.875
+              ]
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 9,
+            "total_tokens": 9
+          }
+        }
+      }
+    ],
+    "items \"base64\"": [
+      {
+        "data": {
+          "object": "list",
+          "model": "TinyLlama_v1.1",
+          "data": [
+            {
+              "index": 0,
+              "object": "embedding",
+              "embedding": "AAAAAAAAAD4AAIA+AADAPgAAAD8AACA/AABAPwAAYD8="
+            },
+            {
+              "index": 1,
+              "object": "embedding",
+              "embedding": "AAAAAAAAAD4AAIA+AADAPgAAAD8AACA/AABAPwAAYD8="
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 9,
+            "total_tokens": 9
+          }
+        }
+      }
+    ]
+  },
+  "invalid_tools_fail_before_an_eager_error_below_both_ways": {
+    "debug": "(Some(InvalidArgument), \"InvalidRequest: tools array cannot be empty; omit the field entirely to disable tool use\")"
+  },
+  "migration_retries_a_stream_error_the_same_both_ways": {
+    "items": [
+      {
+        "data": {
+          "token_ids": [
+            450
+          ]
+        }
+      },
+      {
+        "data": {
+          "token_ids": [
+            1701
+          ]
+        }
+      },
+      {
+        "data": {
+          "token_ids": [
+            29916
+          ]
+        }
+      },
+      {
+        "data": {
+          "token_ids": [
+            21692
+          ]
+        }
+      },
+      {
+        "data": {
+          "token_ids": [
+            278
+          ]
+        }
+      },
+      {
+        "data": {
+          "token_ids": [
+            8580
+          ]
+        }
+      },
+      {
+        "data": {
+          "token_ids": [
+            29889
+          ],
+          "finish_reason": "stop"
+        }
+      }
+    ],
+    "debug": "[(\"req-1\", Some(\"a\"), None, [319, 1701, 29916, 491, 278, 8580], Some(32)), (\"req-1\", Some(\"a\"), None, [319, 1701, 29916, 491, 278, 8580, 450, 1701, 29916], Some(29))]"
+  },
+  "migration_retries_an_eager_worker_unavailable_the_same_both_ways": {
+    "items": [
+      {
+        "data": {
+          "token_ids": [
+            450
+          ]
+        }
+      },
+      {
+        "data": {
+          "token_ids": [
+            1701
+          ]
+        }
+      },
+      {
+        "data": {
+          "token_ids": [
+            29916
+          ],
+          "finish_reason": "stop"
+        }
+      }
+    ],
+    "debug": "[(\"req-1\", Some(\"a\"), Some(\"session-123\"), [319, 1701, 29916, 491, 278, 8580], Some(32)), (\"req-1\", Some(\"a\"), Some(\"session-123\"), [319, 1701, 29916, 491, 278, 8580], Some(32))]"
+  },
+  "the_routers_pass_a_request_through_the_same_both_ways": {
+    "items": [
+      {
+        "data": {
+          "token_ids": [
+            450
+          ]
+        }
+      },
+      {
+        "event": "error",
+        "error": {
+          "error_type": "Unknown",
+          "class": "Internal",
+          "reason": "runtime.internal",
+          "message": "a worker error item",
+          "diagnostic": "a worker error item"
+        }
+      },
+      {
+        "data": {
+          "token_ids": [
+            1701
+          ]
+        }
+      },
+      {
+        "data": {
+          "token_ids": [
+            29916
+          ],
+          "finish_reason": "stop"
+        }
+      }
+    ],
+    "debug": "[(\"req-1\", Some(\"a\"), Some(\"session-123\"), [319, 1701, 29916, 491, 278, 8580], Some(32))]"
+  }
+}

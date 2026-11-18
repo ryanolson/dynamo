@@ -2081,6 +2081,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dynamo-gdl-adapters"
+version = "1.8.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "dynamo-runtime",
+ "futures",
+ "gdl",
+ "tokio",
+]
+
+[[package]]
 name = "dynamo-global-common"
 version = "1.8.0"
 dependencies = [
@@ -2246,6 +2258,7 @@ dependencies = [
  "dialoguer",
  "dynamo-admission",
  "dynamo-decisions",
+ "dynamo-gdl-adapters",
  "dynamo-global-common",
  "dynamo-global-discovery-client",
  "dynamo-global-view-broadcaster",
@@ -2276,6 +2289,7 @@ dependencies = [
  "futures",
  "futures-util",
  "galil-seiferas",
+ "gdl",
  "half",
  "hf-hub",
  "http-body 1.0.1",
@@ -2303,6 +2317,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "percent-encoding",
+ "pin-project-lite",
  "prometheus",
  "prost 0.13.5",
  "rand 0.9.4",
@@ -3320,6 +3335,66 @@ checksum = "794ac25cfda3fa11d2b07ff8c65889c6c03411646df54e59e606878d899e1d5a"
 dependencies = [
  "defmac",
  "unchecked-index",
+]
+
+[[package]]
+name = "gdl"
+version = "0.1.0"
+source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=097717294468cb10245b609871f9da028ade92ae#097717294468cb10245b609871f9da028ade92ae"
+dependencies = [
+ "futures",
+ "gdl-macros",
+ "gdl-message",
+ "gdl-schema",
+ "pin-project-lite",
+ "prometheus",
+ "rmp-serde",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "gdl-attrs"
+version = "0.1.0"
+source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=097717294468cb10245b609871f9da028ade92ae#097717294468cb10245b609871f9da028ade92ae"
+dependencies = [
+ "gdl-schema",
+ "proc-macro2",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "gdl-macros"
+version = "0.1.0"
+source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=097717294468cb10245b609871f9da028ade92ae#097717294468cb10245b609871f9da028ade92ae"
+dependencies = [
+ "gdl-attrs",
+ "gdl-schema",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "gdl-message"
+version = "0.1.0"
+source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=097717294468cb10245b609871f9da028ade92ae#097717294468cb10245b609871f9da028ade92ae"
+dependencies = [
+ "gdl-macros",
+ "gdl-schema",
+ "linkme",
+ "serde",
+ "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
+name = "gdl-schema"
+version = "0.1.0"
+source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=097717294468cb10245b609871f9da028ade92ae#097717294468cb10245b609871f9da028ade92ae"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -4760,6 +4835,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f02ab6bace2054fb888a3c16f990117b579d14a3088e472d63c6011fa185c9d3"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "linkme"
+version = "0.3.38"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a4e12fd3f6b22d5bc28beccac0f53bb35db4a897c6ddb709c4a0161f72eb6e"
+dependencies = [
+ "linkme-impl",
+]
+
+[[package]]
+name = "linkme-impl"
+version = "0.3.38"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22cd04c256b1cd686a45898c8fd150c79b801d96a3eb7bae1075f9eb3b4b85c1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -8543,6 +8638,21 @@ dependencies = [
 
 [[package]]
 name = "toml"
+version = "0.9.12+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf92845e79fc2e2def6a5d828f0801e29a2f8acc037becc5ab08595c7d5e9863"
+dependencies = [
+ "indexmap 2.14.0",
+ "serde_core",
+ "serde_spanned 1.1.1",
+ "toml_datetime 0.7.5+spec-1.1.0",
+ "toml_parser",
+ "toml_writer",
+ "winnow 0.7.15",
+]
+
+[[package]]
+name = "toml"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81f3d15e84cbcd896376e6730314d59fb5a87f31e4b038454184435cd57defee"
@@ -8561,6 +8671,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22cddaf88f4fbc13c51aebbf5f8eceb5c7c5a9da2ac40a13519eb5b0a0e8f11c"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "toml_datetime"
+version = "0.7.5+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92e1cfed4a3038bc5a127e35a2d360f145e1f4b971b551a2ba5fd7aedf7e1347"
+dependencies = [
+ "serde_core",
 ]
 
 [[package]]
@@ -8600,6 +8719,12 @@ name = "toml_write"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
+
+[[package]]
+name = "toml_writer"
+version = "1.2.0+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "009dbb7700f11c55ef83aebbe4c0e9cf1f1ac0844bd8d6f00dc38f302026e13a"
 
 [[package]]
 name = "tonic"

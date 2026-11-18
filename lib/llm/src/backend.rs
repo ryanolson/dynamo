@@ -17,6 +17,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     pin::Pin,
     sync::Arc,
     task::{Context as TaskContext, Poll, ready},
@@ -27,13 +28,12 @@ use anyhow::Result;
 use futures::stream::{Stream, StreamExt};
 
 use crate::model_card::ModelDeploymentCard;
+use crate::operator::{GdlOperator, gdl_error};
+use dynamo_gdl_adapters::{Boxed, CutShort, EndedItems};
 use dynamo_runtime::dynamo_nvtx_range;
 use dynamo_runtime::{
     error::{DynamoError, ErrorClass},
-    pipeline::{
-        AsyncEngineContextProvider, ManyOut, Operator, ResponseStream, ServerStreamingEngine,
-        SingleIn, async_trait,
-    },
+    pipeline::{AsyncEngineContext, AsyncEngineContextProvider, ServerStreamingEngine},
     protocols::{annotated::Annotated, maybe_error::MaybeError},
 };
 
@@ -42,10 +42,9 @@ use crate::protocols::{
     common::{
         StopConditions,
         llm_backend::{
-            BackendOutput, DecoderCheckpoint, EmbeddingsEngineOutput, FinishReason,
-            LLMEngineOutput, PreprocessedRequest, TopLogprobs,
+            BackendOutput, DecoderCheckpoint, FinishReason, LLMEngineOutput, PreprocessedRequest,
+            TopLogprobs,
         },
-        preprocessor::PreprocessedEmbeddingRequest,
         timing::RequestTracker,
     },
 };
@@ -69,6 +68,7 @@ pub struct Backend {
 /// Supports n>1 (multiple choices) by maintaining per-choice decoders.
 #[allow(dead_code)]
 struct DecoderState<S> {
+    /// The engine's stream; `()` until the request is sent (see [`DecoderState::reading`]).
     stream: S,
     decoders: HashMap<u32, Decoder>,
     finished_choices: HashSet<u32>,
@@ -92,6 +92,26 @@ struct DecoderState<S> {
     /// When `false`, `jailed_text` is left unset on every chunk rather than snapshotting the
     /// decoder's withheld state for a checkpoint nothing can ever consume.
     migration_possible: bool,
+}
+
+impl DecoderState<()> {
+    /// The state reading `stream`, the engine's response to the request it was built for.
+    fn reading<S>(self, stream: S) -> DecoderState<S> {
+        DecoderState {
+            stream,
+            decoders: self.decoders,
+            finished_choices: self.finished_choices,
+            validate_engine_decode: self.validate_engine_decode,
+            no_stop_trim: self.no_stop_trim,
+            retain_model_stop_token_text: self.retain_model_stop_token_text,
+            finished: self.finished,
+            tokenizer: self.tokenizer,
+            skip_special_tokens: self.skip_special_tokens,
+            pending_flush: self.pending_flush,
+            stream_ended: self.stream_ended,
+            migration_possible: self.migration_possible,
+        }
+    }
 }
 
 /// Decodes one vocabulary ID for per-token logprob metadata.
@@ -202,7 +222,9 @@ impl Backend {
         }
     }
 
-    fn decoder<S>(&self, stream: S, params: DecoderParams) -> anyhow::Result<DecoderState<S>> {
+    /// The decoders for one request, before its stream: the check that the request can be
+    /// decoded at all (a tokenizer, and a migration checkpoint that fits the prompt).
+    fn decoder(&self, params: DecoderParams) -> anyhow::Result<DecoderState<()>> {
         let Some(tokenizer) = self.tokenizer.as_ref() else {
             anyhow::bail!("Backend built from blank ModelDeploymentCard, no tokenizer");
         };
@@ -217,7 +239,7 @@ impl Backend {
         }
 
         Ok(DecoderState {
-            stream,
+            stream: (),
             decoders,
             finished_choices: HashSet::new(),
             validate_engine_decode: self.validate_engine_decode,
@@ -233,444 +255,581 @@ impl Backend {
     }
 }
 
-#[async_trait]
-impl
-    Operator<
-        SingleIn<PreprocessedRequest>,
-        ManyOut<Annotated<BackendOutput>>,
-        SingleIn<PreprocessedRequest>,
-        ManyOut<Annotated<LLMEngineOutput>>,
-    > for Backend
-{
-    async fn generate(
+/// What Backend's forward half keeps of a request for its backward half: the decoders, and the
+/// request's context, which a stop reaches below.
+///
+/// Not boxed: measured on the gdl pipelines, a box costs one allocation and 1,000 to 1,800
+/// instructions per request, and saves no copy.
+pub struct BackendState {
+    decoder: DecoderState<()>,
+    context: Arc<dyn AsyncEngineContext>,
+}
+
+/// Backend around the stages below it: the forward half checks that the request can be decoded
+/// and builds its decoders, before the request is sent on, and the backward half detokenizes
+/// the response.
+impl gdl::Around<gdl::EndedForm> for GdlOperator<Backend, PreprocessedRequest> {
+    type UpReq = Boxed<PreprocessedRequest>;
+    type UpItem = Annotated<BackendOutput>;
+    type DownReq = Boxed<PreprocessedRequest>;
+    type DownItem = Annotated<LLMEngineOutput>;
+    type State = BackendState;
+
+    // An item of a choice that already finished is dropped (`Verdict::Skip` in the inline
+    // form), so the node can take items without passing one on.
+    const FILTERS: bool = true;
+
+    fn forward(
         &self,
-        request: SingleIn<PreprocessedRequest>,
-        next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
-    ) -> Result<ManyOut<Annotated<BackendOutput>>> {
-        let decoder_params = DecoderParams::from_request(&request);
+        _cx: &gdl::Cx,
+        request: Boxed<PreprocessedRequest>,
+    ) -> impl Future<Output = gdl::Result<(Self::DownReq, Self::State)>> + Send {
+        // Checked before the request is sent on: an eager error below cannot hide a request
+        // this Backend could not decode.
+        let decoder = self
+            .op
+            .decoder(DecoderParams::from_request(&request))
+            .map_err(gdl_error);
+        std::future::ready(decoder.map(|decoder| {
+            let context = request.context();
+            (request, BackendState { decoder, context })
+        }))
+    }
 
-        let next_stream = next.generate(request).await?;
-
-        let context = next_stream.context();
-        let state = self.decoder(next_stream, decoder_params)?;
-
-        Ok(ResponseStream::new(
-            Box::pin(DecoderStream { state: Some(state) }),
-            context,
-        ))
+    fn backward(
+        &self,
+        cx: &gdl::Cx,
+        state: Self::State,
+        input: gdl::Ended<Annotated<LLMEngineOutput>>,
+    ) -> gdl::Ended<Annotated<BackendOutput>> {
+        let input = EndedItems::new(input, cx.clone(), state.context);
+        gdl::ended(DecoderStream {
+            state: Some(state.decoder.reading(input)),
+        })
     }
 }
 
 /// Backend's response stream: detokenizes each item of `S` in place and converts it to a
 /// [`BackendOutput`] once, on its way out.
 ///
-/// The stream owns its state and edits each item through `&mut`, so an item (1 KB) moves only
-/// where it changes type.
+/// A stream that owns its state, in place of `unfold`, `fuse` and `map`: `unfold` moves its
+/// state and the item through a new future on every item, and each combinator moves the item
+/// again, about a third of a stream item's cost (1 KB each). Edited through `&mut`, the item
+/// moves only where it changes type. In gdl's ended form the items carry no `Result`, so none
+/// is taken out of one and wrapped again either.
 struct DecoderStream<S> {
-    /// `None` once the stream has ended, so the stream below and the decoders drop when this
-    /// stream ends.
+    /// `None` once the stream has ended. That drops the stream below and the decoders when this
+    /// stream ends, not when its caller drops it, as `unfold` did.
     state: Option<DecoderState<S>>,
 }
 
 impl<S> Stream for DecoderStream<S>
 where
-    S: Stream<Item = Annotated<LLMEngineOutput>> + AsyncEngineContextProvider + Unpin,
+    S: Stream<Item = Annotated<LLMEngineOutput>> + AsyncEngineContextProvider + CutShort + Unpin,
 {
     type Item = Annotated<BackendOutput>;
 
+    // hot path: per-item-response
+    // The per-item body the inline form shares (`DecoderState::process`), called on the item
+    // where it was read.
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        let Some(state) = self.state.as_mut() else {
-            return Poll::Ready(None);
-        };
-        match ready!(state.poll_step(cx)) {
-            Some(output) => Poll::Ready(Some(backend_output(output))),
-            None => {
-                self.state = None;
-                Poll::Ready(None)
+        let (polled, ended) = {
+            let Some(state) = self.state.as_mut() else {
+                return Poll::Ready(None);
+            };
+            loop {
+                if state.finished {
+                    break (Poll::Ready(None), true);
+                }
+                if state.stream_ended {
+                    let next = state.pending_flush.pop();
+                    let ended = next.is_none();
+                    break (Poll::Ready(next.map(backend_output)), ended);
+                }
+                match ready!(state.stream.poll_next_unpin(cx)) {
+                    Some(mut item) => {
+                        if state.choice_finished(&item) {
+                            continue;
+                        }
+                        state.process(&mut item);
+                        break (Poll::Ready(Some(backend_output(item))), false);
+                    }
+                    None => {
+                        state.stream_ended = true;
+                        if state.stream.cut_short() {
+                            break (Poll::Ready(None), true);
+                        }
+                        state.queue_flush();
+                    }
+                }
             }
+        };
+        if ended {
+            self.state = None;
+        }
+        polled
+    }
+}
+
+/// Backend reads its input through [`EndedItems`], which gives an ending of the stages below as
+/// a last item, so Backend's own stream ends cleanly.
+impl<S> gdl::EndedStream for DecoderStream<S>
+where
+    S: Stream<Item = Annotated<LLMEngineOutput>> + AsyncEngineContextProvider + CutShort + Unpin,
+{
+    fn ending(self: Pin<&mut Self>) -> Option<gdl::Error> {
+        None
+    }
+}
+
+/// What Backend's inline half reads beside its items: the request's Dynamo context, which a
+/// local stop reaches below, and the half's `Cx`, for the cut-short check before a flush.
+pub struct InlineInput {
+    context: Arc<dyn AsyncEngineContext>,
+    root: gdl::Cx,
+}
+
+impl std::fmt::Debug for InlineInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InlineInput")
+            .field("context", &self.context.id())
+            .finish()
+    }
+}
+
+/// The request's Dynamo context, as the shared per-item body asks it of its input.
+impl AsyncEngineContextProvider for InlineInput {
+    fn context(&self) -> Arc<dyn AsyncEngineContext> {
+        Arc::clone(&self.context)
+    }
+}
+
+/// Backend's backward half as a gdl inline node, for one attempt: gdl's inline list calls the
+/// per-item body on each item in place of [`DecoderStream`] and its [`EndedItems`], and answers
+/// the ending below as `EndedItems` does.
+pub struct BackendRun {
+    state: DecoderState<InlineInput>,
+}
+
+impl<S: AsyncEngineContextProvider> DecoderState<S> {
+    /// One item, detokenized in place: the per-item body, shared by [`DecoderStream`] and
+    /// [`BackendRun`].
+    fn process(&mut self, item: &mut Annotated<LLMEngineOutput>) {
+        let output = &mut *item;
+        // move to state.process_output
+        // handle any error conditions / unwraps here
+
+        // events are pass thru
+        if output.is_event() || output.data.is_none() {
+            // A genuine stream-level error ends generation for every choice at
+            // once -- `Annotated::from_err` carries no per-choice `index` the
+            // way `LLMEngineOutput` does, so there is no narrower target than
+            // "all of them". Mark them finished so the bare-EOF flush loop below
+            // does not synthesize a spurious successful `Stop` for any choice
+            // after a real error, the same hardening already applied to decode
+            // errors and the decoded-text bypass path.
+            if output.is_error() {
+                self.finished_choices.extend(self.decoders.keys().copied());
+            }
+            return;
+        }
+
+        // Top-logprob text is independent of the selected token text. An engine may
+        // decode the selected token while still omitting candidate text, so repair the
+        // candidates before the decoded-text fast path below.
+        //
+        // Per-entry decode is O(positions * top_k) per delta. Bounded in
+        // practice (streaming: 1 * top_k <= 20) and dwarfed by serialization
+        // on the same path, so we ship the simple version. Revisit if a
+        // streaming flamegraph with top_logprobs=20 puts this above ~1%:
+        // the cheapest win is a shared LRU on the Tokenizer keyed by
+        // (token_id, skip_special_tokens) — top-k entries repeat heavily
+        // across positions and requests. Do NOT batch as a single
+        // decode(&[ids..]) call: BPE merge / leading-space rules differ
+        // between single-token and sequence decode and will corrupt strings.
+        if let Some(top_logprobs) = output
+            .data
+            .as_mut()
+            .and_then(|data| data.top_logprobs.as_mut())
+        {
+            fill_missing_top_logprob_text(&self.tokenizer, top_logprobs, self.skip_special_tokens);
+        }
+
+        // A worker may send already-trimmed text alongside the raw
+        // IDs. Re-decode those IDs when stop-token text must survive
+        // (no_stop_trim, or a parser that needs the model's terminator)
+        // instead of using the text fast path. Text-only output cannot
+        // honor these options; don't silently return trimmed or empty
+        // content. Empty stop trailers are valid after this choice emitted IDs.
+        if (self.no_stop_trim || self.retain_model_stop_token_text)
+            && let Some(data) = &output.data
+            && data.token_ids.is_empty()
+            && (data.text.as_ref().is_some_and(|text| !text.is_empty())
+                || data
+                    .tokens
+                    .as_ref()
+                    .is_some_and(|tokens| !tokens.is_empty())
+                || (data.finish_reason == Some(FinishReason::Stop)
+                    && self
+                        .decoders
+                        .get(&data.index.unwrap_or(0))
+                        .is_none_or(|decoder| decoder.generated_tokens == 0)))
+        {
+            self.stream.context().stop_generating();
+            self.finished = true;
+            let error = DynamoError::builder()
+                .class(ErrorClass::BackendProtocol)
+                .message("no_stop_trim requires backend token IDs through the matched stop; the backend omitted them (also required when a parser retains the model's stop token text)")
+                .build();
+            *item = Annotated::from_err(error);
+            return;
+        }
+
+        // if we have a data field without an event, then we might need to update the data
+        if let Some(data) = &mut output.data
+            && data.text.is_some()
+            && !self.validate_engine_decode
+            && !(self.no_stop_trim || self.retain_model_stop_token_text)
+        {
+            if data.log_probs.is_some() && data.tokens.is_none() {
+                data.tokens = Some(
+                    data.token_ids
+                        .iter()
+                        .map(|token_id| {
+                            self.tokenizer
+                                .decode(&[*token_id], self.skip_special_tokens)
+                                .ok()
+                                // Lossy text cannot recover the original token bytes.
+                                .filter(|decoded| {
+                                    decoded.is_complete() && !decoded.as_str().contains('\u{fffd}')
+                                })
+                                .map(Into::into)
+                        })
+                        .collect(),
+                );
+            }
+            // Text already decoded; track finish for this choice
+            let choice_idx = data.index.unwrap_or(0);
+            let has_finish = data.finish_reason.is_some();
+            if has_finish {
+                self.finished_choices.insert(choice_idx);
+            }
+            // This path bypasses the decoder entirely (the engine pre-decoded
+            // its own text for this chunk), but the decoder for this choice is
+            // still alive across chunks and may be holding text withheld by a
+            // *previous* chunk that did go through it. Losing track of that here
+            // would either drop it silently (on a terminal chunk) or make a
+            // migration checkpoint captured from this chunk (see `jail_seed`)
+            // look falsely resolved, so:
+            if let Some(decoder) = self.decoders.get_mut(&choice_idx) {
+                // On a terminal chunk, flush it and put it *before* this chunk's
+                // own text -- it is strictly older -- rather than appending,
+                // which would reorder output (e.g. "there" + withheld "o" must
+                // come out as "othere", not "thereo").
+                if has_finish && let Some(data) = &mut output.data {
+                    match decoder.finish() {
+                        Ok(result) => {
+                            if let Some(trigger) = result.stop_trigger {
+                                data.text = result.released_text;
+                                if !matches!(data.finish_reason, Some(FinishReason::Error(_))) {
+                                    let (reason, stop) = trigger.reasons();
+                                    data.finish_reason = Some(reason);
+                                    data.stop_reason = stop;
+                                }
+                            } else if let Some(flushed) = result.released_text {
+                                let newer = data.text.take().unwrap_or_default();
+                                data.text = Some(flushed + &newer);
+                            }
+                        }
+                        Err(error) => {
+                            data.finish_reason =
+                                Some(FinishReason::Error(format!("decode error: {error}")));
+                        }
+                    }
+                }
+                // Mirror the decoder's current withheld state on every chunk
+                // (terminal or not), even though this chunk didn't change it, so
+                // a checkpoint captured here reflects reality instead of always
+                // reading as resolved. Skipped entirely when migration can't
+                // happen -- nothing will ever read this checkpoint, so there is
+                // no reason to allocate a snapshot of it.
+                if self.migration_possible
+                    && let Some(data) = &mut output.data
+                {
+                    data.jailed_text = decoder.checkpoint();
+                }
+            }
+            return;
+        }
+
+        let data = output.data.as_ref().unwrap();
+        let choice_idx = data.index.unwrap_or(0);
+        // Snapshot the choice count before borrowing a specific decoder mutably
+        // below: that borrow stays alive until this choice's `checkpoint()` call
+        // near the end of this arm, so `self.decoders` can't be read again
+        // (even just its length) in between. The count itself never changes
+        // after `Backend::decoder()` creates the map, so this is safe to cache.
+        let decoders_count = self.decoders.len();
+
+        let Some(decoder) = self.decoders.get_mut(&choice_idx) else {
+            tracing::error!(
+                "engine emitted choice index {choice_idx}, but only {decoders_count} choices were requested"
+            );
+            if let Some(data) = &mut output.data {
+                data.finish_reason = Some(FinishReason::Error(format!(
+                    "invalid choice index {choice_idx}"
+                )));
+            }
+            return;
+        };
+
+        // Per-token text is read only with this chunk's logprobs (`create_logprobs`).
+        let needs_token_text = data.log_probs.is_some();
+        let result = decoder
+            .process_token_ids_with_token_text(&data.token_ids, needs_token_text)
+            .and_then(|mut result| {
+                if result.stop_trigger.is_none() && data.finish_reason.is_some() {
+                    let final_step = decoder.finish()?;
+                    if let Some(text) = final_step.released_text {
+                        result.text.get_or_insert_default().push_str(&text);
+                    }
+                    result.stop_trigger = final_step.stop_trigger;
+                }
+                Ok(result)
+            });
+        let result = match result {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::error!("Failed to process token_ids for choice {choice_idx}: {e}");
+                self.finished_choices.insert(choice_idx);
+                if self.finished_choices.len() >= decoders_count {
+                    self.stream.context().stop_generating();
+                    self.finished = true;
+                }
+                if let Some(data) = &mut output.data {
+                    data.finish_reason = Some(FinishReason::Error(format!("decode error: {e}")));
+                }
+                return;
+            }
+        };
+
+        // NOTE: the `finish_reason` is computed from the generated `token_ids` alone.
+        // The `data` field can have a `finish_reason` set, coming from the underlying
+        // LLM inference `Engine`, and empty `token_ids`. See comment below for more details.
+        //
+        // stop_reason is only set for user-provided stop sequences, not for system
+        // EOS tokens (HiddenStopTokenDetected). This matches OpenAI API behavior where
+        // stop_reason is only present when a user-specified stop sequence is matched.
+        let (finish_reason, stop_reason) = result
+            .stop_trigger
+            .as_ref()
+            .map(|trigger| {
+                let (mut reason, stop) = trigger.reasons();
+                // A stop string can win over the EOS token's trigger. Check only consumed IDs.
+                if self.retain_model_stop_token_text
+                    && data.token_ids[..result.tokens.len()]
+                        .last()
+                        .is_some_and(|id| decoder.system_stop_ids.contains(id))
+                {
+                    reason = FinishReason::EoS;
+                }
+                (Some(reason), stop)
+            })
+            .unwrap_or((None, None));
+
+        // If we detected a local stop condition, mark this choice as finished.
+        // Once all expected choices are finished, stop the upstream generator.
+        if finish_reason.is_some() && data.finish_reason.is_none() {
+            self.finished_choices.insert(choice_idx);
+            if self.finished_choices.len() >= decoders_count {
+                self.stream.context().stop_generating();
+                self.finished = true;
+            }
+        }
+
+        let text = result.text;
+        let tokens = result.tokens;
+
+        if self.validate_engine_decode {
+            if data.finish_reason != finish_reason {
+                tracing::warn!(
+                    "finish reason mismatch: expected {:?}, got {:?}",
+                    data.finish_reason,
+                    finish_reason
+                );
+            }
+
+            if data.text.is_some() && data.text != text {
+                tracing::warn!("text mismatch: expected {:?}, got {:?}", data.text, text);
+            }
+        }
+
+        // update output in-place
+        let data = output.data.as_mut().unwrap();
+
+        // NOTE: If `finish_reason.is_some()`, then one of the stop conditions was triggered
+        // by the token generation. We should update the `data.finish_reason` in that case.
+        // However, if `finish_reason.is_none()`, it is possible that we are in the case where
+        // `data.token_ids` is empty, and `data.finish_reason` is already correctly set.
+        // In that case, `process_token_ids` above will rewrite `finish_reason` to `None`,
+        // which we don't want to propagate to `data.finish_reason`.
+        // A failed generation may carry EOS in its final token batch.
+        // Local stop detection must not turn the worker's error into success.
+        if finish_reason.is_some()
+            && !matches!(data.finish_reason, Some(FinishReason::Error(_)))
+            && !(self.retain_model_stop_token_text
+                && matches!(
+                    data.finish_reason,
+                    Some(FinishReason::Length | FinishReason::Cancelled)
+                ))
+        {
+            data.finish_reason = finish_reason;
+            data.stop_reason = stop_reason.or(data.stop_reason.take());
+        }
+        data.text = text;
+
+        // A tokenizer-free engine can return tokens past a local
+        // stop in the same chunk. Keep its per-token fields aligned
+        // with the prefix the decoder consumed.
+        let consumed = tokens.len();
+        if consumed < data.token_ids.len() {
+            data.token_ids.truncate(consumed);
+            if let Some(log_probs) = data.log_probs.as_mut() {
+                log_probs.truncate(consumed);
+            }
+            if let Some(top_logprobs) = data.top_logprobs.as_mut() {
+                top_logprobs.truncate(consumed);
+            }
+        }
+        data.tokens = Some(tokens);
+        // Snapshot of whatever this choice's decoder is still withholding as a
+        // possible hidden-stop-sequence prefix after this step -- `None` once
+        // resolved (matched, ruled out, or flushed). Carried so a migration
+        // retry's fresh decoder can be reseeded from the last known-good chunk
+        // instead of silently losing it (see `PreprocessedRequest::jail_seed`).
+        // Skipped when migration can't happen: nothing will ever read this
+        // checkpoint, so there is no reason to allocate a snapshot of it.
+        if self.migration_possible {
+            data.jailed_text = decoder.checkpoint();
+        }
+    }
+
+    fn choice_finished(&self, output: &Annotated<LLMEngineOutput>) -> bool {
+        !output.is_event()
+            && output.data.as_ref().is_some_and(|data| {
+                self.finished_choices
+                    .contains(&data.index.unwrap_or_default())
+            })
+    }
+
+    /// The end of the stream below: queue a flush of what each unfinished choice's decoder
+    /// holds back.
+    fn queue_flush(&mut self) {
+        self.stream_ended = true;
+        for (idx, decoder) in self.decoders.iter_mut() {
+            if self.finished_choices.contains(idx) {
+                continue;
+            }
+            let data = match decoder.finish() {
+                Ok(result) if result.released_text.is_some() || result.stop_trigger.is_some() => {
+                    let (reason, stop) = result
+                        .stop_trigger
+                        .as_ref()
+                        .map(StopTrigger::reasons)
+                        .unwrap_or((FinishReason::Stop, None));
+                    LLMEngineOutput {
+                        index: Some(*idx),
+                        text: result.released_text,
+                        finish_reason: Some(reason),
+                        stop_reason: stop,
+                        ..Default::default()
+                    }
+                }
+                Ok(_) => continue,
+                Err(error) => LLMEngineOutput {
+                    index: Some(*idx),
+                    finish_reason: Some(FinishReason::Error(format!("decode error: {error}"))),
+                    ..Default::default()
+                },
+            };
+            self.pending_flush.push(Annotated::from_data(data));
         }
     }
 }
 
-impl<S> DecoderState<S>
-where
-    S: Stream<Item = Annotated<LLMEngineOutput>> + AsyncEngineContextProvider + Unpin,
-{
-    /// The next item, detokenized in place, or `None` when the stream has ended.
-    fn poll_step(&mut self, cx: &mut TaskContext<'_>) -> Poll<Option<Annotated<LLMEngineOutput>>> {
-        // If we've already detected a local stop condition, end the stream
-        if self.finished {
-            return Poll::Ready(None);
+impl gdl::inline::Edit<Annotated<LLMEngineOutput>> for BackendRun {
+    // hot path: per-item-response
+    fn edit(&mut self, item: &mut Annotated<LLMEngineOutput>) -> gdl::inline::Verdict {
+        if self.state.choice_finished(item) {
+            return gdl::inline::Verdict::Skip;
         }
-
-        // `stream` already yielded `None` once; do not poll it again (unspecified
-        // behavior for most `Stream` impls). Only drain the flush queue from here on.
-        if self.stream_ended {
-            return Poll::Ready(self.pending_flush.pop());
+        self.state.process(item);
+        // All choices finished locally: this item is the last.
+        if self.state.finished {
+            gdl::inline::Verdict::Last
+        } else {
+            gdl::inline::Verdict::Keep
         }
+    }
 
-        let output = loop {
-            let output = ready!(self.stream.poll_next_unpin(cx));
-            let choice_already_finished = output.as_ref().is_some_and(|output| {
-                !output.is_event()
-                    && output.data.as_ref().is_some_and(|data| {
-                        self.finished_choices
-                            .contains(&data.index.unwrap_or_default())
-                    })
-            });
-            if !choice_already_finished {
-                break output;
-            }
+    // As `EndedItems`: an ending below is a last item, unless it is the cancel of a killed
+    // request, which just ends; the item passes the decoder as any item does.
+    fn end(
+        &mut self,
+        ending: Option<gdl::Error>,
+    ) -> gdl::inline::AtEnd<Annotated<LLMEngineOutput>> {
+        let Some(error) = ending else {
+            return gdl::inline::AtEnd::Pass(None);
         };
-
-        match output {
-            Some(mut output) => {
-                // events are pass thru
-                if output.is_event() || output.data.is_none() {
-                    // A genuine stream-level error ends generation for every choice at
-                    // once -- `Annotated::from_err` carries no per-choice `index` the
-                    // way `LLMEngineOutput` does, so there is no narrower target than
-                    // "all of them". Mark them finished so the bare-EOF flush loop below
-                    // does not synthesize a spurious successful `Stop` for any choice
-                    // after a real error, the same hardening already applied to decode
-                    // errors and the decoded-text bypass path.
-                    if output.is_error() {
-                        self.finished_choices.extend(self.decoders.keys().copied());
-                    }
-                    return Poll::Ready(Some(output));
-                }
-
-                // Top-logprob text is independent of the selected token text. An engine may
-                // decode the selected token while still omitting candidate text, so repair the
-                // candidates before the decoded-text fast path below.
-                //
-                // Per-entry decode is O(positions * top_k) per delta. Bounded in
-                // practice (streaming: 1 * top_k <= 20) and dwarfed by serialization
-                // on the same path, so we ship the simple version. Revisit if a
-                // streaming flamegraph with top_logprobs=20 puts this above ~1%:
-                // the cheapest win is a shared LRU on the Tokenizer keyed by
-                // (token_id, skip_special_tokens) — top-k entries repeat heavily
-                // across positions and requests. Do NOT batch as a single
-                // decode(&[ids..]) call: BPE merge / leading-space rules differ
-                // between single-token and sequence decode and will corrupt strings.
-                if let Some(top_logprobs) = output
-                    .data
-                    .as_mut()
-                    .and_then(|data| data.top_logprobs.as_mut())
-                {
-                    fill_missing_top_logprob_text(
-                        &self.tokenizer,
-                        top_logprobs,
-                        self.skip_special_tokens,
-                    );
-                }
-
-                // A worker may send already-trimmed text alongside the raw
-                // IDs. Re-decode those IDs when stop-token text must survive
-                // (no_stop_trim, or a parser that needs the model's terminator)
-                // instead of using the text fast path. Text-only output cannot
-                // honor these options; don't silently return trimmed or empty
-                // content. Empty stop trailers are valid after this choice emitted IDs.
-                if (self.no_stop_trim || self.retain_model_stop_token_text)
-                    && let Some(data) = &output.data
-                    && data.token_ids.is_empty()
-                    && (data.text.as_ref().is_some_and(|text| !text.is_empty())
-                        || data
-                            .tokens
-                            .as_ref()
-                            .is_some_and(|tokens| !tokens.is_empty())
-                        || (data.finish_reason == Some(FinishReason::Stop)
-                            && self
-                                .decoders
-                                .get(&data.index.unwrap_or(0))
-                                .is_none_or(|decoder| decoder.generated_tokens == 0)))
-                {
-                    self.stream.context().stop_generating();
-                    self.finished = true;
-                    let error = DynamoError::builder()
-                        .class(ErrorClass::BackendProtocol)
-                        .message("no_stop_trim requires backend token IDs through the matched stop; the backend omitted them (also required when a parser retains the model's stop token text)")
-                        .build();
-                    return Poll::Ready(Some(Annotated::from_err(error)));
-                }
-
-                // if we have a data field without an event, then we might need to update the data
-                if let Some(data) = &mut output.data
-                    && data.text.is_some()
-                    && !self.validate_engine_decode
-                    && !(self.no_stop_trim || self.retain_model_stop_token_text)
-                {
-                    if data.log_probs.is_some() && data.tokens.is_none() {
-                        data.tokens = Some(
-                            data.token_ids
-                                .iter()
-                                .map(|token_id| {
-                                    self.tokenizer
-                                        .decode(&[*token_id], self.skip_special_tokens)
-                                        .ok()
-                                        // Lossy text cannot recover the original token bytes.
-                                        .filter(|decoded| {
-                                            decoded.is_complete()
-                                                && !decoded.as_str().contains('\u{fffd}')
-                                        })
-                                        .map(Into::into)
-                                })
-                                .collect(),
-                        );
-                    }
-                    // Text already decoded; track finish for this choice
-                    let choice_idx = data.index.unwrap_or(0);
-                    let has_finish = data.finish_reason.is_some();
-                    if has_finish {
-                        self.finished_choices.insert(choice_idx);
-                    }
-                    // This path bypasses the decoder entirely (the engine pre-decoded
-                    // its own text for this chunk), but the decoder for this choice is
-                    // still alive across chunks and may be holding text withheld by a
-                    // *previous* chunk that did go through it. Losing track of that here
-                    // would either drop it silently (on a terminal chunk) or make a
-                    // migration checkpoint captured from this chunk (see `jail_seed`)
-                    // look falsely resolved, so:
-                    if let Some(decoder) = self.decoders.get_mut(&choice_idx) {
-                        // On a terminal chunk, flush it and put it *before* this chunk's
-                        // own text -- it is strictly older -- rather than appending,
-                        // which would reorder output (e.g. "there" + withheld "o" must
-                        // come out as "othere", not "thereo").
-                        if has_finish && let Some(data) = &mut output.data {
-                            match decoder.finish() {
-                                Ok(result) => {
-                                    if let Some(trigger) = result.stop_trigger {
-                                        data.text = result.released_text;
-                                        if !matches!(
-                                            data.finish_reason,
-                                            Some(FinishReason::Error(_))
-                                        ) {
-                                            let (reason, stop) = trigger.reasons();
-                                            data.finish_reason = Some(reason);
-                                            data.stop_reason = stop;
-                                        }
-                                    } else if let Some(flushed) = result.released_text {
-                                        let newer = data.text.take().unwrap_or_default();
-                                        data.text = Some(flushed + &newer);
-                                    }
-                                }
-                                Err(error) => {
-                                    data.finish_reason =
-                                        Some(FinishReason::Error(format!("decode error: {error}")));
-                                }
-                            }
-                        }
-                        // Mirror the decoder's current withheld state on every chunk
-                        // (terminal or not), even though this chunk didn't change it, so
-                        // a checkpoint captured here reflects reality instead of always
-                        // reading as resolved. Skipped entirely when migration can't
-                        // happen -- nothing will ever read this checkpoint, so there is
-                        // no reason to allocate a snapshot of it.
-                        if self.migration_possible
-                            && let Some(data) = &mut output.data
-                        {
-                            data.jailed_text = decoder.checkpoint();
-                        }
-                    }
-                    return Poll::Ready(Some(output));
-                }
-
-                let data = output.data.as_mut().unwrap();
-                let choice_idx = data.index.unwrap_or(0);
-                // Snapshot the choice count before borrowing a specific decoder mutably
-                // below: that borrow stays alive until this choice's `checkpoint()` call
-                // near the end of this arm, so `self.decoders` can't be read again
-                // (even just its length) in between. The count itself never changes
-                // after `Backend::decoder()` creates the map, so this is safe to cache.
-                let decoders_count = self.decoders.len();
-
-                let Some(decoder) = self.decoders.get_mut(&choice_idx) else {
-                    tracing::error!(
-                        "engine emitted choice index {choice_idx}, but only {decoders_count} choices were requested"
-                    );
-                    data.finish_reason = Some(FinishReason::Error(format!(
-                        "invalid choice index {choice_idx}"
-                    )));
-                    return Poll::Ready(Some(output));
-                };
-
-                // Per-token text is read only with this chunk's logprobs (`create_logprobs`).
-                let needs_token_text = data.log_probs.is_some();
-                let result = decoder
-                    .process_token_ids_with_token_text(&data.token_ids, needs_token_text)
-                    .and_then(|mut result| {
-                        if result.stop_trigger.is_none() && data.finish_reason.is_some() {
-                            let final_step = decoder.finish()?;
-                            if let Some(text) = final_step.released_text {
-                                result.text.get_or_insert_default().push_str(&text);
-                            }
-                            result.stop_trigger = final_step.stop_trigger;
-                        }
-                        Ok(result)
-                    });
-                let result = match result {
-                    Ok(result) => result,
-                    Err(e) => {
-                        tracing::error!("Failed to process token_ids for choice {choice_idx}: {e}");
-                        self.finished_choices.insert(choice_idx);
-                        if self.finished_choices.len() >= decoders_count {
-                            self.stream.context().stop_generating();
-                            self.finished = true;
-                        }
-                        data.finish_reason =
-                            Some(FinishReason::Error(format!("decode error: {e}")));
-                        return Poll::Ready(Some(output));
-                    }
-                };
-
-                // NOTE: the `finish_reason` is computed from the generated `token_ids` alone.
-                // The `data` field can have a `finish_reason` set, coming from the underlying
-                // LLM inference `Engine`, and empty `token_ids`. See comment below for more details.
-                //
-                // stop_reason is only set for user-provided stop sequences, not for system
-                // EOS tokens (HiddenStopTokenDetected). This matches OpenAI API behavior where
-                // stop_reason is only present when a user-specified stop sequence is matched.
-                let (finish_reason, stop_reason) = result
-                    .stop_trigger
-                    .as_ref()
-                    .map(|trigger| {
-                        let (mut reason, stop) = trigger.reasons();
-                        // A stop string can win over the EOS token's trigger.
-                        // Only the consumed prefix supplies evidence of model EOS.
-                        if self.retain_model_stop_token_text
-                            && data.token_ids[..result.tokens.len()]
-                                .last()
-                                .is_some_and(|id| decoder.system_stop_ids.contains(id))
-                        {
-                            reason = FinishReason::EoS;
-                        }
-                        (Some(reason), stop)
-                    })
-                    .unwrap_or((None, None));
-
-                // If we detected a local stop condition, mark this choice as finished.
-                // Once all expected choices are finished, stop the upstream generator.
-                if finish_reason.is_some() && data.finish_reason.is_none() {
-                    self.finished_choices.insert(choice_idx);
-                    if self.finished_choices.len() >= decoders_count {
-                        self.stream.context().stop_generating();
-                        self.finished = true;
-                    }
-                }
-
-                let text = result.text;
-                let tokens = result.tokens;
-
-                if self.validate_engine_decode {
-                    if data.finish_reason != finish_reason {
-                        tracing::warn!(
-                            "finish reason mismatch: expected {:?}, got {:?}",
-                            data.finish_reason,
-                            finish_reason
-                        );
-                    }
-
-                    if data.text.is_some() && data.text != text {
-                        tracing::warn!("text mismatch: expected {:?}, got {:?}", data.text, text);
-                    }
-                }
-
-                // NOTE: If `finish_reason.is_some()`, then one of the stop conditions was triggered
-                // by the token generation. We should update the `data.finish_reason` in that case.
-                // However, if `finish_reason.is_none()`, it is possible that we are in the case where
-                // `data.token_ids` is empty, and `data.finish_reason` is already correctly set.
-                // In that case, `process_token_ids` above will rewrite `finish_reason` to `None`,
-                // which we don't want to propagate to `data.finish_reason`.
-                // A failed generation may carry EOS in its final token batch.
-                // Local stop detection must not turn the worker's error into success.
-                if finish_reason.is_some()
-                    && !matches!(data.finish_reason, Some(FinishReason::Error(_)))
-                    && !(self.retain_model_stop_token_text
-                        && matches!(
-                            data.finish_reason,
-                            Some(FinishReason::Length | FinishReason::Cancelled)
-                        ))
-                {
-                    data.finish_reason = finish_reason;
-                    data.stop_reason = stop_reason.or(data.stop_reason.take());
-                }
-                data.text = text;
-
-                // A tokenizer-free engine can return tokens past a local
-                // stop in the same chunk. Keep its per-token fields aligned
-                // with the prefix the decoder consumed.
-                let consumed = tokens.len();
-                if consumed < data.token_ids.len() {
-                    data.token_ids.truncate(consumed);
-                    if let Some(log_probs) = data.log_probs.as_mut() {
-                        log_probs.truncate(consumed);
-                    }
-                    if let Some(top_logprobs) = data.top_logprobs.as_mut() {
-                        top_logprobs.truncate(consumed);
-                    }
-                }
-                data.tokens = Some(tokens);
-                // Snapshot of whatever this choice's decoder is still withholding as a
-                // possible hidden-stop-sequence prefix after this step -- `None` once
-                // resolved (matched, ruled out, or flushed). Carried so a migration
-                // retry's fresh decoder can be reseeded from the last known-good chunk
-                // instead of silently losing it (see `PreprocessedRequest::jail_seed`).
-                // Skipped when migration can't happen: nothing will ever read this
-                // checkpoint, so there is no reason to allocate a snapshot of it.
-                if self.migration_possible {
-                    data.jailed_text = decoder.checkpoint();
-                }
-
-                Poll::Ready(Some(output))
+        match dynamo_gdl_adapters::last_item(
+            error,
+            &self.state.stream.root,
+            self.state.stream.context.as_ref(),
+        ) {
+            Some(mut item) => {
+                self.state.process(&mut item);
+                gdl::inline::AtEnd::Item(item)
             }
-
-            None => {
-                // The engine's stream ended without ever sending a terminal
-                // `finish_reason` to some choice -- no more tokens are coming for any
-                // of them, so flush whatever each decoder still holds back as an
-                // incomplete hidden-stop-sequence match before the decoders are
-                // dropped, and drain the flushed choices one synthetic chunk at a time.
-                self.stream_ended = true;
-                for (idx, decoder) in self.decoders.iter_mut() {
-                    // A choice that already finished -- successfully or with an error --
-                    // was already given its chance to flush (see the decoder-driven and
-                    // decoded-text-passthrough paths above). Synthesizing another chunk
-                    // for it here would, at best, be redundant and, at worst, turn a
-                    // choice that ended in an error into a spurious extra `Stop`.
-                    if self.finished_choices.contains(idx) {
-                        continue;
-                    }
-                    let data = match decoder.finish() {
-                        Ok(result)
-                            if result.released_text.is_some() || result.stop_trigger.is_some() =>
-                        {
-                            let (reason, stop) = result
-                                .stop_trigger
-                                .as_ref()
-                                .map(StopTrigger::reasons)
-                                .unwrap_or((FinishReason::Stop, None));
-                            LLMEngineOutput {
-                                index: Some(*idx),
-                                text: result.released_text,
-                                finish_reason: Some(reason),
-                                stop_reason: stop,
-                                ..Default::default()
-                            }
-                        }
-                        Ok(_) => continue,
-                        Err(error) => LLMEngineOutput {
-                            index: Some(*idx),
-                            finish_reason: Some(FinishReason::Error(format!(
-                                "decode error: {error}"
-                            ))),
-                            ..Default::default()
-                        },
-                    };
-                    self.pending_flush.push(Annotated::from_data(data));
-                }
-                Poll::Ready(self.pending_flush.pop())
-            }
+            None => gdl::inline::AtEnd::Pass(None),
         }
+    }
+
+    // As `DecoderStream`'s end: flush the held text of unfinished choices, unless the request was
+    // cut short.
+    fn close(&mut self) -> Option<Annotated<LLMEngineOutput>> {
+        if self.state.finished {
+            return None;
+        }
+        if !self.state.stream_ended {
+            self.state.stream_ended = true;
+            if dynamo_gdl_adapters::cut_short(
+                &self.state.stream.root,
+                self.state.stream.context.as_ref(),
+            ) {
+                return None;
+            }
+            self.state.queue_flush();
+        }
+        self.state.pending_flush.pop()
+    }
+}
+
+/// Backend's backward half as an inline node, for pipelines A and B: the forward half is its
+/// `Around` impl's.
+impl gdl::inline::AroundInline for GdlOperator<Backend, PreprocessedRequest> {
+    type Run = BackendRun;
+
+    fn start(&self, cx: &gdl::Cx, state: BackendState) -> BackendRun {
+        BackendRun {
+            state: state.decoder.reading(InlineInput {
+                context: state.context,
+                root: cx.clone(),
+            }),
+        }
+    }
+
+    fn convert(item: Annotated<LLMEngineOutput>) -> Annotated<BackendOutput> {
+        backend_output(item)
     }
 }
 
@@ -706,36 +865,6 @@ fn backend_output(output: Annotated<LLMEngineOutput>) -> Annotated<BackendOutput
         event,
         comment,
         error,
-    }
-}
-
-#[async_trait]
-impl
-    Operator<
-        SingleIn<PreprocessedEmbeddingRequest>,
-        ManyOut<Annotated<EmbeddingsEngineOutput>>,
-        SingleIn<PreprocessedEmbeddingRequest>,
-        ManyOut<Annotated<EmbeddingsEngineOutput>>,
-    > for Backend
-{
-    async fn generate(
-        &self,
-        request: SingleIn<PreprocessedEmbeddingRequest>,
-        next: ServerStreamingEngine<
-            PreprocessedEmbeddingRequest,
-            Annotated<EmbeddingsEngineOutput>,
-        >,
-    ) -> Result<ManyOut<Annotated<EmbeddingsEngineOutput>>> {
-        // For embeddings, we mostly pass through since no detokenization is needed
-        // But we could add validation, logging, or other post-processing here
-        let response_stream = next.generate(request).await?;
-
-        // Could add embedding-specific post-processing here:
-        // - Validation of embedding dimensions
-        // - Normalization if requested
-        // - Usage statistics validation
-
-        Ok(response_stream)
     }
 }
 
@@ -1399,9 +1528,33 @@ mod tests {
         DeltaGeneratorExt, chat_completions::DeltaGenerator, delta_common::DeltaGeneratorOptions,
     };
     use crate::tokenizers::traits;
-    use dynamo_runtime::pipeline::{AsyncEngine, Error, ResponseStream};
+    use dynamo_runtime::pipeline::{
+        AsyncEngine, Error, ManyOut, ResponseStream, SingleIn, async_trait,
+    };
     use futures::StreamExt;
     use std::sync::Arc;
+
+    /// The two forms of Backend's backward half, which share one per-item body: each test
+    /// that runs Backend runs through both.
+    #[derive(Clone, Copy, Debug)]
+    enum Form {
+        /// A stream node, [`DecoderStream`].
+        Stream,
+        /// An inline node, [`BackendRun`], as the frontend's pipelines A and B run it.
+        Inline,
+    }
+
+    /// `backend` over `engine` as a gdl pipeline runs it, with its backward half in `form`.
+    fn on_gdl(
+        form: Form,
+        backend: &Arc<Backend>,
+        engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
+    ) -> ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> {
+        match form {
+            Form::Stream => crate::operator::testing::backend_stream(backend.clone(), engine),
+            Form::Inline => crate::operator::testing::backend(backend.clone(), engine),
+        }
+    }
 
     #[test]
     fn decoder_params_share_prompt_and_preserve_request_copy_on_write() {
@@ -1495,8 +1648,11 @@ mod tests {
 
     impl traits::Tokenizer for CandidateDecoder {}
 
+    #[rstest::rstest]
     #[tokio::test]
-    async fn backend_finalizes_byte_fallback_at_each_terminal_boundary() {
+    async fn backend_finalizes_byte_fallback_at_each_terminal_boundary(
+        #[values(Form::Stream, Form::Inline)] form: Form,
+    ) {
         let hf: tokenizers::Tokenizer = serde_json::from_value(serde_json::json!({
             "version": "1.0", "truncation": null, "padding": null,
             "added_tokens": [{"id": 1, "content": "<eos>", "special": true,
@@ -1553,12 +1709,12 @@ mod tests {
                     Arc::new(SyntheticSglangStopEngine {
                         outputs: Some(outputs),
                     });
-                let outputs: Vec<_> =
-                    Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
-                        .await
-                        .unwrap()
-                        .collect()
-                        .await;
+                let outputs: Vec<_> = on_gdl(form, &backend, engine)
+                    .generate(SingleIn::new(request))
+                    .await
+                    .unwrap()
+                    .collect()
+                    .await;
                 let text: String = outputs
                     .iter()
                     .filter_map(|item| item.data.as_ref()?.text.as_deref())
@@ -1725,7 +1881,10 @@ mod tests {
         assert_eq!(top_logprobs[0][1].logprob, -0.2);
     }
 
-    async fn assert_sglang_top_logprobs_are_decoded_in_openai_response(engine_decodes_text: bool) {
+    async fn assert_sglang_top_logprobs_are_decoded_in_openai_response(
+        form: Form,
+        engine_decodes_text: bool,
+    ) {
         let tokenizer: Arc<dyn traits::Tokenizer> = Arc::new(CandidateDecoder);
         let backend = Backend::from_tokenizer(Tokenizer::from(tokenizer));
         let request = PreprocessedRequest::builder()
@@ -1744,7 +1903,8 @@ mod tests {
                 engine_decodes_text,
             });
 
-        let mut stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let mut stream = on_gdl(form, &backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .expect("backend generation succeeds");
         let output = stream
@@ -1794,18 +1954,27 @@ mod tests {
         assert_eq!(candidates[1].logprob, -1.5);
     }
 
+    #[rstest::rstest]
     #[tokio::test]
-    async fn test_sglang_top_logprobs_are_decoded_in_openai_response() {
-        assert_sglang_top_logprobs_are_decoded_in_openai_response(false).await;
+    async fn test_sglang_top_logprobs_are_decoded_in_openai_response(
+        #[values(Form::Stream, Form::Inline)] form: Form,
+    ) {
+        assert_sglang_top_logprobs_are_decoded_in_openai_response(form, false).await;
     }
 
+    #[rstest::rstest]
     #[tokio::test]
-    async fn test_sglang_top_logprobs_are_decoded_before_engine_text_fast_path() {
-        assert_sglang_top_logprobs_are_decoded_in_openai_response(true).await;
+    async fn test_sglang_top_logprobs_are_decoded_before_engine_text_fast_path(
+        #[values(Form::Stream, Form::Inline)] form: Form,
+    ) {
+        assert_sglang_top_logprobs_are_decoded_in_openai_response(form, true).await;
     }
 
+    #[rstest::rstest]
     #[tokio::test]
-    async fn test_engine_text_logprobs_do_not_fabricate_lossy_token_bytes() {
+    async fn test_engine_text_logprobs_do_not_fabricate_lossy_token_bytes(
+        #[values(Form::Stream, Form::Inline)] form: Form,
+    ) {
         let mut tokenizer = tokenizers::Tokenizer::from_file(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/data/sample-models/TinyLlama_v1.1/tokenizer.json"
@@ -1858,7 +2027,8 @@ mod tests {
                     ..Default::default()
                 }]),
             });
-        let mut stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let mut stream = on_gdl(form, &backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .unwrap();
         let output = stream.next().await.unwrap().data.unwrap();
@@ -1903,8 +2073,11 @@ mod tests {
         }
     }
 
+    #[rstest::rstest]
     #[tokio::test]
-    async fn test_token_text_only_decoded_for_chunks_with_logprobs() {
+    async fn test_token_text_only_decoded_for_chunks_with_logprobs(
+        #[values(Form::Stream, Form::Inline)] form: Form,
+    ) {
         let tokenizer: Arc<dyn traits::Tokenizer> = Arc::new(CandidateDecoder);
         let backend = Backend::from_tokenizer(Tokenizer::from(tokenizer));
         let request = PreprocessedRequest::builder()
@@ -1929,7 +2102,8 @@ mod tests {
                     },
                 ]),
             });
-        let outputs: Vec<_> = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let outputs: Vec<_> = on_gdl(form, &backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .unwrap()
             .filter_map(|item| async move { item.data })
@@ -1946,8 +2120,11 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
     #[tokio::test]
-    async fn test_sglang_local_stop_discards_all_suffix_tokens() {
+    async fn test_sglang_local_stop_discards_all_suffix_tokens(
+        #[values(Form::Stream, Form::Inline)] form: Form,
+    ) {
         use crate::protocols::common::extensions::NvExt;
 
         let tokenizer: Arc<dyn traits::Tokenizer> = Arc::new(CandidateDecoder);
@@ -1969,7 +2146,8 @@ mod tests {
         let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
             Arc::new(SyntheticSglangStopEngine::default());
 
-        let stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let stream = on_gdl(form, &backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .expect("backend generation succeeds");
         let mut outputs = stream.collect::<Vec<_>>().await;
@@ -2023,8 +2201,11 @@ mod tests {
         assert_eq!(generator.get_usage().completion_tokens, 2);
     }
 
+    #[rstest::rstest]
     #[tokio::test]
-    async fn test_no_stop_trim_raw_completion_output() {
+    async fn test_no_stop_trim_raw_completion_output(
+        #[values(Form::Stream, Form::Inline)] form: Form,
+    ) {
         use crate::protocols::common::{
             OutputOptionsProvider, SamplingOptionsProvider, StopConditionsProvider,
         };
@@ -2083,10 +2264,10 @@ mod tests {
                             ..Default::default()
                         }]),
                     });
-                    let mut stream =
-                        Operator::generate(backend.as_ref(), SingleIn::new(input), engine)
-                            .await
-                            .unwrap();
+                    let mut stream = on_gdl(form, &backend, engine)
+                        .generate(SingleIn::new(input))
+                        .await
+                        .unwrap();
                     let output = stream.next().await.unwrap();
                     if no_stop_trim == Some(true) && unsupported {
                         let error = output.error.expect("missing IDs must be rejected");
@@ -2133,8 +2314,11 @@ mod tests {
         }
     }
 
+    #[rstest::rstest]
     #[tokio::test]
-    async fn test_no_stop_trim_terminal_trailers_require_ids_per_choice() {
+    async fn test_no_stop_trim_terminal_trailers_require_ids_per_choice(
+        #[values(Form::Stream, Form::Inline)] form: Form,
+    ) {
         for (index, text, tokens, should_fail) in [
             (0, None, None, false),
             (1, None, None, true),
@@ -2174,7 +2358,8 @@ mod tests {
                         },
                     ]),
                 });
-            let mut stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+            let mut stream = on_gdl(form, &backend, engine)
+                .generate(SingleIn::new(request))
                 .await
                 .unwrap();
             let first = stream.next().await.unwrap().data.unwrap();
@@ -2243,7 +2428,8 @@ mod tests {
                         ..Default::default()
                     }]),
                 });
-            let mut stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+            let mut stream = on_gdl(Form::Inline, &backend, engine)
+                .generate(SingleIn::new(request))
                 .await
                 .unwrap();
             let output = stream.next().await.unwrap().data.unwrap();
@@ -2394,7 +2580,7 @@ mod tests {
     }
 
     /// When the tokenizer's decode() returns Err, Decoder::process_token_ids()
-    /// should propagate the error. In Backend's response stream, this error
+    /// should propagate the error. In the backend decoder stream, this error
     /// gets caught and converted to FinishReason::Error.
     #[test]
     fn test_decoder_process_token_ids_propagates_decode_error() {
@@ -2425,8 +2611,8 @@ mod tests {
         );
     }
 
-    /// Verify that the error message format matches what Backend's response
-    /// stream would wrap into FinishReason::Error.
+    /// Verify that the error message format matches what the backend decoder stream
+    /// closure would wrap into FinishReason::Error.
     #[test]
     fn test_decoder_error_message_format_for_finish_reason() {
         let tokenizer: Arc<dyn traits::Tokenizer> = Arc::new(FailingDecoder);
@@ -2446,7 +2632,7 @@ mod tests {
         let result = decoder.process_token_ids(&[42]);
         let err = result.err().expect("should be Err");
 
-        // This is what Backend's response stream does:
+        // This is what the backend decoder stream does:
         let finish_reason = FinishReason::Error(format!("decode error: {err}"));
         match &finish_reason {
             FinishReason::Error(msg) => {
@@ -2606,6 +2792,7 @@ mod tests {
 
     /// Backend's response to `request`, from `engine`.
     async fn guarded_response(
+        form: Form,
         request: PreprocessedRequest,
         engine: GuardedEngine,
     ) -> ManyOut<Annotated<BackendOutput>> {
@@ -2613,7 +2800,8 @@ mod tests {
         let backend = Backend::from_tokenizer(Tokenizer::from(tokenizer));
         let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
             Arc::new(engine);
-        Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        on_gdl(form, &backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .expect("backend generation succeeds")
     }
@@ -2634,10 +2822,14 @@ mod tests {
             .collect()
     }
 
+    #[rstest::rstest]
     #[tokio::test]
-    async fn backend_flushes_multiple_jailed_choices_on_bare_eof_without_repolling() {
+    async fn backend_flushes_multiple_jailed_choices_on_bare_eof_without_repolling(
+        #[values(Form::Stream, Form::Inline)] form: Form,
+    ) {
         let overpolled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stream = guarded_response(
+            form,
             jailing_request(2),
             GuardedEngine {
                 chunks: bare_eof_multi_choice_chunks(),
@@ -2679,6 +2871,7 @@ mod tests {
     /// Backend's response, from an engine that sends `chunks` for `request`, and the flag that
     /// says the engine's stream was dropped.
     async fn drop_flag_response(
+        form: Form,
         request: PreprocessedRequest,
         chunks: Vec<Annotated<LLMEngineOutput>>,
     ) -> (
@@ -2691,14 +2884,17 @@ mod tests {
             dropped: dropped.clone(),
             ..Default::default()
         };
-        (guarded_response(request, engine).await, dropped)
+        (guarded_response(form, request, engine).await, dropped)
     }
 
     /// Backend lets go of the engine's stream when its own stream ends, not when its caller
     /// drops it, and it stays ended. A caller may hold an ended stream for a while (an HTTP
     /// response still being written); the stages below must see their stream end at once.
+    #[rstest::rstest]
     #[tokio::test]
-    async fn backend_drops_the_engine_stream_when_its_stream_ends() {
+    async fn backend_drops_the_engine_stream_when_its_stream_ends(
+        #[values(Form::Stream, Form::Inline)] form: Form,
+    ) {
         let chunk = |token| {
             Annotated::from_data(LLMEngineOutput {
                 token_ids: vec![token],
@@ -2708,7 +2904,8 @@ mod tests {
         };
 
         // The engine's stream ends on its own.
-        let (mut stream, dropped) = drop_flag_response(jailing_request(1), vec![chunk(1)]).await;
+        let (mut stream, dropped) =
+            drop_flag_response(form, jailing_request(1), vec![chunk(1)]).await;
         let first = stream.next().await.expect("one chunk");
         assert_eq!(
             first.data.and_then(|data| data.text).as_deref(),
@@ -2725,7 +2922,8 @@ mod tests {
         // Backend stops it: a local stop string ends the stream before the engine's ends.
         let mut request = jailing_request(1);
         request.stop_conditions.stop = Some(vec!["abc".to_string()]);
-        let (mut stream, dropped) = drop_flag_response(request, vec![chunk(1), chunk(1)]).await;
+        let (mut stream, dropped) =
+            drop_flag_response(form, request, vec![chunk(1), chunk(1)]).await;
         let first = stream.next().await.expect("the stopping chunk");
         assert!(first.data.is_some_and(|data| data.finish_reason.is_some()));
         assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
@@ -2739,9 +2937,13 @@ mod tests {
 
     /// An engine stream that returns `Pending` before each chunk gives the same output as one
     /// that is always ready.
+    #[rstest::rstest]
     #[tokio::test]
-    async fn backend_output_is_the_same_when_the_engine_is_pending_between_chunks() {
+    async fn backend_output_is_the_same_when_the_engine_is_pending_between_chunks(
+        #[values(Form::Stream, Form::Inline)] form: Form,
+    ) {
         async fn outputs(
+            form: Form,
             pending: bool,
         ) -> Vec<(Option<u32>, Option<String>, Option<FinishReason>)> {
             let engine = GuardedEngine {
@@ -2749,7 +2951,7 @@ mod tests {
                 pending,
                 ..Default::default()
             };
-            guarded_response(jailing_request(2), engine)
+            guarded_response(form, jailing_request(2), engine)
                 .await
                 .map(|output| {
                     let data = output.data.expect("every chunk carries data");
@@ -2765,9 +2967,9 @@ mod tests {
             outputs[4..].sort_by_key(|(index, _, _)| *index);
             outputs
         };
-        let ready = outputs(false).await;
+        let ready = outputs(form, false).await;
         assert_eq!(ready.len(), 6, "{ready:?}");
-        assert_eq!(sorted_flush(outputs(true).await), sorted_flush(ready));
+        assert_eq!(sorted_flush(outputs(form, true).await), sorted_flush(ready));
     }
 
     struct ErrorThenBareEofEngine;
@@ -2824,15 +3026,19 @@ mod tests {
     /// A choice that already ended in a decode error must not be given a second,
     /// synthetic `Stop` chunk by the bare-EOF flush loop -- that would turn a genuine
     /// error into what looks like a normal completion downstream.
+    #[rstest::rstest]
     #[tokio::test]
-    async fn backend_does_not_synthesize_stop_after_choice_decode_error() {
+    async fn backend_does_not_synthesize_stop_after_choice_decode_error(
+        #[values(Form::Stream, Form::Inline)] form: Form,
+    ) {
         let tokenizer: Arc<dyn traits::Tokenizer> = Arc::new(JailingTokenizer);
         let backend = Backend::from_tokenizer(Tokenizer::from(tokenizer));
         let request = jailing_request(2);
         let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
             Arc::new(ErrorThenBareEofEngine);
 
-        let stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let stream = on_gdl(form, &backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .expect("backend generation succeeds");
         let outputs: Vec<_> = stream.collect().await;
@@ -2947,8 +3153,11 @@ mod tests {
     /// because a given chunk skipped the decoder (P2, `jailed_text` erasure), and when it
     /// does flush withheld text into a terminal chunk, that older text must come first, not
     /// be appended after the chunk's own (newer) text (P2, terminal ordering).
+    #[rstest::rstest]
     #[tokio::test]
-    async fn backend_bypass_path_preserves_and_orders_withheld_text() {
+    async fn backend_bypass_path_preserves_and_orders_withheld_text(
+        #[values(Form::Stream, Form::Inline)] form: Form,
+    ) {
         let tokenizer: Arc<dyn traits::Tokenizer> = Arc::new(SingleOTokenizer);
         let backend = Backend::from_tokenizer(Tokenizer::from(tokenizer));
         let request = PreprocessedRequest::builder()
@@ -2970,7 +3179,8 @@ mod tests {
         let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
             Arc::new(MixedBypassEngine);
 
-        let stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let stream = on_gdl(form, &backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .expect("backend generation succeeds");
         let outputs: Vec<_> = stream.collect().await;
@@ -3047,15 +3257,19 @@ mod tests {
     /// annotation (no `data`, hence no per-choice `index`) must also mark every choice
     /// finished, not just choices that fail through a decode error, so the bare-EOF flush
     /// loop does not turn it into a spurious successful `Stop` afterward.
+    #[rstest::rstest]
     #[tokio::test]
-    async fn backend_does_not_synthesize_stop_after_annotated_error() {
+    async fn backend_does_not_synthesize_stop_after_annotated_error(
+        #[values(Form::Stream, Form::Inline)] form: Form,
+    ) {
         let tokenizer: Arc<dyn traits::Tokenizer> = Arc::new(JailingTokenizer);
         let backend = Backend::from_tokenizer(Tokenizer::from(tokenizer));
         let request = jailing_request(1);
         let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
             Arc::new(AnnotatedErrorThenBareEofEngine);
 
-        let stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let stream = on_gdl(form, &backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .expect("backend generation succeeds");
         let outputs: Vec<_> = stream.collect().await;
@@ -3106,8 +3320,11 @@ mod tests {
     }
 
     /// Local EOS detection must not overwrite a worker error that arrives in the same chunk.
+    #[rstest::rstest]
     #[tokio::test]
-    async fn backend_keeps_worker_error_when_chunk_also_hits_eos() {
+    async fn backend_keeps_worker_error_when_chunk_also_hits_eos(
+        #[values(Form::Stream, Form::Inline)] form: Form,
+    ) {
         let tokenizer: Arc<dyn traits::Tokenizer> = Arc::new(CandidateDecoder);
         let backend = Backend::from_tokenizer(Tokenizer::from(tokenizer));
         let request = PreprocessedRequest::builder()
@@ -3124,7 +3341,8 @@ mod tests {
         let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
             Arc::new(ErrorWithEosEngine);
 
-        let stream = Operator::generate(backend.as_ref(), SingleIn::new(request), engine)
+        let stream = on_gdl(form, &backend, engine)
+            .generate(SingleIn::new(request))
             .await
             .expect("backend generation succeeds");
         let outputs: Vec<_> = stream.collect().await;
@@ -3139,5 +3357,265 @@ mod tests {
             vec![FinishReason::Error("worker failed".to_string())],
             "the worker's error must survive a local EOS stop in the same chunk: {outputs:?}"
         );
+    }
+
+    /// One choice that releases "abc" and withholds "STOP", a strict prefix of the stop
+    /// sequence "STOPPED", so a bare end of the engine's stream flushes it with a
+    /// `finish_reason` (see `backend_flushes_multiple_jailed_choices_on_bare_eof_without_repolling`).
+    fn withholding_chunks() -> Vec<Annotated<LLMEngineOutput>> {
+        [1, 2]
+            .into_iter()
+            .map(|token| {
+                Annotated::from_data(LLMEngineOutput {
+                    token_ids: vec![token],
+                    index: Some(0),
+                    ..Default::default()
+                })
+            })
+            .collect()
+    }
+
+    /// Sends [`withholding_chunks`], then does `at_end` to the request's context, then ends
+    /// cleanly: a stop or kill that lands before the engine's stream ends.
+    struct SignalAtEndEngine {
+        at_end: fn(&dyn AsyncEngineContext),
+    }
+
+    #[async_trait]
+    impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>, Error>
+        for SignalAtEndEngine
+    {
+        async fn generate(
+            &self,
+            request: SingleIn<PreprocessedRequest>,
+        ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+            let context = request.context();
+            let signalled = context.clone();
+            let at_end = self.at_end;
+            let end = futures::stream::poll_fn(move |_| {
+                at_end(signalled.as_ref());
+                std::task::Poll::Ready(None)
+            });
+            let stream = futures::stream::iter(withholding_chunks()).chain(end);
+            Ok(ResponseStream::new(Box::pin(stream), context))
+        }
+    }
+
+    /// Backend's response when the engine's stream ends cleanly after `at_end`.
+    async fn signalled_at_end(
+        form: Form,
+        at_end: fn(&dyn AsyncEngineContext),
+    ) -> Vec<Annotated<BackendOutput>> {
+        let tokenizer: Arc<dyn traits::Tokenizer> = Arc::new(JailingTokenizer);
+        let backend = Backend::from_tokenizer(Tokenizer::from(tokenizer));
+        let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
+            Arc::new(SignalAtEndEngine { at_end });
+        on_gdl(form, &backend, engine)
+            .generate(SingleIn::new(jailing_request(1)))
+            .await
+            .expect("backend generation succeeds")
+            .collect()
+            .await
+    }
+
+    fn finish_reasons(outputs: &[Annotated<BackendOutput>]) -> Vec<FinishReason> {
+        outputs
+            .iter()
+            .filter_map(|output| output.data.as_ref()?.finish_reason.clone())
+            .collect()
+    }
+
+    /// A kill before the engine's stream ends cuts the answer: the clean end that follows
+    /// is not a finish, so Backend flushes nothing and marks no choice finished.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn backend_writes_no_finish_after_a_kill(
+        #[values(Form::Stream, Form::Inline)] form: Form,
+    ) {
+        let outputs = signalled_at_end(form, |context| context.kill()).await;
+        assert_eq!(finish_reasons(&outputs), vec![], "{outputs:?}");
+        let text: String = outputs
+            .iter()
+            .filter_map(|output| output.data.as_ref()?.text.as_deref())
+            .collect();
+        assert_eq!(text, "abc", "the withheld text must not be flushed");
+    }
+
+    /// A graceful stop still ends the answer: Backend flushes the withheld text and marks
+    /// the choice finished, as on any clean end.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn backend_still_finishes_after_a_stop(#[values(Form::Stream, Form::Inline)] form: Form) {
+        let outputs = signalled_at_end(form, |context| context.stop_generating()).await;
+        assert_eq!(
+            finish_reasons(&outputs),
+            vec![FinishReason::Stop],
+            "{outputs:?}"
+        );
+    }
+
+    /// Backend's backward half under `cx`, over [`withholding_chunks`] that end cleanly. The
+    /// inline form is called as gdl calls an inline node, but without gdl's own check of the
+    /// attempt before `close`, so that the test sees Backend's.
+    async fn backward_under(form: Form, cx: &gdl::Cx) -> Vec<Annotated<BackendOutput>> {
+        use gdl::inline::{AroundInline, AtEnd, Edit, Verdict};
+        use gdl::{Around, EndedForm};
+        let tokenizer: Arc<dyn traits::Tokenizer> = Arc::new(JailingTokenizer);
+        let backend = Backend::from_tokenizer(Tokenizer::from(tokenizer));
+        let op = GdlOperator::<Backend, PreprocessedRequest>::new(backend);
+        let (_sent, state) =
+            Around::<EndedForm>::forward(&op, cx, Box::new(SingleIn::new(jailing_request(1))))
+                .await
+                .expect("Backend accepts the request");
+        if let Form::Stream = form {
+            let input = gdl::ended::clean(futures::stream::iter(withholding_chunks()));
+            return Around::<EndedForm>::backward(&op, cx, state, input)
+                .collect()
+                .await;
+        }
+        let mut run = AroundInline::start(&op, cx, state);
+        let mut out = Vec::new();
+        for mut item in withholding_chunks() {
+            match run.edit(&mut item) {
+                Verdict::Keep => out.push(item),
+                Verdict::Skip => {}
+                Verdict::Last => panic!("Backend ended on {item:?}: no chunk finishes"),
+                Verdict::End(error) => panic!("Backend ended its stream: {error}"),
+            }
+        }
+        match run.end(None) {
+            AtEnd::Pass(None) => {}
+            AtEnd::Pass(Some(error)) => panic!("Backend failed a clean end: {error}"),
+            AtEnd::Item(item) => out.push(item),
+        }
+        out.extend(std::iter::from_fn(|| run.close()));
+        out.into_iter()
+            .map(<GdlOperator<Backend, PreprocessedRequest> as AroundInline>::convert)
+            .collect()
+    }
+
+    /// A request past its deadline when the engine's stream ends cleanly was cut, as after a
+    /// kill. No Dynamo caller sets a deadline, so this drives the node with a `Cx` that has
+    /// one; the control without one shows the same input does finish.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn backend_writes_no_finish_after_the_deadline(
+        #[values(Form::Stream, Form::Inline)] form: Form,
+    ) {
+        let control = backward_under(form, &gdl::Cx::new()).await;
+        assert_eq!(
+            finish_reasons(&control),
+            vec![FinishReason::Stop],
+            "{control:?}"
+        );
+
+        let past = gdl::Cx::new().with_timeout(std::time::Duration::ZERO);
+        let outputs = backward_under(form, &past).await;
+        assert_eq!(finish_reasons(&outputs), vec![], "{outputs:?}");
+    }
+
+    /// When the engine's stream is dropped, with Backend under the request scope (as Migration
+    /// runs it in pipeline B) and its held text flushed at a bare end of the engine's stream:
+    /// whether it was dropped when the flush reached the caller, and when Backend's stream
+    /// ended.
+    async fn request_scope_release(form: Form) -> (bool, bool) {
+        type Pre = PreprocessedRequest;
+        // Migration forwards the same context, so gdl runs Backend under the request scope.
+        struct Forward;
+        impl gdl::Operator<gdl::EndedForm> for Forward {
+            type UpReq = Boxed<Pre>;
+            type DownReq = Self::UpReq;
+            type UpItem = Annotated<BackendOutput>;
+            type DownItem = Self::UpItem;
+
+            async fn generate<N>(
+                &self,
+                cx: gdl::Cx,
+                request: Self::UpReq,
+                next: N,
+            ) -> gdl::Result<gdl::Ended<Self::UpItem>>
+            where
+                N: gdl::Next<Self::DownReq, Self::DownItem, gdl::EndedForm>,
+            {
+                next.generate(cx, request).await
+            }
+        }
+
+        fn nested<N>(next: N) -> ServerStreamingEngine<Pre, Annotated<BackendOutput>>
+        where
+            N: gdl::Next<Boxed<Pre>, Annotated<BackendOutput>, gdl::EndedForm> + Clone,
+        {
+            Arc::new(dynamo_gdl_adapters::PipelineEngine::<
+                _,
+                Pre,
+                BackendOutput,
+                Boxed<Pre>,
+            >::for_dynamo_stages(gdl::Hop::new(
+                (),
+                gdl::OperatorStage::new(Arc::new(Forward), next),
+                (),
+            )))
+        }
+
+        let tokenizer: Arc<dyn traits::Tokenizer> = Arc::new(JailingTokenizer);
+        let backend = Backend::from_tokenizer(Tokenizer::from(tokenizer));
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let engine: ServerStreamingEngine<Pre, Annotated<LLMEngineOutput>> =
+            Arc::new(GuardedEngine {
+                chunks: withholding_chunks(),
+                dropped: dropped.clone(),
+                ..Default::default()
+            });
+        let inner = crate::operator::testing::sink_stage(engine);
+        let node = Arc::new(GdlOperator::<Backend, Pre>::new(backend));
+        let (forward, backward) = gdl::around(node.clone());
+        let pipeline = match form {
+            Form::Stream => nested(gdl::Hop::new((forward, ()), inner, (backward, ()))),
+            Form::Inline => nested(gdl::Hop::new(
+                (forward, ()),
+                inner,
+                (gdl::inline::InlineHalf::new(node), ()),
+            )),
+        };
+        let mut stream = pipeline
+            .generate(SingleIn::new(jailing_request(1)))
+            .await
+            .expect("backend generation succeeds");
+        for _ in 0..2 {
+            let item = stream.next().await.expect("a chunk").data.expect("data");
+            assert!(item.finish_reason.is_none(), "{form:?}: {item:?}");
+        }
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        let flush = stream.next().await.expect("the flush").data.expect("data");
+        assert_eq!(flush.text.as_deref(), Some("STOP"));
+        assert_eq!(flush.finish_reason, Some(FinishReason::Stop));
+        let at_flush = dropped.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(stream.next().await.is_none(), "{form:?}: one flush");
+        (at_flush, dropped.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Under the request scope no node boundary drops the engine's stream when it ends, so
+    /// Backend's own end must, before its caller drops the response, in both forms.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn backend_drops_the_engine_stream_by_its_end_under_the_request_scope(
+        #[values(Form::Stream, Form::Inline)] form: Form,
+    ) {
+        let (_, at_end) = request_scope_release(form).await;
+        assert!(
+            at_end,
+            "{form:?}: dropped only when the caller drops the response"
+        );
+    }
+
+    /// The stream form reads the engine's stream through `EndedItems`, which drops it when it
+    /// ends, so it is gone before the flush. The inline form keeps it until Backend's stream
+    /// ends, after the flush, as Dynamo's Backend did before gdl: gdl keeps a request-scoped
+    /// node's input until the node's stream ends. The flush is at most one item per choice
+    /// that held text when the engine's stream ended without finishing it.
+    #[tokio::test]
+    async fn backend_stream_form_drops_the_engine_stream_before_the_flush() {
+        let (at_flush, _) = request_scope_release(Form::Stream).await;
+        assert!(at_flush);
     }
 }

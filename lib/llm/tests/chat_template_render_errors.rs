@@ -17,17 +17,19 @@
 use std::sync::Arc;
 
 use anyhow::Error;
+use dynamo_gdl_adapters::{Boxed, EngineSink, PipelineEngine};
 use dynamo_llm::http::service::service_v2::HttpService;
 use dynamo_llm::model_card::ModelDeploymentCard;
-use dynamo_llm::preprocessor::{BackendOutput, OpenAIPreprocessor, PreprocessedRequest};
+use dynamo_llm::preprocessor::{
+    BackendOutput, OpenAIPreprocessor, PreprocessedRequest, PreprocessorNode,
+};
 use dynamo_llm::protocols::Annotated;
 use dynamo_llm::protocols::openai::chat_completions::{
     NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse,
 };
 use dynamo_runtime::CancellationToken;
 use dynamo_runtime::pipeline::{
-    AsyncEngine, AsyncEngineContextProvider, ManyOut, Operator, ResponseStream, SingleIn,
-    async_trait,
+    AsyncEngine, AsyncEngineContextProvider, ManyOut, ResponseStream, SingleIn, async_trait,
 };
 use reqwest::StatusCode;
 
@@ -95,38 +97,38 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>
     }
 }
 
-/// Wires the preprocessor ahead of a backend the way the frontend does in production, so
-/// chat template rendering happens inside the engine the HTTP service calls.
-struct PreprocessingChatEngine {
-    preprocessor: Arc<OpenAIPreprocessor>,
-    backend: Arc<
-        dyn AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>,
-    >,
-}
+type ChatEngine = Arc<
+    dyn AsyncEngine<
+            SingleIn<NvCreateChatCompletionRequest>,
+            ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>,
+            Error,
+        >,
+>;
 
-impl PreprocessingChatEngine {
-    fn new(mdc: ModelDeploymentCard) -> Self {
-        Self {
-            preprocessor: OpenAIPreprocessor::new(mdc).expect("failed to build preprocessor"),
-            backend: Arc::new(EchoBackend),
-        }
-    }
-}
-
-#[async_trait]
-impl
-    AsyncEngine<
-        SingleIn<NvCreateChatCompletionRequest>,
-        ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>,
-        Error,
-    > for PreprocessingChatEngine
-{
-    async fn generate(
-        &self,
-        request: SingleIn<NvCreateChatCompletionRequest>,
-    ) -> Result<ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>, Error> {
-        Operator::generate(self.preprocessor.as_ref(), request, self.backend.clone()).await
-    }
+/// Wires the preprocessor ahead of a backend the way the frontend's gdl pipeline does: an
+/// around node of the hop to the backend, which also takes a speculative prefill. So chat
+/// template rendering happens inside the engine the HTTP service calls.
+fn preprocessing_chat_engine(mdc: ModelDeploymentCard) -> ChatEngine {
+    type Pre = PreprocessedRequest;
+    type Req = NvCreateChatCompletionRequest;
+    let preprocessor = OpenAIPreprocessor::new(mdc).expect("failed to build preprocessor");
+    let backend: Arc<dyn AsyncEngine<SingleIn<Pre>, ManyOut<Annotated<BackendOutput>>, Error>> =
+        Arc::new(EchoBackend);
+    let (forward, backward) = gdl::around(Arc::new(PreprocessorNode::<Req>::new(
+        preprocessor,
+        backend.clone(),
+    )));
+    let sink = gdl::SinkStage::new(Arc::new(EngineSink::<_, Pre, _, Boxed<Pre>>::new(backend)));
+    Arc::new(PipelineEngine::<
+        _,
+        Req,
+        NvCreateChatCompletionStreamResponse,
+        Boxed<Req>,
+    >::for_dynamo_stages(gdl::Source::new(gdl::Hop::new(
+        (forward, ()),
+        sink,
+        (backward, ()),
+    ))))
 }
 
 struct TestService {
@@ -169,7 +171,7 @@ impl TestService {
                 .add_chat_completions_model(
                     model,
                     mdc.mdcsum(),
-                    Arc::new(PreprocessingChatEngine::new(mdc.clone())),
+                    preprocessing_chat_engine(mdc.clone()),
                 )
                 .expect("failed to register model");
         }

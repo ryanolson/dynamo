@@ -5,9 +5,13 @@
 
 #![allow(dead_code)]
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use bytes::Bytes;
 use futures::StreamExt;
 use serde::Serialize;
+use tokio::sync::Notify;
 use tokio_util::codec::FramedRead;
 
 use dynamo_runtime::pipeline::network::{
@@ -16,15 +20,49 @@ use dynamo_runtime::pipeline::network::{
     tcp::TcpStreamConnectionInfo,
 };
 
-/// A frontend's response endpoint: accepts each worker connection, reads its
-/// frames and closes it after the closing sentinel, as the frontend does. It
-/// runs on its own thread, so a test that counts allocations on its own thread
-/// does not count the peer's.
-pub fn start_response_peer() -> String {
+/// A frontend's response endpoint, running on its own thread.
+pub struct ResponsePeer {
+    /// Where a request's response stream connects.
+    pub address: String,
+    closed: Arc<Closed>,
+}
+
+/// Connections the peer has closed.
+#[derive(Default)]
+struct Closed {
+    count: AtomicUsize,
+    notify: Notify,
+}
+
+impl ResponsePeer {
+    /// Waits until the peer has closed `n` connections in all. It reads no
+    /// clock, so its cost under callgrind does not follow wall-clock time.
+    pub async fn closed(&self, n: usize) {
+        loop {
+            // Created before the check, so a close between the two still wakes it.
+            let notified = self.closed.notify.notified();
+            if self.closed.count.load(Ordering::Acquire) >= n {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Starts a frontend's response endpoint: it accepts each worker connection,
+/// reads its frames and closes it after the closing sentinel, as the frontend
+/// does. It runs on its own thread, so a test that counts allocations on its
+/// own thread does not count the peer's, and that thread turns callgrind's
+/// counting off.
+pub fn start_response_peer() -> ResponsePeer {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap().to_string();
     listener.set_nonblocking(true).unwrap();
+    let closed = Arc::new(Closed::default());
+    let peer_closed = closed.clone();
     std::thread::spawn(move || {
+        // A frontend's work, not the worker's: keep it out of callgrind's count.
+        super::callgrind::stop_counting_thread();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -33,6 +71,7 @@ pub fn start_response_peer() -> String {
             let listener = tokio::net::TcpListener::from_std(listener).unwrap();
             loop {
                 let (socket, _) = listener.accept().await.unwrap();
+                let closed = peer_closed.clone();
                 tokio::spawn(async move {
                     let sentinel = serde_json::to_vec(&ControlMessage::Sentinel).unwrap();
                     let mut frames = FramedRead::new(socket, TwoPartCodec::default());
@@ -43,11 +82,14 @@ pub fn start_response_peer() -> String {
                             break;
                         }
                     }
+                    drop(frames);
+                    closed.count.fetch_add(1, Ordering::Release);
+                    closed.notify.notify_waiters();
                 });
             }
         });
     });
-    address
+    ResponsePeer { address, closed }
 }
 
 /// One single-in, many-out request-plane frame, as a frontend sends it. Its
