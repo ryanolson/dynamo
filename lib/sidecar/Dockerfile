@@ -51,7 +51,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH \
-    RUST_VERSION=1.96.1
+    RUST_VERSION=1.99.0
 
 RUN ARCH_ALT=$(case "${TARGETARCH:-$(dpkg --print-architecture)}" in \
         amd64) echo "x86_64" ;; \

@@ -37,7 +37,7 @@ IMAGE_BUILD_CMD ?= $(DOCKER_BUILDX_CMD) build
 # Docker Hub official images are mirrored under the library/ namespace (e.g.
 # ${DOCKER_PROXY}library/rust), so keep library/ in the defaults or the ECR
 # Docker Hub mirror fails to resolve the base images.
-RUST_IMAGE ?= $(DOCKER_PROXY)library/rust:1.96.1
+RUST_IMAGE ?= $(DOCKER_PROXY)library/rust:1.99.0
 BASE_IMAGE ?= $(DOCKER_PROXY)library/ubuntu:24.04
 
 # Container tool

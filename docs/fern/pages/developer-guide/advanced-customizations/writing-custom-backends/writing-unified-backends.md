@@ -940,7 +940,7 @@ inside `dynamo-runtime`:
 
    ```toml
    [toolchain]
-   channel = "1.96.1"
+   channel = "1.99.0"
    ```
 
    Older toolchains fail with `feature edition2024 is required`.
