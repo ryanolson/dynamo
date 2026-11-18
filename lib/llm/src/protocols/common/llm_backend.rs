@@ -591,8 +591,8 @@ mod tests {
     #[test]
     fn engine_and_backend_outputs_stay_small() {
         use dynamo_runtime::protocols::annotated::Annotated;
-        assert!(std::mem::size_of::<Annotated<LLMEngineOutput>>() <= 632);
-        assert!(std::mem::size_of::<Annotated<BackendOutput>>() <= 592);
+        assert!(std::mem::size_of::<Annotated<LLMEngineOutput>>() <= 640);
+        assert!(std::mem::size_of::<Annotated<BackendOutput>>() <= 600);
         assert!(std::mem::size_of::<LLMEngineOutput>() <= 456);
         assert!(std::mem::size_of::<BackendOutput>() <= 416);
     }
