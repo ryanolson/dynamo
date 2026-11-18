@@ -508,11 +508,10 @@ impl AsyncEngine<Input, Output, Error> for ConcurrentEchoEngine {
     }
 }
 
-/// Concurrent requests sharing a client id each get their own output through
-/// the frontend pipeline, which matches responses to callers by context id.
+/// Concurrent requests sharing a client id each get their own output, and the
+/// engine sees a distinct context id for each.
 #[tokio::test]
 async fn concurrent_requests_sharing_a_client_id_get_their_own_output() {
-    use dynamo_runtime::pipeline::{ServiceBackend, ServiceFrontend, Source};
     for (format, body, header_id) in [
         (
             sglang(),
@@ -529,19 +528,13 @@ async fn concurrent_requests_sharing_a_client_id_get_their_own_output() {
             barrier: tokio::sync::Barrier::new(2),
             seen: std::sync::Mutex::new(Vec::new()),
         });
-        let frontend = ServiceFrontend::<Input, Output>::new();
-        let pipeline = frontend
-            .link(ServiceBackend::from_engine(engine.clone()))
-            .unwrap()
-            .link_terminal(frontend)
-            .unwrap();
         let state = state();
         let mut card = dynamo_llm::model_card::ModelDeploymentCard::with_name_only("test-model");
         card.runtime_config
             .runtime_data
             .insert(format.capability().into(), Value::Bool(true));
         let ws = dynamo_llm::discovery::WorkerSet::new("test".into(), "test".into(), card)
-            .with_generate_engine(pipeline);
+            .with_generate_engine(engine.clone());
         assert!(state.manager().add_worker_set("test-model", "test", ws));
         let (_, router) = format_generate::router(state, None, format.clone());
         let tokens_key = if format.name() == "sglang" {
