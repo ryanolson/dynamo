@@ -463,17 +463,17 @@ mod tests {
         markers(&items)
     }
 
-    /// On a clean end the jail closes the open call and finishes the answer. After a kill
-    /// it writes nothing of that.
+    /// On a clean end the Nemotron Deci jail closes its buffered call and finishes the answer.
+    /// A kill suppresses that tool call and finish.
     #[tokio::test]
-    async fn the_jail_writes_no_tool_call_or_finish_after_a_kill() {
+    async fn nemotron_deci_sends_no_buffered_tool_call_or_finish_after_a_kill() {
         let stopped = jail_after(stop).await;
         assert_ne!(stopped, Markers::default(), "the control must write on end");
         assert_eq!(jail_after(kill).await, Markers::default());
     }
 
     #[tokio::test]
-    async fn the_jail_writes_no_tool_call_or_finish_after_the_deadline() {
+    async fn nemotron_deci_sends_no_buffered_tool_call_or_finish_after_the_deadline() {
         let jail = |cx: gdl::Cx| async move {
             let items = through_node::<
                 _,
@@ -491,9 +491,10 @@ mod tests {
         assert_eq!(jail(past_deadline()).await, Markers::default());
     }
 
-    /// Hermes streams incomplete arguments before EOF. A cut must leave the prefix alone.
+    /// Hermes can stream a role and partial arguments before the cut check at input EOF,
+    /// even with an expired deadline. A cut adds no finish, usage, error or closing frame.
     #[tokio::test]
-    async fn hermes_keeps_its_provisional_prefix_on_kill_and_deadline() {
+    async fn hermes_cut_keeps_the_prefix_and_sends_no_finish_usage_error_or_closing_frame() {
         use futures::FutureExt;
 
         for deadline in [false, true] {
