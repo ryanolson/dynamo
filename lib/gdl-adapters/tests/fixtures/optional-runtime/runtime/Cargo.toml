@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Stands in for gdl's runtime: the guard refuses it by name.
+[package]
+name = "gdl-runtime"
+version = "0.0.0"
+edition = "2024"
+publish = false
