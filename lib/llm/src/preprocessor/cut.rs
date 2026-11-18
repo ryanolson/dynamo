@@ -149,7 +149,7 @@ mod tests {
     /// A tool call the engine had not closed when its stream ended.
     fn open_tool_call() -> Vec<BackendOutput> {
         vec![
-            output("<tool_call>\n{\"name\": \"get_weather\", ", None),
+            output("<TOOLCALL>[{\"name\": \"get_weather\", ", None),
             output("\"arguments\": {\"city\": \"Par", None),
         ]
     }
@@ -454,7 +454,7 @@ mod tests {
             _,
             crate::types::openai::chat_completions::NvCreateChatCompletionStreamResponse,
         >(
-            preprocessor(TOOL_MODEL, Some("hermes")),
+            preprocessor(TOOL_MODEL, Some("nemotron_deci")),
             tool_request(),
             open_tool_call(),
             at_end,
@@ -479,7 +479,7 @@ mod tests {
                 _,
                 crate::types::openai::chat_completions::NvCreateChatCompletionStreamResponse,
             >(
-                preprocessor(TOOL_MODEL, Some("hermes")),
+                preprocessor(TOOL_MODEL, Some("nemotron_deci")),
                 tool_request(),
                 open_tool_call(),
                 &cx,
@@ -489,6 +489,94 @@ mod tests {
         };
         assert_ne!(jail(gdl::Cx::new()).await, Markers::default());
         assert_eq!(jail(past_deadline()).await, Markers::default());
+    }
+
+    /// Hermes streams incomplete arguments before EOF. A cut must leave the prefix alone.
+    #[tokio::test]
+    async fn hermes_keeps_its_provisional_prefix_on_kill_and_deadline() {
+        use futures::FutureExt;
+
+        for deadline in [false, true] {
+            let cx = if deadline {
+                past_deadline()
+            } else {
+                gdl::Cx::new()
+            };
+            let mut req = tool_request();
+            req.inner.stream_options = Some(dynamo_protocols::types::ChatCompletionStreamOptions {
+                include_usage: true,
+                continuous_usage_stats: false,
+            });
+            let request = Context::new(req);
+            let controller = request.context();
+            let below: BelowEngine = Arc::new(SignalAtEnd {
+                outputs: vec![],
+                at_end: |_| {},
+            });
+            let node = PreprocessorNode::<NvCreateChatCompletionRequest>::new(
+                preprocessor(TOOL_MODEL, Some("hermes")),
+                below,
+            );
+            let (_, state) = node
+                .forward(&cx, Box::new(request))
+                .await
+                .unwrap_or_else(|_| panic!("the preprocessor accepts the request"));
+            let (tx, rx) = futures::channel::mpsc::unbounded();
+            for text in [
+                r#"<tool_call>
+{"name": "get_weather", "#,
+                r#""arguments": {"city": "Par"#,
+            ] {
+                tx.unbounded_send(Annotated::from_data(output(text, None)))
+                    .unwrap();
+            }
+            let mut frames = node.backward(&cx, state, gdl::ended::clean(rx));
+            let (role, prefix) = tokio::time::timeout(Duration::from_secs(5), async {
+                let role = frames.next().await.expect("assistant role before EOF");
+                let prefix = frames.next().await.expect("tool arguments before EOF");
+                (role, prefix)
+            })
+            .await
+            .expect("Hermes emits its provisional prefix while input is open");
+            let data = |frame: &Annotated<
+                crate::types::openai::chat_completions::NvCreateChatCompletionStreamResponse,
+            >| {
+                assert!(!frame.is_error());
+                serde_json::to_value(frame.data.as_ref().unwrap()).unwrap()
+            };
+            let role_data = data(&role);
+            assert_eq!(role_data["choices"][0]["delta"]["role"], "assistant");
+            let prefix_data = data(&prefix);
+            let call = &prefix_data["choices"][0]["delta"]["tool_calls"][0]["function"];
+            assert_eq!(call["name"], "get_weather");
+            assert_eq!(call["arguments"], r#"{"city": "Par"#);
+            assert_eq!(
+                prefix_data["tool_call_completion"],
+                serde_json::json!([
+                    {"choice_index": 0, "tool_index": 0, "complete": false}
+                ])
+            );
+            assert_eq!(
+                markers(&[role, prefix]),
+                Markers {
+                    tool_calls: 1,
+                    ..Markers::default()
+                }
+            );
+            assert!(
+                frames.next().now_or_never().is_none(),
+                "input is still open"
+            );
+
+            if !deadline {
+                controller.kill();
+            }
+            drop(tx);
+            assert!(
+                frames.next().await.is_none(),
+                "the cut emits no closing frame"
+            );
+        }
     }
 
     #[tokio::test]
