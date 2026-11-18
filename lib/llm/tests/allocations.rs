@@ -44,20 +44,19 @@
 //! core count changes the counts.
 //!
 //! Measured on a 20-core aarch64 Linux host, Rust 1.99.0, 200 requests after 50 of warm-up,
-//! for the typical request. Debug and release builds give the same numbers:
+//! for the typical request using the test profile.
 //!
 //! | Row | Allocations, 1 item | Bytes, 1 item | Allocations, 16 items | Bytes, 16 items |
 //! |---|---:|---:|---:|---:|
-//! | `engine` | 7 | 2,752 | 22 | 2,812 |
-//! | `a-gdl` | 326 | 63,871 | 839 | 85,359 |
-//! | `b-gdl` | 343 | 80,554 | 856 | 102,042 |
-//! | `c-gdl` | 38 | 28,188 | 53 | 28,248 |
-//! | `embed-engine` | 8 | 6,548 | 23 | 88,868 |
-//! | `embeddings-gdl` | 177 | 41,719 | 2,261 | 527,167 |
+//! | `engine` | 6 | 2,504 | 21 | 2,564 |
+//! | `a-gdl` | 325 | 61,213 | 838 | 82,701 |
+//! | `b-gdl` | 341 | 78,000 | 854 | 99,488 |
+//! | `c-gdl` | 36 | 28,388 | 51 | 28,448 |
+//! | `embed-engine` | 7 | 6,228 | 22 | 88,548 |
+//! | `embeddings-gdl` | 173 | 39,783 | 2,212 | 497,607 |
 //!
-//! At the switch the Dynamo `link` chains made more allocations than these rows at both item
-//! counts, the same number more at each, so nothing per item: `a` +18 (346 and 859), `b` +56
-//! (399 and 912), `c` +33 (71 and 86), `embed` +22 (199 and 2,283).
+//! With the same dependencies, Dynamo's linked chains made 23 more allocations on A, 59 on B,
+//! 33 on C and 22 on embeddings. Each difference was the same for one and 16 items.
 //!
 //! The rows carry the chat and preprocessed requests boxed (`dynamo_gdl_adapters::Boxed`),
 //! accepted at one allocation per box: `a-gdl` and `b-gdl` +2 (the chat request where it enters
@@ -82,7 +81,7 @@
 //! The largest allocation of `b` and `c` was Migration's boxed future, 59,592 bytes per request;
 //! the largest of `b-gdl` was 13,376 bytes and of `c-gdl` 12,256 (debug build, gdl 165b166c).
 //!
-//! Run: `cargo test -p dynamo-llm --test allocations`. For instructions and `memcpy` calls per
+//! Run `cargo test --locked -p dynamo-llm --test allocations`. For instructions and `memcpy` calls per
 //! request, see `lib/llm/benches/callgrind.sh` and `hotpath.sh`, which run this binary under
 //! callgrind as `allocations row <row> <items> <requests>`. Callgrind counts only the measured
 //! requests: the binary asks it for one dump after warm-up and one after the last measured
@@ -129,27 +128,27 @@ const MODEL_PATH: &str = "tests/data/sample-models/TinyLlama_v1.1";
 const WARMUP: usize = 50;
 const REQUESTS: usize = 200;
 
-/// Recorded allocations and bytes of the typical request (see [`Measured::typical`]). Debug
-/// and release builds give the same numbers.
+/// Recorded allocations and bytes of the typical request (see [`Measured::typical`]). The
+/// byte records use the pinned toolchain.
 const BASELINE: &[Row] = &[
     // Every gdl row: +1 for the request id `PipelineEngine` holds while it dispatches, to
     // refuse a second in-flight request with that id, and -1 for the response, which leaves
     // in one box with no `ResponseStream` around it.
-    row("engine", 1, 7, 2752),
-    row("engine", 16, 22, 2812),
+    row("engine", 1, 6, 2504),
+    row("engine", 16, 21, 2564),
     // +2 for the boxed chat and preprocessed requests (see the module docs).
-    row("a-gdl", 1, 327, 63873),
-    row("a-gdl", 16, 840, 85361),
+    row("a-gdl", 1, 325, 61213),
+    row("a-gdl", 16, 838, 82701),
     // +2 for the boxed chat and preprocessed requests (see the module docs).
-    row("b-gdl", 1, 344, 80508),
-    row("b-gdl", 16, 857, 101996),
+    row("b-gdl", 1, 341, 78000),
+    row("b-gdl", 16, 854, 99488),
     // +1 for the boxed preprocessed request (see the module docs).
-    row("c-gdl", 1, 38, 28196),
-    row("c-gdl", 16, 53, 28256),
-    row("embed-engine", 1, 8, 6548),
-    row("embed-engine", 16, 23, 88868),
-    row("embeddings-gdl", 1, 177, 41727),
-    row("embeddings-gdl", 16, 2261, 527175),
+    row("c-gdl", 1, 36, 28388),
+    row("c-gdl", 16, 51, 28448),
+    row("embed-engine", 1, 7, 6228),
+    row("embed-engine", 16, 22, 88548),
+    row("embeddings-gdl", 1, 173, 39783),
+    row("embeddings-gdl", 16, 2212, 497607),
 ];
 
 #[global_allocator]
