@@ -268,7 +268,7 @@ async fn main() -> Result<()> {
 
     println!("\n=== Results ===");
     println!("Processed {} texts", texts.len());
-    println!("First decoded text: {}", &decoded[0]);
+    println!("First decoded text: {}", decoded[0]);
 
     // Print metrics
     let metrics = pool.metrics();

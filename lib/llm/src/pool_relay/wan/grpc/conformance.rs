@@ -573,6 +573,7 @@ async fn initial_catalog(
     )
 }
 
+#[allow(clippy::result_large_err)]
 async fn subscribe_pool(
     client: &mut proto::KvEventRelayClient<Channel>,
     producer: proto::ProducerIdentity,

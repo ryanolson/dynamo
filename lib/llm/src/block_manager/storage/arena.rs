@@ -163,7 +163,7 @@ impl<S: Storage> ArenaBuffer<S> {
 
 mod nixl {
     use super::super::nixl::*;
-    use super::super::*;
+
     use super::*;
 
     impl<S: Storage> ArenaBuffer<S>

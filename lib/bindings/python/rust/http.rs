@@ -222,7 +222,7 @@ where
                         if let Ok(HttpError { code, message }) = py_err.value(py).extract() {
                             // SSE panics if there are carriage returns or newlines
                             let message = message.replace(['\r', '\n'], "");
-                            return Err(http_error::HttpError { code, message })?;
+                            Err(http_error::HttpError { code, message })?;
                         }
                         Err(error!("Python Error: {}", py_err))
                     })

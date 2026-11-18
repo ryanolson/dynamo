@@ -63,7 +63,7 @@ impl<R: Clone + Eq + Hash, P: Clone + Eq + Hash, V> PoolViews<R, P, V> {
     pub fn open(&mut self, relay: R) -> StreamToken<R> {
         static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
         let generation = NEXT_GENERATION
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
             .expect("relay stream generation overflow")

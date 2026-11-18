@@ -78,6 +78,7 @@ use crate::protocols::openai::completions::{
 };
 
 pub mod inference {
+    #![allow(clippy::result_large_err)]
     tonic::include_proto!("inference");
 }
 use inference::grpc_inference_service_server::{GrpcInferenceService, GrpcInferenceServiceServer};
@@ -435,6 +436,7 @@ impl InferRequest {
     /// Run the request to completion and fold the stream into a single unary
     /// [`ModelInferResponse`]. Streaming completion requests are rejected here,
     /// matching the unary endpoint's contract.
+    #[allow(clippy::result_large_err)]
     async fn unary_response(
         self,
         state: Arc<State>,
@@ -487,6 +489,7 @@ impl InferRequest {
     /// Produce a stream of [`ModelStreamInferResponse`] for the streaming
     /// endpoint. Non-streaming completion requests are folded into a single
     /// response; streaming ones are forwarded delta-by-delta.
+    #[allow(clippy::result_large_err)]
     async fn stream_response<'a>(
         self,
         state: Arc<State>,

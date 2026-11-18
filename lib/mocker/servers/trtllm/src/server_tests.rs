@@ -93,6 +93,7 @@ fn request(request_id: &str, max_tokens: u32) -> pb::GenerateRequest {
     }
 }
 
+#[allow(clippy::result_large_err)]
 async fn drain(
     service: &TrtllmMockerService,
     request: pb::GenerateRequest,

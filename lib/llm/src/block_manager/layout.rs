@@ -680,16 +680,15 @@ impl LayerSeparateConfig {
 
         let outer_dim_stride_in_bytes;
         let block_stride_in_bytes;
-        let layout_data_bytes;
 
-        if is_outer_contiguous {
+        let layout_data_bytes = if is_outer_contiguous {
             block_stride_in_bytes = if alignment > 1 {
                 align_up(memory_region_size, alignment)
             } else {
                 memory_region_size
             };
             outer_dim_stride_in_bytes = block_stride_in_bytes * config.num_blocks;
-            layout_data_bytes = outer_dim_stride_in_bytes * config.outer_dim;
+            outer_dim_stride_in_bytes * config.outer_dim
         } else {
             outer_dim_stride_in_bytes = memory_region_size;
             let natural_block_stride = outer_dim_stride_in_bytes * config.outer_dim;
@@ -698,8 +697,8 @@ impl LayerSeparateConfig {
             } else {
                 natural_block_stride
             };
-            layout_data_bytes = block_stride_in_bytes * config.num_blocks;
-        }
+            block_stride_in_bytes * config.num_blocks
+        };
 
         Ok(Self {
             inner: config,

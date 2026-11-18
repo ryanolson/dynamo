@@ -740,7 +740,7 @@ impl Inner {
 
     fn reserve_entry(&self) -> bool {
         self.entry_count
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                 (count < self.max_entries).then_some(count + 1)
             })
             .is_ok()

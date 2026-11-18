@@ -23,6 +23,7 @@ pub mod kserve_test {
 
     // For using gRPC client for test
     pub mod inference {
+        #![allow(clippy::result_large_err)]
         tonic::include_proto!("inference");
     }
     use dynamo_llm::model_card::ModelDeploymentCard;

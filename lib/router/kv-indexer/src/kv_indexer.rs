@@ -237,6 +237,7 @@ pub struct KvEventSender {
 }
 
 impl KvEventSender {
+    #[allow(clippy::result_large_err)]
     pub async fn send(
         &self,
         event: RouterEvent,

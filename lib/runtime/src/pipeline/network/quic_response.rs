@@ -2433,7 +2433,7 @@ fn decode_fingerprint(encoded: &str) -> Result<[u8; 32]> {
         bail!("invalid ASCII SHA-256 fingerprint length {}", bytes.len());
     }
     let mut decoded = [0_u8; 32];
-    for (pair, output) in bytes.chunks_exact(2).zip(&mut decoded) {
+    for (pair, output) in bytes.as_chunks::<2>().0.iter().zip(&mut decoded) {
         let high = decode_hex_digit(pair[0])?;
         let low = decode_hex_digit(pair[1])?;
         *output = (high << 4) | low;

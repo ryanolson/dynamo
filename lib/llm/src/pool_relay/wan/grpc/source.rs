@@ -50,6 +50,7 @@ impl GrpcPublicationSource {
         self.publication.watch_readiness()
     }
 
+    #[allow(clippy::result_large_err)]
     pub(super) async fn subscribe_pool(
         &self,
         pool_id: PoolId,
