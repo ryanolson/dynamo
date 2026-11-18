@@ -1488,6 +1488,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ingress_without_an_engine_returns_a_generate_error_and_sends_a_typed_prologue() {
+        use crate::pipeline::network::ResponseStreamPrologue;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let publisher = StreamSender {
+            tx,
+            prologue: Some(ResponseStreamPrologue {
+                error: None,
+                typed_error: None,
+            }),
+        };
+        let error = TestIngress::new()
+            .generate_and_publish(
+                Context::new(serde_json::json!({})),
+                RequestPlanePayloadCodec::Json,
+                Instant::now(),
+                ResponsePlaneModes {
+                    configured: ResponsePlaneMode::Tcp,
+                    advertised: ResponsePlaneMode::Tcp,
+                },
+                &LifecycleTrace::new(false),
+                publisher,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, PipelineError::GenerateError(cause) if cause.to_string() == "Ingress has no engine")
+        );
+        let frame = rx.recv().await.expect("error prologue");
+        let prologue: ResponseStreamPrologue =
+            serde_json::from_slice(frame.header().unwrap()).unwrap();
+        assert_eq!(prologue.error, Some(error.to_string()));
+        assert_eq!(prologue.typed_error.unwrap().class(), ErrorType::Internal);
+    }
+
+    #[tokio::test]
     async fn response_plane_mismatch_reports_error_before_generate() {
         for (configured, advertised) in [
             (ResponsePlaneMode::Tcp, ResponsePlaneMode::Quic),
