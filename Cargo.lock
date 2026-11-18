@@ -876,9 +876,9 @@ dependencies = [
 
 [[package]]
 name = "axum"
-version = "0.8.4"
+version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "021e862c184ae977658b36c4500f7feac3221ca5da43e3f25bd04ab6c79a29b5"
+checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
 dependencies = [
  "axum-core 0.5.6",
  "axum-macros",
@@ -898,15 +898,14 @@ dependencies = [
  "multer",
  "percent-encoding",
  "pin-project-lite",
- "rustversion",
- "serde",
+ "serde_core",
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
  "sha1",
  "sync_wrapper 1.0.2",
  "tokio",
- "tokio-tungstenite",
+ "tokio-tungstenite 0.29.0",
  "tower 0.5.3",
  "tower-layer",
  "tower-service",
@@ -2474,7 +2473,7 @@ version = "1.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum 0.8.4",
+ "axum 0.8.9",
  "futures",
  "reqwest 0.12.28",
  "serde",
@@ -2502,7 +2501,7 @@ version = "1.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum 0.8.4",
+ "axum 0.8.9",
  "bytes",
  "dashmap",
  "dynamo-kv-events",
@@ -2549,7 +2548,7 @@ version = "1.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum 0.8.4",
+ "axum 0.8.9",
  "dynamo-llm",
  "dynamo-runtime",
  "dynamo-sglang-generate",
@@ -2580,7 +2579,7 @@ dependencies = [
 name = "dynamo-global-discovery-client"
 version = "1.8.0"
 dependencies = [
- "axum 0.8.4",
+ "axum 0.8.9",
  "dynamo-global-common",
  "reqwest 0.12.28",
  "serde",
@@ -2601,7 +2600,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-dynamodb",
- "axum 0.8.4",
+ "axum 0.8.9",
  "blake3",
  "clap",
  "dynamo-global-common",
@@ -2628,7 +2627,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-dynamodb",
- "axum 0.8.4",
+ "axum 0.8.9",
  "clap",
  "dynamo-global-common",
  "dynamo-global-discovery-client",
@@ -2714,7 +2713,7 @@ name = "dynamo-http-server"
 version = "1.8.0"
 dependencies = [
  "anyhow",
- "axum 0.8.4",
+ "axum 0.8.9",
  "dynamo-runtime",
  "futures",
  "hyper-util",
@@ -2811,7 +2810,7 @@ version = "1.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum 0.8.4",
+ "axum 0.8.9",
  "blake3",
  "chrono",
  "criterion",
@@ -2864,7 +2863,7 @@ dependencies = [
  "async-nats",
  "async-stream",
  "async-trait",
- "axum 0.8.4",
+ "axum 0.8.9",
  "base64 0.22.1",
  "bincode 2.0.1",
  "bitflags 2.13.2",
@@ -2973,7 +2972,7 @@ dependencies = [
  "tokio-rayon",
  "tokio-rustls",
  "tokio-stream",
- "tokio-tungstenite",
+ "tokio-tungstenite 0.26.2",
  "tokio-util",
  "tonic 0.13.1",
  "tonic-build 0.13.1",
@@ -3037,7 +3036,7 @@ dependencies = [
  "anyhow",
  "async-stream",
  "async-trait",
- "axum 0.8.4",
+ "axum 0.8.9",
  "clap",
  "dynamo-backend-common",
  "dynamo-runtime",
@@ -3262,7 +3261,7 @@ name = "dynamo-rl"
 version = "1.8.0"
 dependencies = [
  "anyhow",
- "axum 0.8.4",
+ "axum 0.8.9",
  "dynamo-runtime",
  "futures",
  "serde",
@@ -3313,7 +3312,7 @@ dependencies = [
  "async-once-cell",
  "async-stream",
  "async-trait",
- "axum 0.8.4",
+ "axum 0.8.9",
  "base64 0.22.1",
  "bincode 1.3.3",
  "blake3",
@@ -3343,7 +3342,7 @@ dependencies = [
  "local-ip-address",
  "log",
  "lru",
- "mio 1.2.2",
+ "mio 1.2.4",
  "nix 0.30.1",
  "notify",
  "nuid",
@@ -3452,7 +3451,7 @@ dependencies = [
 name = "dynamo-sglang-generate"
 version = "1.8.0"
 dependencies = [
- "axum 0.8.4",
+ "axum 0.8.9",
  "base64 0.22.1",
  "dynamo-llm",
  "dynamo-protocols 10.0.1",
@@ -3721,7 +3720,7 @@ name = "dynamo-vllm-generate"
 version = "1.8.0"
 dependencies = [
  "anyhow",
- "axum 0.8.4",
+ "axum 0.8.9",
  "base64 0.22.1",
  "dynamo-kv-events",
  "dynamo-kv-hashing",
@@ -6462,9 +6461,9 @@ dependencies = [
 
 [[package]]
 name = "mio"
-version = "1.2.2"
+version = "1.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30d65c71f1ce40ab09135ce117d742b9f8a19ff91a41a8b57ed50bc2de59c427"
+checksum = "1788edb87fdc09c7e26304471e2f5be8cdefb1b6930d6e3985fc02ff53bf86ee"
 dependencies = [
  "libc",
  "log",
@@ -10406,7 +10405,7 @@ checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",
- "mio 1.2.2",
+ "mio 1.2.4",
  "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
@@ -10481,7 +10480,19 @@ dependencies = [
  "futures-util",
  "log",
  "tokio",
- "tungstenite",
+ "tungstenite 0.26.2",
+]
+
+[[package]]
+name = "tokio-tungstenite"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
+dependencies = [
+ "futures-util",
+ "log",
+ "tokio",
+ "tungstenite 0.29.0",
 ]
 
 [[package]]
@@ -10642,7 +10653,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e581ba15a835f4d9ea06c55ab1bd4dce26fc53752c69a04aac00703bfb49ba9"
 dependencies = [
  "async-trait",
- "axum 0.8.4",
+ "axum 0.8.9",
  "base64 0.22.1",
  "bytes",
  "h2 0.4.14",
@@ -10672,7 +10683,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac2a5518c70fa84342385732db33fb3f44bc4cc748936eb5833d2df34d6445ef"
 dependencies = [
  "async-trait",
- "axum 0.8.4",
+ "axum 0.8.9",
  "base64 0.22.1",
  "bytes",
  "h2 0.4.14",
@@ -11008,6 +11019,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tungstenite"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c01152af293afb9c7c2a57e4b559c5620b421f6d133261c60dd2d0cdb38e6b8"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http 1.4.1",
+ "httparse",
+ "log",
+ "rand 0.9.4",
+ "sha1",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "turbojpeg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11327,7 +11354,7 @@ version = "10.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f1fd2f9615838885c6ff4115fde8a2b58825dc7b4617f78d29c167377a15c92"
 dependencies = [
- "axum 0.8.4",
+ "axum 0.8.9",
  "base64 0.23.1",
  "mime_guess",
  "regex",
