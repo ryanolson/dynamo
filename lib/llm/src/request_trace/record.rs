@@ -81,6 +81,7 @@ pub(crate) fn emit_request_end(
         input_tokens: tracker.isl_tokens().map(|v| v as u64),
         output_tokens: Some(tracker.osl_tokens()),
         cached_tokens: tracker.cached_tokens().map(|v| v as u64),
+        engine_reused_tokens: tracker.engine_reused_tokens(),
         request_received_ms: Some(timing.request_received_ms),
         prefill_wait_time_ms: timing.prefill_wait_time_ms,
         prefill_time_ms: timing.prefill_time_ms,
@@ -239,6 +240,7 @@ mod tests {
         let tracker = RequestTracker::new();
         tracker.record_isl(8, Some(4));
         tracker.record_kv_hit(2.0, 4);
+        tracker.record_engine_reused_tokens(6);
         tracker.record_osl(7);
         tracker.record_finish();
 
@@ -271,6 +273,7 @@ mod tests {
         assert_eq!(request.input_tokens, Some(8));
         assert_eq!(request.output_tokens, Some(7));
         assert_eq!(request.cached_tokens, Some(4));
+        assert_eq!(request.engine_reused_tokens, Some(6));
         assert_eq!(request.kv_hit_rate, Some(0.5));
         assert_eq!(
             request.request_received_ms,

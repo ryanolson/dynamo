@@ -1222,3 +1222,36 @@ async fn test_postprocessor_output_is_the_same_when_the_backend_is_pending_betwe
     assert_eq!(pending, ready);
     assert!(ready.last().is_some_and(|chunk| chunk.3), "{ready:?}");
 }
+
+#[rstest::rstest]
+#[case::backend_reports_cached_tokens(Some(5), Some(5))]
+#[case::backend_reports_no_usage(None, None)]
+#[tokio::test]
+async fn test_traced_request_records_final_usage_cached_tokens(
+    #[case] backend_cached: Option<u32>,
+    #[case] expected: Option<u64>,
+) {
+    // The client did not ask for usage; the trace still records the engine's count.
+    let request = create_chat_request(None, Some(true));
+    let mut response_generator = Box::new(request.response_generator("trace-usage-1".to_string()));
+    let tracker = response_generator.tracker();
+    // The router's estimate, recorded at selection, stays apart.
+    tracker.record_isl(0, Some(3));
+    response_generator.update_isl(0);
+
+    let ctx = Arc::new(MockContext::new());
+    let backend_stream = create_backend_stream_with_cached_tokens(ctx.clone(), backend_cached);
+    let transformed_stream = OpenAIPreprocessor::transform_postprocessor_stream(
+        backend_stream,
+        response_generator,
+        ctx.clone(),
+        false,
+        true,
+        None,
+        Default::default(),
+    );
+    let _: Vec<_> = transformed_stream.collect().await;
+
+    assert_eq!(tracker.engine_reused_tokens(), expected);
+    assert_eq!(tracker.cached_tokens(), Some(3));
+}

@@ -181,6 +181,10 @@ pub(crate) fn record_llm_metric_tokens(
     if input_tokens.is_some() || cached_tokens.is_some() {
         tracker.record_isl(input_tokens.unwrap_or(0), cached_tokens);
     }
+    // The final usage is the engine's own count, kept apart from the router's estimate.
+    if let Some(cached_tokens) = cached_tokens {
+        tracker.record_engine_reused_tokens(cached_tokens as u64);
+    }
     tracker.record_osl(output_tokens);
 }
 
@@ -212,6 +216,7 @@ pub(crate) fn request_metrics(
         input_tokens: tracker.and_then(|tracker| tracker.isl_tokens().map(|v| v as u64)),
         output_tokens: tracker.map(RequestTracker::osl_tokens),
         cached_tokens: tracker.and_then(|tracker| tracker.cached_tokens().map(|v| v as u64)),
+        engine_reused_tokens: tracker.and_then(RequestTracker::engine_reused_tokens),
         request_received_ms: timing.as_ref().map(|timing| timing.request_received_ms),
         prefill_wait_time_ms: timing
             .as_ref()
@@ -745,6 +750,25 @@ mod tests {
     }
 
     #[test]
+    fn final_usage_is_the_engine_count_beside_the_router_estimate() {
+        let tracker = RequestTracker::new();
+        tracker.record_isl(100, Some(32));
+        // A mid-stream frame carries no usage; the final usage carries the engine's count.
+        super::record_llm_metric_tokens(Some(&tracker), Some(100), 2, None);
+        assert_eq!(tracker.engine_reused_tokens(), None);
+        super::record_llm_metric_tokens(Some(&tracker), Some(100), 4, Some(48));
+
+        let metrics = request_metrics(
+            "req-1".to_string(),
+            None,
+            "test-model".to_string(),
+            Some(&tracker),
+        );
+        assert_eq!(metrics.cached_tokens, Some(32));
+        assert_eq!(metrics.engine_reused_tokens, Some(48));
+    }
+
+    #[test]
     fn test_request_metrics_without_tracker_is_partial() {
         let metrics = request_metrics(
             "req-1".to_string(),
@@ -759,6 +783,7 @@ mod tests {
         assert_eq!(metrics.input_tokens, None);
         assert_eq!(metrics.output_tokens, None);
         assert_eq!(metrics.cached_tokens, None);
+        assert_eq!(metrics.engine_reused_tokens, None);
         assert_eq!(metrics.request_received_ms, None);
         assert_eq!(metrics.prefill_wait_time_ms, None);
         assert_eq!(metrics.prefill_time_ms, None);
