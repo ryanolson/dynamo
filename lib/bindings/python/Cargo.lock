@@ -3314,7 +3314,7 @@ dependencies = [
 [[package]]
 name = "gdl"
 version = "0.1.0"
-source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=d9f6c389070b0fcf84edad5e29fe2d5bf2017bdd#d9f6c389070b0fcf84edad5e29fe2d5bf2017bdd"
+source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=7f9634972d00e9cf4d00ab4d2aab899b1445132c#7f9634972d00e9cf4d00ab4d2aab899b1445132c"
 dependencies = [
  "futures",
  "gdl-macros",
@@ -3332,7 +3332,7 @@ dependencies = [
 [[package]]
 name = "gdl-attrs"
 version = "0.1.0"
-source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=d9f6c389070b0fcf84edad5e29fe2d5bf2017bdd#d9f6c389070b0fcf84edad5e29fe2d5bf2017bdd"
+source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=7f9634972d00e9cf4d00ab4d2aab899b1445132c#7f9634972d00e9cf4d00ab4d2aab899b1445132c"
 dependencies = [
  "gdl-schema",
  "proc-macro2",
@@ -3342,7 +3342,7 @@ dependencies = [
 [[package]]
 name = "gdl-macros"
 version = "0.1.0"
-source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=d9f6c389070b0fcf84edad5e29fe2d5bf2017bdd#d9f6c389070b0fcf84edad5e29fe2d5bf2017bdd"
+source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=7f9634972d00e9cf4d00ab4d2aab899b1445132c#7f9634972d00e9cf4d00ab4d2aab899b1445132c"
 dependencies = [
  "gdl-attrs",
  "gdl-schema",
@@ -3354,7 +3354,7 @@ dependencies = [
 [[package]]
 name = "gdl-message"
 version = "0.1.0"
-source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=d9f6c389070b0fcf84edad5e29fe2d5bf2017bdd#d9f6c389070b0fcf84edad5e29fe2d5bf2017bdd"
+source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=7f9634972d00e9cf4d00ab4d2aab899b1445132c#7f9634972d00e9cf4d00ab4d2aab899b1445132c"
 dependencies = [
  "gdl-macros",
  "gdl-schema",
@@ -3366,7 +3366,7 @@ dependencies = [
 [[package]]
 name = "gdl-schema"
 version = "0.1.0"
-source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=d9f6c389070b0fcf84edad5e29fe2d5bf2017bdd#d9f6c389070b0fcf84edad5e29fe2d5bf2017bdd"
+source = "git+ssh://git@github.com/NVIDIA-dev/dynamo-gdl.git?rev=7f9634972d00e9cf4d00ab4d2aab899b1445132c#7f9634972d00e9cf4d00ab4d2aab899b1445132c"
 dependencies = [
  "serde",
 ]
